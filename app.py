@@ -777,22 +777,22 @@ def reflect():
 
     cur = get_cursor()
 
-    # Postgres version with subquery
+    # Postgres version - wrap in subquery to filter by computed column
     sql = '''
-        SELECT b.blob_hash, b.content_type, substring(b.content, 1, 500) as preview,
-               (SELECT COUNT(*) FROM cross_references cr
-                WHERE (cr.source_blob = b.blob_hash OR cr.target_blob = b.blob_hash)
-                AND cr.tenant_id = %s) as link_count
-        FROM blobs b
-        WHERE b.tenant_id = %s
-        HAVING (SELECT COUNT(*) FROM cross_references cr
-                WHERE (cr.source_blob = b.blob_hash OR cr.target_blob = b.blob_hash)
-                AND cr.tenant_id = %s) >= %s
+        SELECT * FROM (
+            SELECT b.blob_hash, b.content_type, substring(b.content, 1, 500) as preview,
+                   (SELECT COUNT(*) FROM cross_references cr
+                    WHERE (cr.source_blob = b.blob_hash OR cr.target_blob = b.blob_hash)
+                    AND cr.tenant_id = %s) as link_count
+            FROM blobs b
+            WHERE b.tenant_id = %s
+        ) subquery
+        WHERE link_count >= %s
         ORDER BY link_count DESC
         LIMIT %s
     '''
 
-    cur.execute(sql, (DEFAULT_TENANT, DEFAULT_TENANT, DEFAULT_TENANT, min_links, limit))
+    cur.execute(sql, (DEFAULT_TENANT, DEFAULT_TENANT, min_links, limit))
     insights = []
 
     for row in cur.fetchall():
