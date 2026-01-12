@@ -12,6 +12,7 @@ import os
 from datetime import datetime
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -103,6 +104,44 @@ def close_db(exception):
     if db is not None:
         db.close()
 
+# Phase 3: Audit Logging
+AUDIT_ENABLED = os.environ.get('AUDIT_ENABLED', 'true').lower() == 'true'
+
+@app.before_request
+def before_request():
+    """Start timing for audit logging."""
+    g.audit_start = time.time()
+
+@app.after_request
+def after_request(response):
+    """Log request to audit trail."""
+    if not AUDIT_ENABLED:
+        return response
+    # Skip health checks and static
+    if request.path in ('/', '/health', '/favicon.ico', '/v2/'):
+        return response
+    try:
+        from audit_service import log_audit, parse_request_action
+        duration_ms = int((time.time() - getattr(g, 'audit_start', time.time())) * 1000)
+        action, resource_type, resource_id = parse_request_action(request)
+
+        cur = get_cursor()
+        log_audit(
+            cursor=cur,
+            tenant_id=DEFAULT_TENANT,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            response_status=response.status_code,
+            duration_ms=duration_ms,
+            extra_metadata={'response_size_bytes': response.content_length or 0}
+        )
+        cur.connection.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[AUDIT] Error: {e}", file=sys.stderr)
+    return response
+
 def compute_hash(content):
     """Compute SHA-256 hash for content-addressable storage."""
     if isinstance(content, str):
@@ -152,10 +191,11 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '2.7.0-encrypted',
+            'version': '2.8.0-audit',
             'platform': 'railway',
             'database': 'postgres',
             'encryption': encryption_status,
+            'audit': 'enabled' if AUDIT_ENABLED else 'disabled',
             'branches': branch_count,
             'commits': commit_count,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
@@ -864,6 +904,94 @@ def list_sessions():
 
     cur.close()
     return jsonify({'sessions': sessions, 'count': len(sessions)})
+
+# ==================== AUDIT LOGGING (Phase 3) ====================
+
+@app.route('/v2/audit', methods=['GET'])
+def query_audit():
+    """Query audit logs with filtering."""
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    action = request.args.get('action')
+    resource_type = request.args.get('resource_type')
+    start_time = request.args.get('start_time')
+    end_time = request.args.get('end_time')
+    status_min = request.args.get('status_min', type=int)
+
+    cur = get_cursor()
+
+    try:
+        from audit_service import query_audit_logs
+        filters = {}
+        if action:
+            filters['action'] = action
+        if resource_type:
+            filters['resource_type'] = resource_type
+        if start_time:
+            filters['start_time'] = start_time
+        if end_time:
+            filters['end_time'] = end_time
+        if status_min:
+            filters['status_min'] = status_min
+
+        rows = query_audit_logs(cur, DEFAULT_TENANT, filters, limit, offset)
+        logs = []
+        for row in rows:
+            logs.append({
+                'id': str(row[0]),
+                'timestamp': str(row[1]),
+                'action': row[2],
+                'resource_type': row[3],
+                'resource_id': row[4],
+                'response_status': row[5],
+                'duration_ms': row[6],
+                'request_metadata': row[7]
+            })
+        cur.close()
+        return jsonify({
+            'logs': logs,
+            'count': len(logs),
+            'limit': limit,
+            'offset': offset
+        })
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/v2/audit/stats', methods=['GET'])
+def audit_stats():
+    """Get audit statistics."""
+    hours = request.args.get('hours', 24, type=int)
+
+    cur = get_cursor()
+
+    try:
+        from audit_service import get_audit_stats
+        stats = get_audit_stats(cur, DEFAULT_TENANT, hours)
+        cur.close()
+
+        if stats:
+            return jsonify({
+                'period_hours': hours,
+                'total_requests': stats[0] or 0,
+                'error_count': stats[1] or 0,
+                'avg_duration_ms': stats[2] or 0,
+                'max_duration_ms': stats[3] or 0,
+                'unique_actions': stats[4] or 0,
+                'error_rate': round((stats[1] or 0) / max(stats[0] or 1, 1) * 100, 2)
+            })
+        return jsonify({
+            'period_hours': hours,
+            'total_requests': 0,
+            'error_count': 0,
+            'avg_duration_ms': 0,
+            'max_duration_ms': 0,
+            'unique_actions': 0,
+            'error_rate': 0
+        })
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
