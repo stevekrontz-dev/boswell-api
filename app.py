@@ -191,7 +191,7 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '2.8.0-audit',
+            'version': '2.9.0-godmode',
             'platform': 'railway',
             'database': 'postgres',
             'encryption': encryption_status,
@@ -992,6 +992,332 @@ def audit_stats():
     except Exception as e:
         cur.close()
         return jsonify({'error': str(e)}), 500
+
+# ==================== ADMIN API (God Mode Dashboard) ====================
+
+@app.route('/v2/admin/pulse', methods=['GET'])
+def admin_pulse():
+    """Get all stats for the Pulse view - system overview."""
+    cur = get_cursor()
+
+    try:
+        # Count tenants
+        cur.execute('SELECT COUNT(*) as count FROM tenants')
+        tenant_count = cur.fetchone()['count']
+
+        # Count commits
+        cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        commit_count = cur.fetchone()['count']
+
+        # Count blobs
+        cur.execute('SELECT COUNT(*) as count FROM blobs WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        blob_count = cur.fetchone()['count']
+
+        # Total storage
+        cur.execute('SELECT COALESCE(SUM(byte_size), 0) as total FROM blobs WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        total_storage = cur.fetchone()['total']
+
+        # API calls in last 24h
+        cur.execute('''
+            SELECT COUNT(*) as count FROM audit_logs
+            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '24 hours'
+        ''', (DEFAULT_TENANT,))
+        api_calls_24h = cur.fetchone()['count']
+
+        # Request volume by day (last 7 days)
+        cur.execute('''
+            SELECT DATE(timestamp) as day, COUNT(*) as requests
+            FROM audit_logs
+            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
+            GROUP BY DATE(timestamp)
+            ORDER BY day
+        ''', (DEFAULT_TENANT,))
+        request_volume = [{'day': str(row['day']), 'requests': row['requests']} for row in cur.fetchall()]
+
+        # Error rate by day (last 7 days)
+        cur.execute('''
+            SELECT DATE(timestamp) as day,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE response_status >= 400) as errors
+            FROM audit_logs
+            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
+            GROUP BY DATE(timestamp)
+            ORDER BY day
+        ''', (DEFAULT_TENANT,))
+        error_rates = []
+        for row in cur.fetchall():
+            error_rate = round((row['errors'] / max(row['total'], 1)) * 100, 2)
+            error_rates.append({'day': str(row['day']), 'error_rate': error_rate, 'errors': row['errors']})
+
+        # Response time percentiles (last 24h)
+        cur.execute('''
+            SELECT
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms) as p50,
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms) as p95,
+                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) as p99,
+                AVG(duration_ms) as avg
+            FROM audit_logs
+            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '24 hours'
+        ''', (DEFAULT_TENANT,))
+        perf_row = cur.fetchone()
+        response_times = {
+            'p50': round(perf_row['p50'] or 0, 1),
+            'p95': round(perf_row['p95'] or 0, 1),
+            'p99': round(perf_row['p99'] or 0, 1),
+            'avg': round(perf_row['avg'] or 0, 1)
+        }
+
+        # System status
+        cur.execute('SELECT COUNT(*) FILTER (WHERE response_status >= 500) as errors FROM audit_logs WHERE timestamp > NOW() - INTERVAL \'15 minutes\'')
+        recent_500s = cur.fetchone()['errors']
+        system_health = 'healthy' if recent_500s == 0 else 'degraded'
+
+        cur.close()
+
+        return jsonify({
+            'cards': {
+                'total_tenants': tenant_count,
+                'total_commits': commit_count,
+                'total_blobs': blob_count,
+                'api_calls_24h': api_calls_24h,
+                'total_storage_bytes': total_storage
+            },
+            'charts': {
+                'request_volume': request_volume,
+                'error_rates': error_rates,
+                'response_times': response_times
+            },
+            'status': {
+                'system_health': system_health,
+                'recent_500_errors': recent_500s,
+                'storage_bytes': total_storage,
+                'encryption': 'enabled' if ENCRYPTION_ENABLED else 'disabled',
+                'audit': 'enabled' if AUDIT_ENABLED else 'disabled'
+            },
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/admin/tenants', methods=['GET'])
+def admin_tenants():
+    """List all tenants with aggregate stats."""
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT
+                t.id,
+                t.name,
+                t.created_at,
+                (SELECT COUNT(*) FROM commits c WHERE c.tenant_id = t.id) as commit_count,
+                (SELECT COUNT(*) FROM blobs b WHERE b.tenant_id = t.id) as blob_count,
+                (SELECT COALESCE(SUM(byte_size), 0) FROM blobs b WHERE b.tenant_id = t.id) as storage_bytes,
+                (SELECT COUNT(*) FROM audit_logs a WHERE a.tenant_id = t.id AND a.timestamp > NOW() - INTERVAL '7 days') as api_calls_7d,
+                (SELECT MAX(timestamp) FROM audit_logs a WHERE a.tenant_id = t.id) as last_active
+            FROM tenants t
+            ORDER BY t.created_at DESC
+        ''')
+
+        tenants = []
+        for row in cur.fetchall():
+            tenants.append({
+                'id': str(row['id']),
+                'name': row['name'],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'commit_count': row['commit_count'],
+                'blob_count': row['blob_count'],
+                'storage_bytes': row['storage_bytes'],
+                'api_calls_7d': row['api_calls_7d'],
+                'last_active': str(row['last_active']) if row['last_active'] else None
+            })
+
+        cur.close()
+        return jsonify({
+            'tenants': tenants,
+            'count': len(tenants)
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/admin/tenants/<tenant_id>', methods=['GET'])
+def admin_tenant_detail(tenant_id):
+    """Get detailed stats for a specific tenant."""
+    cur = get_cursor()
+
+    try:
+        # Basic tenant info
+        cur.execute('SELECT * FROM tenants WHERE id = %s', (tenant_id,))
+        tenant = cur.fetchone()
+        if not tenant:
+            cur.close()
+            return jsonify({'error': 'Tenant not found'}), 404
+
+        # Commits by branch
+        cur.execute('''
+            SELECT br.name as branch, COUNT(c.commit_hash) as commits
+            FROM branches br
+            LEFT JOIN commits c ON c.tenant_id = br.tenant_id
+            WHERE br.tenant_id = %s
+            GROUP BY br.name
+            ORDER BY commits DESC
+        ''', (tenant_id,))
+        commits_by_branch = [{'branch': row['branch'], 'commits': row['commits']} for row in cur.fetchall()]
+
+        # API calls by day (last 30 days)
+        cur.execute('''
+            SELECT DATE(timestamp) as day, COUNT(*) as requests
+            FROM audit_logs
+            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '30 days'
+            GROUP BY DATE(timestamp)
+            ORDER BY day
+        ''', (tenant_id,))
+        api_calls_by_day = [{'day': str(row['day']), 'requests': row['requests']} for row in cur.fetchall()]
+
+        # Top actions
+        cur.execute('''
+            SELECT action, COUNT(*) as count
+            FROM audit_logs
+            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
+            GROUP BY action
+            ORDER BY count DESC
+            LIMIT 10
+        ''', (tenant_id,))
+        top_actions = [{'action': row['action'], 'count': row['count']} for row in cur.fetchall()]
+
+        cur.close()
+        return jsonify({
+            'tenant': {
+                'id': str(tenant['id']),
+                'name': tenant['name'],
+                'created_at': str(tenant['created_at']) if tenant['created_at'] else None
+            },
+            'charts': {
+                'commits_by_branch': commits_by_branch,
+                'api_calls_by_day': api_calls_by_day,
+                'top_actions': top_actions
+            }
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/admin/alerts', methods=['GET'])
+def admin_alerts():
+    """Get computed alerts for the system."""
+    cur = get_cursor()
+    alerts = []
+
+    try:
+        # Alert 1: Error rate above 5% in last hour
+        cur.execute('''
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE response_status >= 400) as errors
+            FROM audit_logs
+            WHERE timestamp > NOW() - INTERVAL '1 hour'
+        ''')
+        row = cur.fetchone()
+        if row['total'] > 0:
+            error_rate = (row['errors'] / row['total']) * 100
+            if error_rate > 5:
+                alerts.append({
+                    'severity': 'warning',
+                    'type': 'error_rate',
+                    'message': f'Error rate is {error_rate:.1f}% in the last hour',
+                    'details': {'total': row['total'], 'errors': row['errors'], 'rate': round(error_rate, 2)}
+                })
+
+        # Alert 2: Any 500 errors in last 15 minutes
+        cur.execute('''
+            SELECT COUNT(*) as count
+            FROM audit_logs
+            WHERE response_status >= 500 AND timestamp > NOW() - INTERVAL '15 minutes'
+        ''')
+        recent_500s = cur.fetchone()['count']
+        if recent_500s > 0:
+            alerts.append({
+                'severity': 'critical',
+                'type': 'server_errors',
+                'message': f'{recent_500s} server errors in the last 15 minutes',
+                'details': {'count': recent_500s}
+            })
+
+        # Alert 3: Tenant storage above 80% (need to define limits per tenant - using 100MB as example)
+        storage_limit = 100 * 1024 * 1024  # 100MB
+        cur.execute('''
+            SELECT t.id, t.name, COALESCE(SUM(b.byte_size), 0) as storage
+            FROM tenants t
+            LEFT JOIN blobs b ON b.tenant_id = t.id
+            GROUP BY t.id, t.name
+            HAVING COALESCE(SUM(b.byte_size), 0) > %s
+        ''', (storage_limit * 0.8,))
+        for row in cur.fetchall():
+            usage_pct = (row['storage'] / storage_limit) * 100
+            alerts.append({
+                'severity': 'warning',
+                'type': 'storage_warning',
+                'message': f'Tenant "{row["name"]}" using {usage_pct:.0f}% of storage limit',
+                'details': {'tenant_id': str(row['id']), 'storage_bytes': row['storage'], 'limit_bytes': storage_limit}
+            })
+
+        # Alert 4: Tenants inactive 30+ days
+        cur.execute('''
+            SELECT t.id, t.name,
+                   (SELECT MAX(timestamp) FROM audit_logs a WHERE a.tenant_id = t.id) as last_active
+            FROM tenants t
+            WHERE (SELECT MAX(timestamp) FROM audit_logs a WHERE a.tenant_id = t.id) < NOW() - INTERVAL '30 days'
+               OR (SELECT MAX(timestamp) FROM audit_logs a WHERE a.tenant_id = t.id) IS NULL
+        ''')
+        for row in cur.fetchall():
+            alerts.append({
+                'severity': 'info',
+                'type': 'inactive_tenant',
+                'message': f'Tenant "{row["name"]}" inactive for 30+ days',
+                'details': {'tenant_id': str(row['id']), 'last_active': str(row['last_active']) if row['last_active'] else 'never'}
+            })
+
+        # Alert 5: High response time (p95 > 500ms)
+        cur.execute('''
+            SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms) as p95
+            FROM audit_logs
+            WHERE timestamp > NOW() - INTERVAL '1 hour'
+        ''')
+        p95_row = cur.fetchone()
+        if p95_row['p95'] and p95_row['p95'] > 500:
+            alerts.append({
+                'severity': 'warning',
+                'type': 'slow_responses',
+                'message': f'P95 response time is {p95_row["p95"]:.0f}ms (last hour)',
+                'details': {'p95_ms': round(p95_row['p95'], 1)}
+            })
+
+        cur.close()
+
+        # Sort by severity
+        severity_order = {'critical': 0, 'warning': 1, 'info': 2}
+        alerts.sort(key=lambda x: severity_order.get(x['severity'], 99))
+
+        return jsonify({
+            'alerts': alerts,
+            'count': len(alerts),
+            'critical_count': sum(1 for a in alerts if a['severity'] == 'critical'),
+            'warning_count': sum(1 for a in alerts if a['severity'] == 'warning'),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
