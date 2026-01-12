@@ -8,7 +8,12 @@ RUN mkdir -p /data
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy all Python source files
 COPY app.py .
+COPY audit_service.py .
+COPY encryption_service.py .
+
+# Legacy SQLite file (kept for reference, not used in production)
 COPY boswell_v2.db /data/boswell_v2.db
 
 ENV BOSWELL_DB=/data/boswell_v2.db
