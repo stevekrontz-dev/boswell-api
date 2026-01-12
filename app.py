@@ -1621,6 +1621,85 @@ def release_task(task_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/admin/spawn-agent', methods=['POST'])
+def spawn_agent():
+    """Spawn a new agent with a task. Creates a task entry for agent coordination."""
+    data = request.get_json() or {}
+    agent_type = data.get('agentType', 'general')
+    task_prompt = data.get('task')
+    branch = data.get('branch', 'command-center')
+
+    if not task_prompt:
+        return jsonify({'error': 'Task prompt required'}), 400
+
+    valid_agent_types = ['general', 'research', 'coding', 'analysis']
+    if agent_type not in valid_agent_types:
+        return jsonify({'error': f'Invalid agent type. Must be one of: {valid_agent_types}'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Generate a unique agent ID
+        import uuid
+        agent_id = f"agent-{uuid.uuid4().hex[:8]}"
+
+        # Create a task for the agent
+        metadata = {
+            'agent_type': agent_type,
+            'agent_id': agent_id,
+            'spawned_from': 'god-mode-dashboard'
+        }
+
+        cur.execute(
+            '''INSERT INTO tasks (tenant_id, description, branch, assigned_to, status, priority, metadata)
+               VALUES (%s, %s, %s, %s, 'open', 1, %s)
+               RETURNING id, created_at''',
+            (DEFAULT_TENANT, task_prompt, branch, agent_id, json.dumps(metadata))
+        )
+        row = cur.fetchone()
+        task_id = str(row['id'])
+        created_at = str(row['created_at'])
+
+        # Also commit this spawn event to memory
+        spawn_record = {
+            'event': 'agent_spawned',
+            'agent_id': agent_id,
+            'agent_type': agent_type,
+            'task': task_prompt,
+            'branch': branch,
+            'task_id': task_id
+        }
+        content_str = json.dumps(spawn_record)
+        blob_hash = compute_hash(content_str)
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, DEFAULT_TENANT, content_str, 'agent_spawn', now, len(content_str))
+        )
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'spawned',
+            'agent_id': agent_id,
+            'agent_type': agent_type,
+            'task_id': task_id,
+            'branch': branch,
+            'task': task_prompt,
+            'created_at': created_at
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
