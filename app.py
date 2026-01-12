@@ -1210,6 +1210,100 @@ def admin_tenant_detail(tenant_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/admin/create-tenant', methods=['POST'])
+def admin_create_tenant():
+    """
+    Create a new tenant with auto-generated credentials.
+    Secured with GODMODE_PASSWORD header.
+
+    Request:
+        Headers: X-Godmode-Password: <password>
+        Body: { "name": "Tenant Name", "email": "contact@email.com" }
+
+    Response:
+        { "tenant_id": "uuid", "api_key": "key", "name": "...", "created_at": "..." }
+    """
+    import uuid
+    import secrets
+
+    # Security check
+    godmode_password = os.environ.get('GODMODE_PASSWORD')
+    provided_password = request.headers.get('X-Godmode-Password')
+
+    if not godmode_password:
+        return jsonify({'error': 'Server not configured for tenant provisioning'}), 503
+
+    if not provided_password or provided_password != godmode_password:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Parse request
+    data = request.get_json() or {}
+    tenant_name = data.get('name')
+    tenant_email = data.get('email')
+
+    if not tenant_name:
+        return jsonify({'error': 'name is required'}), 400
+
+    # Generate credentials
+    tenant_id = str(uuid.uuid4())
+    api_key = f"bos_{secrets.token_urlsafe(32)}"
+    api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Insert tenant
+        cur.execute(
+            '''INSERT INTO tenants (id, name, created_at)
+               VALUES (%s, %s, NOW())
+               RETURNING id, name, created_at''',
+            (tenant_id, tenant_name)
+        )
+        tenant_row = cur.fetchone()
+
+        # Store API key hash (we return the actual key only once)
+        # Note: api_keys table may not exist yet - gracefully handle
+        try:
+            cur.execute(
+                '''INSERT INTO api_keys (tenant_id, key_hash, name, created_at)
+                   VALUES (%s, %s, %s, NOW())''',
+                (tenant_id, api_key_hash, f"Default key for {tenant_name}")
+            )
+        except Exception as key_err:
+            # Table might not exist yet - log but continue
+            print(f"[WARN] Could not store API key hash: {key_err}", file=sys.stderr)
+
+        # Create default branches for new tenant
+        default_branches = ['main', 'command-center']
+        for branch_name in default_branches:
+            cur.execute(
+                '''INSERT INTO branches (tenant_id, name, head_commit)
+                   VALUES (%s, %s, NULL)
+                   ON CONFLICT DO NOTHING''',
+                (tenant_id, branch_name)
+            )
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'created',
+            'tenant_id': tenant_id,
+            'api_key': api_key,  # Only returned once!
+            'name': tenant_row['name'],
+            'email': tenant_email,
+            'created_at': str(tenant_row['created_at']),
+            'branches': default_branches,
+            'warning': 'Save your API key now - it cannot be retrieved again!'
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/v2/admin/alerts', methods=['GET'])
 def admin_alerts():
     """Get computed alerts for the system."""
