@@ -1319,6 +1319,308 @@ def admin_alerts():
         return jsonify({'error': str(e)}), 500
 
 
+# ==================== TASK QUEUE (Multi-Agent Coordination) ====================
+
+@app.route('/v2/tasks', methods=['POST'])
+def create_task():
+    """Create a new task for agent coordination."""
+    data = request.get_json() or {}
+    description = data.get('description')
+    branch = data.get('branch')
+    assigned_to = data.get('assigned_to')
+    priority = data.get('priority', 5)
+    deadline = data.get('deadline')
+    metadata = data.get('metadata', {})
+
+    if not description:
+        return jsonify({'error': 'Description required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        cur.execute(
+            '''INSERT INTO tasks (tenant_id, description, branch, assigned_to, status, priority, deadline, metadata)
+               VALUES (%s, %s, %s, %s, 'open', %s, %s, %s)
+               RETURNING id, created_at''',
+            (DEFAULT_TENANT, description, branch, assigned_to, priority, deadline, json.dumps(metadata))
+        )
+        row = cur.fetchone()
+        task_id = str(row['id'])
+        created_at = str(row['created_at'])
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'created',
+            'task_id': task_id,
+            'description': description,
+            'branch': branch,
+            'assigned_to': assigned_to,
+            'priority': priority,
+            'created_at': created_at
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/tasks', methods=['GET'])
+def list_tasks():
+    """List tasks with optional filtering."""
+    status = request.args.get('status')
+    branch = request.args.get('branch')
+    assigned_to = request.args.get('assigned_to')
+    limit = request.args.get('limit', 50, type=int)
+
+    cur = get_cursor()
+
+    sql = 'SELECT * FROM tasks WHERE tenant_id = %s'
+    params = [DEFAULT_TENANT]
+
+    if status:
+        sql += ' AND status = %s'
+        params.append(status)
+
+    if branch:
+        sql += ' AND branch = %s'
+        params.append(branch)
+
+    if assigned_to:
+        sql += ' AND assigned_to = %s'
+        params.append(assigned_to)
+
+    sql += ' ORDER BY priority ASC, created_at ASC LIMIT %s'
+    params.append(limit)
+
+    cur.execute(sql, params)
+    tasks = []
+    for row in cur.fetchall():
+        task = dict(row)
+        task['id'] = str(task['id'])
+        task['tenant_id'] = str(task['tenant_id'])
+        if task.get('created_at'):
+            task['created_at'] = str(task['created_at'])
+        if task.get('updated_at'):
+            task['updated_at'] = str(task['updated_at'])
+        if task.get('deadline'):
+            task['deadline'] = str(task['deadline'])
+        tasks.append(task)
+
+    cur.close()
+    return jsonify({'tasks': tasks, 'count': len(tasks)})
+
+
+@app.route('/v2/tasks/<task_id>', methods=['PATCH'])
+def update_task(task_id):
+    """Update a task's fields."""
+    data = request.get_json() or {}
+
+    # Allowed fields to update
+    allowed_fields = ['description', 'branch', 'assigned_to', 'status', 'priority', 'deadline', 'metadata']
+    updates = {k: v for k, v in data.items() if k in allowed_fields}
+
+    if not updates:
+        return jsonify({'error': 'No valid fields to update'}), 400
+
+    # Validate status if provided
+    if 'status' in updates:
+        valid_statuses = ['open', 'claimed', 'blocked', 'done']
+        if updates['status'] not in valid_statuses:
+            return jsonify({'error': f'Invalid status. Must be one of: {valid_statuses}'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Build dynamic UPDATE query
+        set_clauses = []
+        params = []
+        for field, value in updates.items():
+            if field == 'metadata':
+                set_clauses.append(f'{field} = %s')
+                params.append(json.dumps(value))
+            else:
+                set_clauses.append(f'{field} = %s')
+                params.append(value)
+
+        params.extend([task_id, DEFAULT_TENANT])
+
+        sql = f'''UPDATE tasks SET {', '.join(set_clauses)}
+                  WHERE id = %s AND tenant_id = %s
+                  RETURNING *'''
+
+        cur.execute(sql, params)
+        row = cur.fetchone()
+
+        if not row:
+            cur.close()
+            return jsonify({'error': 'Task not found'}), 404
+
+        db.commit()
+
+        task = dict(row)
+        task['id'] = str(task['id'])
+        task['tenant_id'] = str(task['tenant_id'])
+        if task.get('created_at'):
+            task['created_at'] = str(task['created_at'])
+        if task.get('updated_at'):
+            task['updated_at'] = str(task['updated_at'])
+        if task.get('deadline'):
+            task['deadline'] = str(task['deadline'])
+
+        cur.close()
+        return jsonify({'status': 'updated', 'task': task})
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/tasks/<task_id>/claim', methods=['POST'])
+def claim_task(task_id):
+    """Claim a task for an agent instance. Includes collision detection."""
+    data = request.get_json() or {}
+    instance_id = data.get('instance_id')
+
+    if not instance_id:
+        return jsonify({'error': 'instance_id required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Check if task exists and is claimable
+        cur.execute(
+            'SELECT * FROM tasks WHERE id = %s AND tenant_id = %s',
+            (task_id, DEFAULT_TENANT)
+        )
+        task = cur.fetchone()
+
+        if not task:
+            cur.close()
+            return jsonify({'error': 'Task not found'}), 404
+
+        if task['status'] == 'done':
+            cur.close()
+            return jsonify({'error': 'Task already completed'}), 409
+
+        # Check for existing active claims (collision detection)
+        cur.execute(
+            '''SELECT * FROM task_claims
+               WHERE task_id = %s AND tenant_id = %s AND released_at IS NULL''',
+            (task_id, DEFAULT_TENANT)
+        )
+        existing_claim = cur.fetchone()
+
+        if existing_claim:
+            cur.close()
+            return jsonify({
+                'error': 'Task already claimed',
+                'claimed_by': existing_claim['instance_id'],
+                'claimed_at': str(existing_claim['claimed_at'])
+            }), 409
+
+        # Create the claim
+        cur.execute(
+            '''INSERT INTO task_claims (tenant_id, task_id, instance_id)
+               VALUES (%s, %s, %s)
+               RETURNING id, claimed_at''',
+            (DEFAULT_TENANT, task_id, instance_id)
+        )
+        claim_row = cur.fetchone()
+
+        # Update task status
+        cur.execute(
+            '''UPDATE tasks SET status = 'claimed', assigned_to = %s
+               WHERE id = %s AND tenant_id = %s''',
+            (instance_id, task_id, DEFAULT_TENANT)
+        )
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'claimed',
+            'task_id': task_id,
+            'instance_id': instance_id,
+            'claim_id': str(claim_row['id']),
+            'claimed_at': str(claim_row['claimed_at'])
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/tasks/<task_id>/release', methods=['POST'])
+def release_task(task_id):
+    """Release a task claim."""
+    data = request.get_json() or {}
+    instance_id = data.get('instance_id')
+    reason = data.get('reason', 'manual')  # completed, blocked, timeout, manual
+
+    if not instance_id:
+        return jsonify({'error': 'instance_id required'}), 400
+
+    valid_reasons = ['completed', 'blocked', 'timeout', 'manual']
+    if reason not in valid_reasons:
+        return jsonify({'error': f'Invalid reason. Must be one of: {valid_reasons}'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Find active claim for this instance
+        cur.execute(
+            '''SELECT * FROM task_claims
+               WHERE task_id = %s AND instance_id = %s AND tenant_id = %s AND released_at IS NULL''',
+            (task_id, instance_id, DEFAULT_TENANT)
+        )
+        claim = cur.fetchone()
+
+        if not claim:
+            cur.close()
+            return jsonify({'error': 'No active claim found for this instance'}), 404
+
+        # Release the claim
+        now = datetime.utcnow().isoformat() + 'Z'
+        cur.execute(
+            '''UPDATE task_claims SET released_at = %s, release_reason = %s
+               WHERE id = %s''',
+            (now, reason, claim['id'])
+        )
+
+        # Update task status based on reason
+        new_status = 'done' if reason == 'completed' else ('blocked' if reason == 'blocked' else 'open')
+        cur.execute(
+            '''UPDATE tasks SET status = %s
+               WHERE id = %s AND tenant_id = %s''',
+            (new_status, task_id, DEFAULT_TENANT)
+        )
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'released',
+            'task_id': task_id,
+            'instance_id': instance_id,
+            'reason': reason,
+            'new_task_status': new_status,
+            'released_at': now
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
