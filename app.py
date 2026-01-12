@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Boswell v2 API - Git-Style Memory Architecture
-PostgreSQL version with multi-tenant support
+PostgreSQL version with multi-tenant support + Encryption (Phase 2)
 """
 
 import psycopg2
@@ -15,6 +15,40 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+# Encryption support (Phase 2)
+ENCRYPTION_ENABLED = os.environ.get('ENCRYPTION_ENABLED', 'false').lower() == 'true'
+CREDENTIALS_PATH = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'service-account-key.json')
+
+_encryption_service = None
+_active_dek = None  # (key_id, wrapped_dek)
+
+def get_encryption_service():
+    """Get or initialize the encryption service."""
+    global _encryption_service
+    if _encryption_service is None and ENCRYPTION_ENABLED:
+        try:
+            from encryption_service import get_encryption_service as init_service
+            _encryption_service = init_service(CREDENTIALS_PATH)
+            print(f"[STARTUP] Encryption service initialized", file=sys.stderr)
+        except Exception as e:
+            print(f"[STARTUP] WARNING: Encryption service failed to initialize: {e}", file=sys.stderr)
+    return _encryption_service
+
+def get_active_dek():
+    """Get the active DEK for the current tenant."""
+    global _active_dek
+    if _active_dek is None and ENCRYPTION_ENABLED:
+        cur = get_cursor()
+        cur.execute(
+            "SELECT key_id, wrapped_key FROM data_encryption_keys WHERE tenant_id = %s AND status = 'active' LIMIT 1",
+            (DEFAULT_TENANT,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row:
+            _active_dek = (row['key_id'], bytes(row['wrapped_key']))
+    return _active_dek
 
 # Database URL from environment (Railway provides this)
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -108,12 +142,20 @@ def health_check():
         cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (DEFAULT_TENANT,))
         commit_count = cur.fetchone()['count']
         cur.close()
+        # Check encryption status
+        encryption_status = 'disabled'
+        if ENCRYPTION_ENABLED:
+            encryption_status = 'enabled'
+            if get_active_dek():
+                encryption_status = 'active'
+
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '2.6.0-postgres',
+            'version': '2.7.0-encrypted',
             'platform': 'railway',
             'database': 'postgres',
+            'encryption': encryption_status,
             'branches': branch_count,
             'commits': commit_count,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
@@ -244,13 +286,30 @@ def create_commit():
     content_str = json.dumps(content) if isinstance(content, dict) else str(content)
     blob_hash = compute_hash(content_str)
 
-    # Insert blob (ignore if exists)
-    cur.execute(
-        '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
-           VALUES (%s, %s, %s, %s, %s, %s)
-           ON CONFLICT (blob_hash) DO NOTHING''',
-        (blob_hash, DEFAULT_TENANT, content_str, memory_type, now, len(content_str))
-    )
+    # Insert blob with encryption if enabled
+    encryption_service = get_encryption_service()
+    dek_info = get_active_dek()
+
+    if ENCRYPTION_ENABLED and encryption_service and dek_info:
+        # Encrypt the content
+        key_id, wrapped_dek = dek_info
+        plaintext_dek = encryption_service.unwrap_dek(key_id, wrapped_dek)
+        ciphertext, nonce = encryption_service.encrypt(content_str, plaintext_dek)
+
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_encrypted, nonce, encryption_key_id, content_type, created_at, byte_size)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, DEFAULT_TENANT, content_str, psycopg2.Binary(ciphertext), psycopg2.Binary(nonce), key_id, memory_type, now, len(content_str))
+        )
+    else:
+        # Fallback: store unencrypted
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, DEFAULT_TENANT, content_str, memory_type, now, len(content_str))
+        )
 
     tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
     cur.execute(
@@ -380,6 +439,32 @@ def search_memories():
     cur.close()
     return jsonify({'query': query, 'results': results, 'count': len(results)})
 
+def decrypt_blob_content(blob):
+    """Decrypt blob content if encrypted, otherwise return plaintext."""
+    # Check if blob has encrypted content
+    if blob.get('content_encrypted') and blob.get('nonce') and blob.get('encryption_key_id'):
+        encryption_service = get_encryption_service()
+        if encryption_service:
+            # Get the DEK for this blob
+            cur = get_cursor()
+            cur.execute(
+                "SELECT wrapped_key FROM data_encryption_keys WHERE key_id = %s",
+                (blob['encryption_key_id'],)
+            )
+            dek_row = cur.fetchone()
+            cur.close()
+
+            if dek_row:
+                wrapped_dek = bytes(dek_row['wrapped_key'])
+                ciphertext = bytes(blob['content_encrypted'])
+                nonce = bytes(blob['nonce'])
+                return encryption_service.decrypt_with_wrapped_dek(
+                    ciphertext, nonce, blob['encryption_key_id'], wrapped_dek
+                )
+    # Fallback to plaintext content
+    return blob.get('content', '')
+
+
 @app.route('/v2/recall', methods=['GET'])
 def recall_memory():
     """Recall a specific memory by hash."""
@@ -395,17 +480,22 @@ def recall_memory():
             cur.close()
             return jsonify({'error': 'Memory not found'}), 404
         cur.close()
+
+        # Decrypt content if needed
+        content = decrypt_blob_content(dict(blob))
+
         return jsonify({
             'blob_hash': blob['blob_hash'],
-            'content': blob['content'],
+            'content': content,
             'content_type': blob['content_type'],
             'created_at': str(blob['created_at']) if blob['created_at'] else None,
-            'byte_size': blob['byte_size']
+            'byte_size': blob['byte_size'],
+            'encrypted': bool(blob.get('content_encrypted'))
         })
 
     elif commit_hash:
         cur.execute(
-            '''SELECT c.*, b.content, b.content_type
+            '''SELECT c.*, b.content, b.content_type, b.content_encrypted, b.nonce, b.encryption_key_id
                FROM commits c
                JOIN tree_entries t ON c.tree_hash = t.tree_hash AND c.tenant_id = t.tenant_id
                JOIN blobs b ON t.blob_hash = b.blob_hash AND t.tenant_id = b.tenant_id
@@ -417,6 +507,16 @@ def recall_memory():
         if not commit:
             return jsonify({'error': 'Commit not found'}), 404
         result = dict(commit)
+
+        # Decrypt content if needed
+        result['content'] = decrypt_blob_content(result)
+        result['encrypted'] = bool(result.get('content_encrypted'))
+
+        # Clean up encryption fields from response
+        result.pop('content_encrypted', None)
+        result.pop('nonce', None)
+        result.pop('encryption_key_id', None)
+
         if result.get('created_at'):
             result['created_at'] = str(result['created_at'])
         return jsonify(result)
