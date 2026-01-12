@@ -938,14 +938,14 @@ def query_audit():
         logs = []
         for row in rows:
             logs.append({
-                'id': str(row[0]),
-                'timestamp': str(row[1]),
-                'action': row[2],
-                'resource_type': row[3],
-                'resource_id': row[4],
-                'response_status': row[5],
-                'duration_ms': row[6],
-                'request_metadata': row[7]
+                'id': str(row['id']),
+                'timestamp': str(row['timestamp']),
+                'action': row['action'],
+                'resource_type': row['resource_type'],
+                'resource_id': row['resource_id'],
+                'response_status': row['response_status'],
+                'duration_ms': row['duration_ms'],
+                'request_metadata': row['request_metadata']
             })
         cur.close()
         return jsonify({
@@ -973,12 +973,12 @@ def audit_stats():
         if stats:
             return jsonify({
                 'period_hours': hours,
-                'total_requests': stats[0] or 0,
-                'error_count': stats[1] or 0,
-                'avg_duration_ms': stats[2] or 0,
-                'max_duration_ms': stats[3] or 0,
-                'unique_actions': stats[4] or 0,
-                'error_rate': round((stats[1] or 0) / max(stats[0] or 1, 1) * 100, 2)
+                'total_requests': stats['total_requests'] or 0,
+                'error_count': stats['error_count'] or 0,
+                'avg_duration_ms': stats['avg_duration_ms'] or 0,
+                'max_duration_ms': stats['max_duration_ms'] or 0,
+                'unique_actions': stats['unique_actions'] or 0,
+                'error_rate': round((stats['error_count'] or 0) / max(stats['total_requests'] or 1, 1) * 100, 2)
             })
         return jsonify({
             'period_hours': hours,
