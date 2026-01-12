@@ -19,6 +19,16 @@ CORS(app)
 # Database URL from environment (Railway provides this)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
+# Startup logging for debugging
+import sys
+print(f"[STARTUP] DATABASE_URL set: {bool(DATABASE_URL)}", file=sys.stderr)
+if DATABASE_URL:
+    # Log sanitized URL (hide password)
+    from urllib.parse import urlparse
+    parsed = urlparse(DATABASE_URL)
+    safe_url = f"{parsed.scheme}://{parsed.username}:***@{parsed.hostname}:{parsed.port}{parsed.path}"
+    print(f"[STARTUP] Database host: {parsed.hostname}:{parsed.port}", file=sys.stderr)
+
 # Default tenant for single-tenant mode (Steve Krontz)
 DEFAULT_TENANT = '00000000-0000-0000-0000-000000000001'
 
@@ -36,7 +46,10 @@ PROJECT_BRANCH_MAP = {
 def get_db():
     """Get database connection for current request context."""
     if 'db' not in g:
-        g.db = psycopg2.connect(DATABASE_URL)
+        if not DATABASE_URL:
+            raise Exception("DATABASE_URL environment variable not set")
+        # Add connection timeout to prevent hanging
+        g.db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
         g.db.autocommit = False
         # Set tenant context for RLS
         cur = g.db.cursor()
