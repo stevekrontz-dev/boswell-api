@@ -2276,6 +2276,15 @@ from auth.api_keys import init_api_keys
 api_keys_bp = init_api_keys(get_db, get_cursor)
 app.register_blueprint(api_keys_bp)
 
+# =============================================================================
+# STRIPE BILLING WEBHOOKS (W2P2 - CC2)
+# =============================================================================
+
+from billing.stripe_handler import init_stripe_webhooks
+stripe_bp = init_stripe_webhooks(get_db, get_cursor)
+app.register_blueprint(stripe_bp)
+
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
