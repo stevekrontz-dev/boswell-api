@@ -6,7 +6,19 @@ export async function register(email: string, password: string, name: string) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password, name })
   });
-  return res.json();
+  const data = await res.json();
+
+  if (data.token && data.user_id) {
+    return {
+      token: data.token,
+      user: {
+        id: data.user_id,
+        email: data.email,
+        name: data.name
+      }
+    };
+  }
+  return data;
 }
 
 export async function login(email: string, password: string) {
@@ -29,4 +41,16 @@ export async function fetchWithAuth(endpoint: string, options: RequestInit = {})
     },
   });
   return res.json();
+}
+
+export async function getApiKeys() {
+  return fetchWithAuth('/v2/auth/keys');
+}
+
+export async function createApiKey() {
+  return fetchWithAuth('/v2/auth/keys/create', { method: 'POST' });
+}
+
+export async function deleteApiKey(keyId: string) {
+  return fetchWithAuth('/v2/auth/keys/' + keyId, { method: 'DELETE' });
 }
