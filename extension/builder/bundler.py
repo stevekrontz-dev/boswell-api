@@ -75,19 +75,36 @@ class BundleBuilder:
         Returns:
             BundleResult with success status and details
         """
-        # STUB: W4P2 implementation
-        #
-        # Implementation steps:
-        # 1. Load manifest template
-        # 2. Inject user_config with tenant_id and api_key
-        # 3. Copy server files to temp directory
-        # 4. Create ZIP archive
-        # 5. Optionally sign the bundle
+        try:
+            # 1. Load manifest template
+            manifest = self._load_manifest_template()
 
-        return BundleResult(
-            success=False,
-            error="Not implemented - blocked on W1P3 (API Key Management)"
-        )
+            # 2. Inject user_config with tenant_id and api_key
+            manifest = self._inject_user_config(manifest, config)
+
+            # 3. Update display name if provided
+            if config.display_name:
+                manifest["display_name"] = f"Boswell Memory - {config.display_name}"
+
+            # 4. Create ZIP archive with manifest and server files
+            self._create_zip(manifest, output_path)
+
+            return BundleResult(
+                success=True,
+                output_path=output_path,
+                manifest=manifest
+            )
+
+        except FileNotFoundError as e:
+            return BundleResult(
+                success=False,
+                error=f"Template or server files not found: {e}"
+            )
+        except Exception as e:
+            return BundleResult(
+                success=False,
+                error=f"Bundle creation failed: {e}"
+            )
 
     def _load_manifest_template(self) -> dict:
         """Load and parse the manifest template."""
@@ -155,8 +172,7 @@ class BundleBuilder:
         )
 
 
-# API endpoint integration stub
-def generate_bundle_for_user(tenant_id: str, api_key: str) -> bytes:
+def generate_bundle_for_user(tenant_id: str, api_key: str, display_name: Optional[str] = None) -> bytes:
     """
     Generate a bundle for a user and return as bytes.
 
@@ -165,22 +181,38 @@ def generate_bundle_for_user(tenant_id: str, api_key: str) -> bytes:
     Args:
         tenant_id: User's tenant ID
         api_key: User's API key
+        display_name: Optional display name for personalization
 
     Returns:
         Bytes of the .mcpb file for streaming response
     """
-    # STUB: W4P2 implementation
-    #
-    # Will be called from app.py like:
-    #   @app.route('/api/extension/download')
-    #   def download_extension():
-    #       tenant_id = get_current_tenant()
-    #       api_key = generate_or_get_api_key(tenant_id)
-    #       bundle_bytes = generate_bundle_for_user(tenant_id, api_key)
-    #       return Response(
-    #           bundle_bytes,
-    #           mimetype='application/octet-stream',
-    #           headers={'Content-Disposition': 'attachment; filename=boswell.mcpb'}
-    #       )
+    # Determine paths relative to this file
+    builder_dir = Path(__file__).parent
+    extension_dir = builder_dir.parent
+    template_dir = extension_dir / "templates"
+    server_dir = extension_dir / "server"
 
-    raise NotImplementedError("Blocked on W1P3 (API Key Management)")
+    # Create builder and config
+    builder = BundleBuilder(template_dir=template_dir, server_dir=server_dir)
+    config = BundleConfig(
+        tenant_id=tenant_id,
+        api_key=api_key,
+        display_name=display_name
+    )
+
+    # Build to temp file and read bytes
+    with tempfile.NamedTemporaryFile(suffix='.mcpb', delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        result = builder.build(config=config, output_path=tmp_path)
+        if not result.success:
+            raise RuntimeError(f"Bundle generation failed: {result.error}")
+
+        # Read the generated bundle
+        with open(tmp_path, 'rb') as f:
+            return f.read()
+    finally:
+        # Clean up temp file
+        if tmp_path.exists():
+            tmp_path.unlink()
