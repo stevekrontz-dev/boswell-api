@@ -170,8 +170,8 @@ def get_branch_for_project(project):
 
 # ==================== API ENDPOINTS ====================
 
-@app.route('/', methods=['GET'])
-@app.route('/v2/', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
+@app.route('/v2/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
     try:
