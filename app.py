@@ -2268,6 +2268,109 @@ registration_bp = init_registration(get_db, get_cursor)
 app.register_blueprint(registration_bp)
 
 
+# =============================================================================
+# USER LOGIN (W1P2 - CC1) - UNBLOCKS CC3
+# =============================================================================
+
+from auth.login import init_login
+login_bp = init_login(get_db, get_cursor)
+app.register_blueprint(login_bp)
+
+
+# =============================================================================
+# API KEY MANAGEMENT (W1P3 - CC1)
+# =============================================================================
+
+from auth.api_keys import init_api_keys
+api_keys_bp = init_api_keys(get_db, get_cursor)
+app.register_blueprint(api_keys_bp)
+# =============================================================================
+# BILLING & STRIPE WEBHOOKS (W2P2 - CC2)
+# =============================================================================
+
+from billing.stripe_handler import billing_bp
+app.register_blueprint(billing_bp)
+
+
+# =============================================================================
+# EXTENSION DOWNLOAD (W4P2 - CC4)
+# =============================================================================
+
+@app.route('/api/extension/download', methods=['GET'])
+@require_auth
+def download_extension():
+    """
+    Download personalized .mcpb bundle for Claude Desktop.
+
+    The bundle is pre-configured with the user's API credentials.
+    Requires authentication via session token or GODMODE_PASSWORD.
+    """
+    from flask import Response
+    from extension.builder.bundler import generate_bundle_for_user
+
+    user_id = g.get('current_user', 'steve')
+
+    # Get tenant_id for this user
+    cur = get_cursor()
+    cur.execute(
+        'SELECT id, name FROM tenants WHERE name = %s OR id::text = %s LIMIT 1',
+        (user_id, DEFAULT_TENANT)
+    )
+    tenant_row = cur.fetchone()
+
+    if not tenant_row:
+        cur.close()
+        return jsonify({'error': 'Tenant not found'}), 404
+
+    tenant_id = str(tenant_row['id'])
+    display_name = tenant_row['name']
+
+    # Get or create an API key for this tenant
+    cur.execute(
+        'SELECT key_hash FROM api_keys WHERE tenant_id = %s AND revoked_at IS NULL LIMIT 1',
+        (tenant_id,)
+    )
+    key_row = cur.fetchone()
+
+    if key_row:
+        # Return error - we can't retrieve the actual key, only the hash
+        # User needs to use an existing key or create a new one via /api/keys
+        cur.close()
+        return jsonify({
+            'error': 'API key required. Create one via POST /api/keys first, then use that key.',
+            'hint': 'The download endpoint needs your actual API key. Create one and save it.'
+        }), 400
+
+    cur.close()
+
+    # Alternative: Accept API key as query param for download
+    api_key = request.args.get('api_key')
+    if not api_key:
+        return jsonify({
+            'error': 'api_key query parameter required',
+            'hint': 'GET /api/extension/download?api_key=bos_xxx'
+        }), 400
+
+    try:
+        bundle_bytes = generate_bundle_for_user(
+            tenant_id=tenant_id,
+            api_key=api_key,
+            display_name=display_name
+        )
+
+        return Response(
+            bundle_bytes,
+            mimetype='application/octet-stream',
+            headers={
+                'Content-Disposition': 'attachment; filename=boswell.mcpb',
+                'Content-Length': str(len(bundle_bytes))
+            }
+        )
+
+    except Exception as e:
+        return jsonify({'error': f'Bundle generation failed: {str(e)}'}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
