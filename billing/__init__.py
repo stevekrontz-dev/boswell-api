@@ -9,6 +9,6 @@ This module handles:
 - Usage tracking and limit enforcement
 """
 
-from billing.plans import PLANS, get_plan, get_plan_limits
+from .plans import PLANS, get_plan, get_plan_limits
 
 __all__ = ['PLANS', 'get_plan', 'get_plan_limits']

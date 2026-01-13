@@ -238,7 +238,7 @@ def get_plan_from_price(price_id: str) -> str:
     """
     Map Stripe price ID to internal plan ID.
     """
-    from billing.plans import PLANS
+    from .plans import PLANS
 
     for plan_id, plan in PLANS.items():
         if plan.get('stripe_price_id') == price_id:
