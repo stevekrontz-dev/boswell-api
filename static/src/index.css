@@ -1,6 +1,82 @@
 @import "tailwindcss";
 
+:root {
+  /* Colors matching askboswell.com */
+  --color-bg-primary: #030303;
+  --color-bg-secondary: #0a0a0a;
+  --color-bg-card: #0f0f0f;
+  --color-bg-card-hover: #141414;
+  --color-border: #1a1a1a;
+  --color-border-highlight: #2a2a2a;
+  --color-orange: #f97316;
+  --color-orange-hover: #fb923c;
+  --color-orange-glow: rgba(249, 115, 22, 0.15);
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #9ca3af;
+  --color-text-muted: #6b7280;
+  
+  /* Fonts */
+  --font-display: 'Playfair Display', Georgia, serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
+  background-color: var(--color-bg-primary);
+  font-family: var(--font-body);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Serif headings utility class */
+.font-display {
+  font-family: var(--font-display);
+}
+
+/* Orange glow effect for highlighted cards */
+.glow-orange {
+  box-shadow: 0 0 40px var(--color-orange-glow), 
+              0 0 80px var(--color-orange-glow);
+}
+
+/* Smooth transitions */
+.transition-smooth {
+  transition: all 0.2s ease-out;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-highlight);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Focus styles */
+*:focus-visible {
+  outline: 2px solid var(--color-orange);
+  outline-offset: 2px;
+}
+
+/* Selection color */
+::selection {
+  background-color: var(--color-orange);
+  color: var(--color-bg-primary);
 }

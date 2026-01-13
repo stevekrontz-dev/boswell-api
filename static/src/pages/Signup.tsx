@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
+import Logo from '../components/Logo';
 
 export default function Signup() {
   const [name, setName] = useState('');
@@ -27,74 +28,99 @@ export default function Signup() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
-      <div className="w-full max-w-md">
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-orange-500">Boswell</h1>
-          <p className="text-slate-400 mt-2">Memory for your AI</p>
-        </div>
+    <div className="min-h-screen bg-boswell-bg flex flex-col items-center justify-center px-4">
+      {/* Logo */}
+      <div className="mb-10 animate-fade-in">
+        <Logo size="lg" />
+      </div>
 
-        <form onSubmit={handleSubmit} className="bg-slate-900 rounded-xl p-8 border border-slate-800">
-          <h2 className="text-xl font-semibold text-slate-100 mb-6">Create account</h2>
+      {/* Tagline */}
+      <div className="text-center mb-8 animate-slide-up">
+        <h1 className="font-display text-3xl md:text-4xl text-white mb-2">
+          Get started
+        </h1>
+        <p className="text-gray-500 font-body">
+          Create your Boswell account
+        </p>
+      </div>
 
-          {error && (
-            <div className="mb-4 p-3 bg-red-900/50 border border-red-500/50 rounded-lg text-red-400 text-sm">
-              {error}
-            </div>
-          )}
+      {/* Form Card */}
+      <form 
+        onSubmit={handleSubmit} 
+        className="w-full max-w-sm bg-boswell-card rounded-2xl p-8 border border-boswell-border animate-slide-up"
+        style={{ animationDelay: '0.1s' }}
+      >
+        {error && (
+          <div className="mb-6 p-4 bg-red-950/50 border border-red-900/50 rounded-xl text-red-400 text-sm">
+            {error}
+          </div>
+        )}
 
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-slate-400 mb-1">Name</label>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                required
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-slate-100 focus:outline-none focus:border-orange-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-slate-400 mb-1">Email</label>
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-slate-100 focus:outline-none focus:border-orange-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-slate-400 mb-1">Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                minLength={8}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-slate-100 focus:outline-none focus:border-orange-500"
-              />
-            </div>
+        <div className="space-y-5">
+          <div>
+            <label className="block text-sm font-medium text-gray-400 mb-2">
+              Name
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              placeholder="Your name"
+              className="w-full bg-boswell-bg-secondary border border-boswell-border rounded-xl px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-ember-500 transition-colors"
+            />
           </div>
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full mt-6 py-3 bg-orange-500 hover:bg-orange-400 disabled:bg-slate-700 text-slate-900 font-medium rounded-lg transition-colors"
-          >
-            {loading ? 'Creating account...' : 'Create account'}
-          </button>
+          <div>
+            <label className="block text-sm font-medium text-gray-400 mb-2">
+              Email
+            </label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              placeholder="you@example.com"
+              className="w-full bg-boswell-bg-secondary border border-boswell-border rounded-xl px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-ember-500 transition-colors"
+            />
+          </div>
 
-          <p className="mt-4 text-center text-slate-400 text-sm">
-            Already have an account?{' '}
-            <Link to="/login" className="text-orange-500 hover:text-orange-400">
-              Sign in
-            </Link>
-          </p>
-        </form>
-      </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-400 mb-2">
+              Password
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              minLength={8}
+              placeholder="At least 8 characters"
+              className="w-full bg-boswell-bg-secondary border border-boswell-border rounded-xl px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-ember-500 transition-colors"
+            />
+          </div>
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full mt-8 py-3.5 bg-ember-500 hover:bg-ember-400 disabled:bg-boswell-border disabled:text-gray-500 text-boswell-bg font-semibold rounded-full transition-all duration-200 hover:shadow-glow-sm"
+        >
+          {loading ? 'Creating account...' : 'Create account'}
+        </button>
+
+        <p className="mt-6 text-center text-gray-500 text-sm">
+          Already have an account?{' '}
+          <Link to="/login" className="text-ember-500 hover:text-ember-400 transition-colors">
+            Sign in
+          </Link>
+        </p>
+      </form>
+
+      {/* Footer */}
+      <p className="mt-10 text-gray-600 text-xs animate-fade-in" style={{ animationDelay: '0.3s' }}>
+        Memory for your AI
+      </p>
     </div>
   );
 }
