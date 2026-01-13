@@ -2269,6 +2269,15 @@ app.register_blueprint(registration_bp)
 
 
 # =============================================================================
+# USER LOGIN (W1P2 - CC1) - UNBLOCKS CC3
+# =============================================================================
+
+from auth.login import init_login
+login_bp = init_login(get_db, get_cursor)
+app.register_blueprint(login_bp)
+
+
+# =============================================================================
 # API KEY MANAGEMENT (W1P3 - CC1)
 # =============================================================================
 
