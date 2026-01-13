@@ -2268,6 +2268,15 @@ registration_bp = init_registration(get_db, get_cursor)
 app.register_blueprint(registration_bp)
 
 
+# =============================================================================
+# API KEY MANAGEMENT (W1P3 - CC1)
+# =============================================================================
+
+from auth.api_keys import init_api_keys
+api_keys_bp = init_api_keys(get_db, get_cursor)
+app.register_blueprint(api_keys_bp)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
