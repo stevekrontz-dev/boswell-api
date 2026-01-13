@@ -341,81 +341,87 @@ def create_commit():
     cur = get_cursor()
     now = datetime.utcnow().isoformat() + 'Z'
 
-    content_str = json.dumps(content) if isinstance(content, dict) else str(content)
-    blob_hash = compute_hash(content_str)
+    try:
+        content_str = json.dumps(content) if isinstance(content, dict) else str(content)
+        blob_hash = compute_hash(content_str)
 
-    # Insert blob with encryption if enabled
-    encryption_service = get_encryption_service()
-    dek_info = get_active_dek()
+        # Insert blob with encryption if enabled
+        encryption_service = get_encryption_service()
+        dek_info = get_active_dek()
 
-    if ENCRYPTION_ENABLED and encryption_service and dek_info:
-        # Encrypt the content
-        key_id, wrapped_dek = dek_info
-        plaintext_dek = encryption_service.unwrap_dek(key_id, wrapped_dek)
-        ciphertext, nonce = encryption_service.encrypt(content_str, plaintext_dek)
+        if ENCRYPTION_ENABLED and encryption_service and dek_info:
+            # Encrypt the content
+            key_id, wrapped_dek = dek_info
+            plaintext_dek = encryption_service.unwrap_dek(key_id, wrapped_dek)
+            ciphertext, nonce = encryption_service.encrypt(content_str, plaintext_dek)
 
+            cur.execute(
+                '''INSERT INTO blobs (blob_hash, tenant_id, content, content_encrypted, nonce, encryption_key_id, content_type, created_at, byte_size)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (blob_hash) DO NOTHING''',
+                (blob_hash, DEFAULT_TENANT, content_str, psycopg2.Binary(ciphertext), psycopg2.Binary(nonce), key_id, memory_type, now, len(content_str))
+            )
+        else:
+            # Fallback: store unencrypted
+            cur.execute(
+                '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (blob_hash) DO NOTHING''',
+                (blob_hash, DEFAULT_TENANT, content_str, memory_type, now, len(content_str))
+            )
+
+        tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
         cur.execute(
-            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_encrypted, nonce, encryption_key_id, content_type, created_at, byte_size)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-               ON CONFLICT (blob_hash) DO NOTHING''',
-            (blob_hash, DEFAULT_TENANT, content_str, psycopg2.Binary(ciphertext), psycopg2.Binary(nonce), key_id, memory_type, now, len(content_str))
-        )
-    else:
-        # Fallback: store unencrypted
-        cur.execute(
-            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
-               VALUES (%s, %s, %s, %s, %s, %s)
-               ON CONFLICT (blob_hash) DO NOTHING''',
-            (blob_hash, DEFAULT_TENANT, content_str, memory_type, now, len(content_str))
-        )
-
-    tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
-    cur.execute(
-        '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
-           VALUES (%s, %s, %s, %s, %s)''',
-        (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, memory_type)
-    )
-
-    cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
-    branch_row = cur.fetchone()
-    parent_hash = branch_row['head_commit'] if branch_row else None
-    if parent_hash == 'GENESIS':
-        parent_hash = None
-
-    commit_data = f"{tree_hash}:{parent_hash}:{message}:{now}"
-    commit_hash = compute_hash(commit_data)
-
-    cur.execute(
-        '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-        (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, author, message, now)
-    )
-
-    cur.execute(
-        'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
-        (commit_hash, branch, DEFAULT_TENANT)
-    )
-
-    for tag in tags:
-        tag_str = tag if isinstance(tag, str) else str(tag)
-        cur.execute(
-            '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT (tenant_id, blob_hash, tag) DO NOTHING''',
-            (DEFAULT_TENANT, blob_hash, tag_str, now)
+            '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
+               VALUES (%s, %s, %s, %s, %s)''',
+            (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, memory_type)
         )
 
-    db.commit()
-    cur.close()
+        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        branch_row = cur.fetchone()
+        parent_hash = branch_row['head_commit'] if branch_row else None
+        if parent_hash == 'GENESIS':
+            parent_hash = None
 
-    return jsonify({
-        'status': 'committed',
-        'commit_hash': commit_hash,
-        'blob_hash': blob_hash,
-        'tree_hash': tree_hash,
-        'branch': branch,
-        'message': message
-    }), 201
+        commit_data = f"{tree_hash}:{parent_hash}:{message}:{now}"
+        commit_hash = compute_hash(commit_data)
+
+        cur.execute(
+            '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+            (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, author, message, now)
+        )
+
+        cur.execute(
+            'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
+            (commit_hash, branch, DEFAULT_TENANT)
+        )
+
+        for tag in tags:
+            tag_str = tag if isinstance(tag, str) else str(tag)
+            cur.execute(
+                '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (tenant_id, blob_hash, tag) DO NOTHING''',
+                (DEFAULT_TENANT, blob_hash, tag_str, now)
+            )
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'committed',
+            'commit_hash': commit_hash,
+            'blob_hash': blob_hash,
+            'tree_hash': tree_hash,
+            'branch': branch,
+            'message': message
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Commit failed: {str(e)}'}), 500
 
 @app.route('/v2/log', methods=['GET'])
 def get_log():
