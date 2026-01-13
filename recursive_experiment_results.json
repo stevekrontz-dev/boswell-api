@@ -1,0 +1,371 @@
+{
+  "experiment": "Recursive Sub-Agent Spawning",
+  "timestamp": "2026-01-13T04:44:10.835937",
+  "architecture": {
+    "depth_0": "CC4 (root)",
+    "depth_1": [
+      "CC4a",
+      "CC4b",
+      "CC4c"
+    ],
+    "depth_2": [
+      "CC4a-1",
+      "CC4a-2",
+      "CC4a-3",
+      "CC4b-1",
+      "CC4b-2",
+      "CC4b-3",
+      "CC4c-1",
+      "CC4c-2"
+    ]
+  },
+  "metrics": {
+    "total_agents": 11,
+    "max_depth": 2,
+    "coordinators": 3,
+    "workers": 8,
+    "total_tests": 19,
+    "passed": 19,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "spawn_time_ms": 1.41,
+    "total_time_ms": 4641.42,
+    "sequential_estimate_ms": 45766.3,
+    "speedup": 9.86
+  },
+  "spawn_log": [
+    {
+      "timestamp": "2026-01-13T04:44:06.195231",
+      "agent": "CC4a",
+      "depth": 1,
+      "parent": "CC4",
+      "count": 1
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.195547",
+      "agent": "CC4b",
+      "depth": 1,
+      "parent": "CC4",
+      "count": 2
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.195789",
+      "agent": "CC4c",
+      "depth": 1,
+      "parent": "CC4",
+      "count": 3
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.196108",
+      "agent": "CC4b-1",
+      "depth": 2,
+      "parent": "CC4b",
+      "count": 4
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.196564",
+      "agent": "CC4a-1",
+      "depth": 2,
+      "parent": "CC4a",
+      "count": 5
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.197643",
+      "agent": "CC4a-2",
+      "depth": 2,
+      "parent": "CC4a",
+      "count": 6
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.198383",
+      "agent": "CC4b-2",
+      "depth": 2,
+      "parent": "CC4b",
+      "count": 7
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.199124",
+      "agent": "CC4c-1",
+      "depth": 2,
+      "parent": "CC4c",
+      "count": 8
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.199663",
+      "agent": "CC4a-3",
+      "depth": 2,
+      "parent": "CC4a",
+      "count": 9
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.202181",
+      "agent": "CC4b-3",
+      "depth": 2,
+      "parent": "CC4b",
+      "count": 10
+    },
+    {
+      "timestamp": "2026-01-13T04:44:06.202993",
+      "agent": "CC4c-2",
+      "depth": 2,
+      "parent": "CC4c",
+      "count": 11
+    }
+  ],
+  "results": {
+    "CC4b": {
+      "name": "CC4b",
+      "depth": 1,
+      "task": "API Keys coordinator",
+      "spawned_children": true,
+      "children": {
+        "CC4b-1": {
+          "name": "CC4b-1",
+          "depth": 2,
+          "task": "Test create key",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "create_key_requires_auth",
+              "status": "PASS",
+              "http_code": 405,
+              "elapsed_ms": 2621.7,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/api/keys -> 405"
+            },
+            {
+              "name": "v2_create_key",
+              "status": "PASS",
+              "http_code": 401,
+              "elapsed_ms": 1105.7,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/v2/auth/keys/create -> 401"
+            }
+          ],
+          "elapsed_ms": 3732.09,
+          "error": null
+        },
+        "CC4b-2": {
+          "name": "CC4b-2",
+          "depth": 2,
+          "task": "Test list keys",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "list_keys_requires_auth",
+              "status": "PASS",
+              "http_code": 404,
+              "elapsed_ms": 2662.99,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/api/keys -> 404"
+            },
+            {
+              "name": "v2_list_keys",
+              "status": "PASS",
+              "http_code": 401,
+              "elapsed_ms": 1141.96,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/v2/auth/keys -> 401"
+            }
+          ],
+          "elapsed_ms": 3808.16,
+          "error": null
+        },
+        "CC4b-3": {
+          "name": "CC4b-3",
+          "depth": 2,
+          "task": "Test delete key",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "delete_key_requires_auth",
+              "status": "PASS",
+              "http_code": 405,
+              "elapsed_ms": 2684.07,
+              "details": "DELETE https://delightful-imagination-production-f6a1.up.railway.app/api/keys/test-key-id -> 405"
+            },
+            {
+              "name": "v2_delete_key",
+              "status": "PASS",
+              "http_code": 401,
+              "elapsed_ms": 1139.9,
+              "details": "DELETE https://delightful-imagination-production-f6a1.up.railway.app/v2/auth/keys/test-key-id -> 401"
+            }
+          ],
+          "elapsed_ms": 3828.42,
+          "error": null
+        }
+      },
+      "tests": [],
+      "elapsed_ms": 3836.18,
+      "error": null
+    },
+    "CC4c": {
+      "name": "CC4c",
+      "depth": 1,
+      "task": "Extension coordinator",
+      "spawned_children": true,
+      "children": {
+        "CC4c-1": {
+          "name": "CC4c-1",
+          "depth": 2,
+          "task": "Test extension download",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "download_requires_key",
+              "status": "PASS",
+              "http_code": 401,
+              "elapsed_ms": 2635.86,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/api/extension/download -> 401"
+            },
+            {
+              "name": "download_rejects_invalid_key",
+              "status": "PASS",
+              "http_code": 401,
+              "elapsed_ms": 1103.08,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/api/extension/download -> 401"
+            }
+          ],
+          "elapsed_ms": 3740.89,
+          "error": null
+        },
+        "CC4c-2": {
+          "name": "CC4c-2",
+          "depth": 2,
+          "task": "Test file structure",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "static_frontend_loads",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 2569.58,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/ -> 200"
+            },
+            {
+              "name": "dashboard_accessible",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 1113.53,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/dashboard -> 200"
+            },
+            {
+              "name": "connect_page_accessible",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 892.96,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/dashboard/connect -> 200"
+            }
+          ],
+          "elapsed_ms": 4580.32,
+          "error": null
+        }
+      },
+      "tests": [],
+      "elapsed_ms": 4587.83,
+      "error": null
+    },
+    "CC4a": {
+      "name": "CC4a",
+      "depth": 1,
+      "task": "Auth coordinator",
+      "spawned_children": true,
+      "children": {
+        "CC4a-3": {
+          "name": "CC4a-3",
+          "depth": 2,
+          "task": "Test password reset",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "password_reset_request",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 2636.67,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/v2/auth/password-reset/request -> 200"
+            },
+            {
+              "name": "password_reset_page",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 1149.09,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/reset-password -> 200"
+            }
+          ],
+          "elapsed_ms": 3788.84,
+          "error": null
+        },
+        "CC4a-1": {
+          "name": "CC4a-1",
+          "depth": 2,
+          "task": "Test signup",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "signup_page_loads",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 2620.84,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/signup -> 200"
+            },
+            {
+              "name": "signup_api_rejects_invalid",
+              "status": "PASS",
+              "http_code": 405,
+              "elapsed_ms": 1055.79,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/api/auth/signup -> 405"
+            },
+            {
+              "name": "register_endpoint_exists",
+              "status": "PASS",
+              "http_code": 400,
+              "elapsed_ms": 905.11,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/v2/auth/register -> 400"
+            }
+          ],
+          "elapsed_ms": 4585.65,
+          "error": null
+        },
+        "CC4a-2": {
+          "name": "CC4a-2",
+          "depth": 2,
+          "task": "Test login",
+          "spawned_children": false,
+          "children": {},
+          "tests": [
+            {
+              "name": "login_page_loads",
+              "status": "PASS",
+              "http_code": 200,
+              "elapsed_ms": 2664.26,
+              "details": "GET https://delightful-imagination-production-f6a1.up.railway.app/login -> 200"
+            },
+            {
+              "name": "login_rejects_bad_creds",
+              "status": "PASS",
+              "http_code": 405,
+              "elapsed_ms": 1061.0,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/api/auth/login -> 405"
+            },
+            {
+              "name": "v2_login_endpoint",
+              "status": "PASS",
+              "http_code": 401,
+              "elapsed_ms": 907.09,
+              "details": "POST https://delightful-imagination-production-f6a1.up.railway.app/v2/auth/login -> 401"
+            }
+          ],
+          "elapsed_ms": 4637.61,
+          "error": null
+        }
+      },
+      "tests": [],
+      "elapsed_ms": 4640.31,
+      "error": null
+    }
+  }
+}

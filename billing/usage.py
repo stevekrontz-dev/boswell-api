@@ -29,6 +29,8 @@ def get_tenant_usage(cursor, tenant_id: str) -> Dict[str, Any]:
     storage_mb = 0.0
 
     try:
+        # Use savepoint to prevent transaction corruption on error
+        cursor.execute("SAVEPOINT usage_commits")
         # Count commits this month
         cursor.execute("""
             SELECT COUNT(*) as cnt FROM commits
@@ -37,20 +39,24 @@ def get_tenant_usage(cursor, tenant_id: str) -> Dict[str, Any]:
         """, (tenant_id,))
         row = cursor.fetchone()
         commits = row['cnt'] if row else 0
+        cursor.execute("RELEASE SAVEPOINT usage_commits")
     except Exception:
-        pass
+        cursor.execute("ROLLBACK TO SAVEPOINT usage_commits")
 
     try:
+        cursor.execute("SAVEPOINT usage_branches")
         # Count branches
         cursor.execute("""
             SELECT COUNT(*) as cnt FROM branches WHERE tenant_id = %s
         """, (tenant_id,))
         row = cursor.fetchone()
         branches = row['cnt'] if row else 0
+        cursor.execute("RELEASE SAVEPOINT usage_branches")
     except Exception:
-        pass
+        cursor.execute("ROLLBACK TO SAVEPOINT usage_branches")
 
     try:
+        cursor.execute("SAVEPOINT usage_storage")
         # Calculate storage (approximate from blob sizes)
         cursor.execute("""
             SELECT COALESCE(SUM(byte_size), 0) / 1048576.0 as storage
@@ -58,8 +64,9 @@ def get_tenant_usage(cursor, tenant_id: str) -> Dict[str, Any]:
         """, (tenant_id,))
         row = cursor.fetchone()
         storage_mb = round(row['storage'] if row else 0, 2)
+        cursor.execute("RELEASE SAVEPOINT usage_storage")
     except Exception:
-        pass
+        cursor.execute("ROLLBACK TO SAVEPOINT usage_storage")
 
     return {
         'commits': commits,
@@ -80,15 +87,20 @@ def get_tenant_plan(cursor, tenant_id: str) -> str:
         Plan ID string ('free', 'pro', 'team')
     """
     try:
+        cursor.execute("SAVEPOINT tenant_plan")
         cursor.execute("""
             SELECT plan_id FROM subscriptions
             WHERE tenant_id = %s AND status = 'active'
         """, (tenant_id,))
         row = cursor.fetchone()
+        cursor.execute("RELEASE SAVEPOINT tenant_plan")
         if row and row.get('plan_id'):
             return row['plan_id']
     except Exception:
-        pass
+        try:
+            cursor.execute("ROLLBACK TO SAVEPOINT tenant_plan")
+        except Exception:
+            pass  # Savepoint may not exist
 
     return 'free'  # Default to free tier
 

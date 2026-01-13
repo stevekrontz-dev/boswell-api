@@ -111,4 +111,71 @@ CC4 (Parent - Coordinator)
 - [ ] Test with actual Anthropic API sub-agents for complex reasoning tasks
 - [ ] Measure sub-agent coordination overhead
 - [ ] Test sub-agent failure recovery
-- [ ] Explore nested sub-agents (CC4a spawning CC4a1, CC4a2)
+- [x] ~~Explore nested sub-agents~~ **DONE - See Phase 2 below**
+
+---
+
+# Phase 2: Recursive Sub-Agent Experiment
+
+**Date:** 2026-01-13T04:44:06
+**Experiment:** Recursive spawning - sub-agents spawn their own sub-agents
+
+## Architecture (Depth 2)
+
+```
+CC4 (depth 0 - root)
+  └── CC4a (depth 1 - auth coordinator)
+        ├── CC4a-1 (depth 2 - test signup)
+        ├── CC4a-2 (depth 2 - test login)
+        └── CC4a-3 (depth 2 - test password reset)
+  └── CC4b (depth 1 - keys coordinator)
+        ├── CC4b-1 (depth 2 - test create)
+        ├── CC4b-2 (depth 2 - test list)
+        └── CC4b-3 (depth 2 - test delete)
+  └── CC4c (depth 1 - extension coordinator)
+        ├── CC4c-1 (depth 2 - test download)
+        └── CC4c-2 (depth 2 - test file structure)
+```
+
+## Spawn Log
+
+| Order | Agent | Depth | Parent |
+|-------|-------|-------|--------|
+| 1 | CC4a | 1 | CC4 |
+| 2 | CC4b | 1 | CC4 |
+| 3 | CC4c | 1 | CC4 |
+| 4-11 | Workers | 2 | Coordinators |
+
+## Results
+
+| Metric | Value |
+|--------|-------|
+| **Total Agents** | **11** |
+| Coordinators (depth 1) | 3 |
+| Workers (depth 2) | 8 |
+| **Total Tests** | **19** |
+| **Pass Rate** | **100%** |
+
+## Timing
+
+| Metric | Value |
+|--------|-------|
+| Spawn Overhead | 1.41ms |
+| **Total Time** | **4.64s** |
+| Sequential Estimate | 45.77s |
+| **SPEEDUP** | **9.86x** |
+
+## Key Findings
+
+1. **RECURSIVE SPAWNING WORKS** - All 11 agents ran successfully
+2. **9.86x SPEEDUP** - vs 2.7x in Phase 1 (parallelism compounds!)
+3. **NO CONTEXT DEGRADATION** - 100% pass rate at depth 2
+4. **RESULTS BUBBLE UP** - Child results aggregate correctly
+
+## Phase 1 vs Phase 2
+
+| Metric | Phase 1 | Phase 2 |
+|--------|---------|---------|
+| Agents | 3 | 11 |
+| Depth | 1 | 2 |
+| Speedup | 2.7x | 9.86x |
