@@ -44,8 +44,11 @@ export async function fetchWithAuth(endpoint: string, options: RequestInit = {})
 }
 
 export async function getApiKeys() {
-  return fetchWithAuth('/v2/auth/keys');
+  const data = await fetchWithAuth('/v2/auth/keys');
+  if (Array.isArray(data)) { return { keys: data }; }
+  return data;
 }
+
 
 export async function createApiKey() {
   return fetchWithAuth('/v2/auth/keys/create', { method: 'POST' });
