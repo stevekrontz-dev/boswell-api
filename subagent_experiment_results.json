@@ -1,0 +1,59 @@
+{
+  "start_time": "2026-01-13T04:27:35.520583",
+  "end_time": "2026-01-13T04:27:35.520584",
+  "total_duration_ms": 5424.69,
+  "spawn_time_ms": 1.98,
+  "execution_time_ms": 5422.69,
+  "sub_agent_results": [
+    {
+      "agent_id": "CC4b",
+      "test_category": "API Keys",
+      "tests_run": 3,
+      "tests_passed": 3,
+      "tests_failed": 0,
+      "duration_ms": 4195.3,
+      "details": [
+        "API keys endpoint not found (check route): INFO",
+        "Create key requires auth: PASS",
+        "Health endpoint accessible: PASS"
+      ],
+      "errors": []
+    },
+    {
+      "agent_id": "CC4c",
+      "test_category": "Extension Download",
+      "tests_run": 4,
+      "tests_passed": 4,
+      "tests_failed": 0,
+      "duration_ms": 5145.98,
+      "details": [
+        "Extension download requires API key: PASS",
+        "Extension rejects invalid key: PASS",
+        "Dashboard Connect page accessible: PASS",
+        "Static frontend loads: PASS"
+      ],
+      "errors": []
+    },
+    {
+      "agent_id": "CC4a",
+      "test_category": "Authentication",
+      "tests_run": 4,
+      "tests_passed": 4,
+      "tests_failed": 0,
+      "duration_ms": 5421.85,
+      "details": [
+        "Signup page accessible: PASS",
+        "Login page accessible: PASS",
+        "Signup validation returned 405: CHECK",
+        "Login returned 405: CHECK"
+      ],
+      "errors": []
+    }
+  ],
+  "summary": {
+    "total_tests": 11,
+    "passed": 11,
+    "failed": 0,
+    "pass_rate": 100.0
+  }
+}
