@@ -24,3 +24,4 @@ service-account-key.json
 .env
 .env.local
 tmpclaude-*
+extension/server/node_modules/
