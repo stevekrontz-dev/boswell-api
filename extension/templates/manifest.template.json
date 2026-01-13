@@ -1,0 +1,130 @@
+{
+  "manifest_version": "0.3",
+  "name": "boswell-memory",
+  "display_name": "Boswell Memory",
+  "version": "1.0.0",
+  "description": "Git-style memory system for AI assistants. Commit, search, and recall memories across conversations.",
+  "author": {
+    "name": "Boswell",
+    "url": "https://askboswell.com"
+  },
+  "license": "Proprietary",
+  "homepage": "https://askboswell.com",
+  "documentation": "https://askboswell.com/docs",
+  "support": "https://askboswell.com/support",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/askboswell/boswell-extension"
+  },
+  "icon": "icon.png",
+  "keywords": [
+    "memory",
+    "git",
+    "knowledge-base",
+    "ai-assistant",
+    "context"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "BOSWELL_API_KEY": "${user_config.api_key}",
+        "BOSWELL_TENANT_ID": "${user_config.tenant_id}",
+        "BOSWELL_API_ENDPOINT": "${user_config.api_endpoint}"
+      }
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "API Key",
+      "description": "Your Boswell API key",
+      "required": true,
+      "sensitive": true
+    },
+    "tenant_id": {
+      "type": "string",
+      "title": "Tenant ID",
+      "description": "Your Boswell tenant identifier",
+      "required": true
+    },
+    "api_endpoint": {
+      "type": "string",
+      "title": "API Endpoint",
+      "description": "Boswell API endpoint URL",
+      "required": true,
+      "default": "https://boswell-api-production.up.railway.app"
+    }
+  },
+  "tools": [
+    {
+      "name": "boswell_startup",
+      "description": "Load startup context including sacred manifest and tool registry"
+    },
+    {
+      "name": "boswell_brief",
+      "description": "Get a quick context brief of current Boswell state"
+    },
+    {
+      "name": "boswell_commit",
+      "description": "Commit a new memory to Boswell"
+    },
+    {
+      "name": "boswell_search",
+      "description": "Search memories across all branches by keyword"
+    },
+    {
+      "name": "boswell_recall",
+      "description": "Recall a specific memory by hash"
+    },
+    {
+      "name": "boswell_log",
+      "description": "Get commit history for a branch"
+    },
+    {
+      "name": "boswell_branches",
+      "description": "List all cognitive branches"
+    },
+    {
+      "name": "boswell_head",
+      "description": "Get the current HEAD commit for a branch"
+    },
+    {
+      "name": "boswell_graph",
+      "description": "Get the full memory graph"
+    },
+    {
+      "name": "boswell_links",
+      "description": "List resonance links between memories"
+    },
+    {
+      "name": "boswell_link",
+      "description": "Create a resonance link between two memories"
+    },
+    {
+      "name": "boswell_reflect",
+      "description": "Get AI-surfaced insights and patterns"
+    },
+    {
+      "name": "boswell_checkout",
+      "description": "Switch focus to a different cognitive branch"
+    }
+  ],
+  "tools_generated": false,
+  "_meta": {
+    "com.anthropic.claude": {
+      "category": "productivity",
+      "featured": false
+    }
+  }
+}
