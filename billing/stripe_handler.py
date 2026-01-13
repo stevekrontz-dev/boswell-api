@@ -505,3 +505,36 @@ def billing_health():
         'stripe_configured': bool(stripe.api_key),
         'webhook_secret_configured': bool(WEBHOOK_SECRET)
     })
+
+
+# ============================================================================
+# W2P4: Usage Tracking Endpoint
+# Owner: CC2
+# ============================================================================
+
+@billing_bp.route('/usage', methods=['GET'])
+def get_usage():
+    """
+    Get current usage and limits for the tenant.
+
+    Returns usage stats, plan limits, and percentage utilization.
+    Used by dashboard to show usage meters and upgrade prompts.
+
+    Returns:
+        plan: Current plan info
+        usage: Current period usage (commits, branches, storage)
+        limits: Plan limits
+        percentages: Usage as percentage of limits
+        at_limit: Boolean flags for each limit
+    """
+    from .usage import get_usage_summary
+    get_db, get_cursor, DEFAULT_TENANT = get_db_functions()
+
+    tenant_id = request.headers.get('X-Tenant-ID', DEFAULT_TENANT)
+
+    cur = get_cursor()
+    try:
+        summary = get_usage_summary(cur, tenant_id)
+        return jsonify(summary)
+    finally:
+        cur.close()
