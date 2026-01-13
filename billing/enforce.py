@@ -216,18 +216,23 @@ def enforce_commit_limit(cursor, tenant_id: str):
     from .usage import get_tenant_usage, get_tenant_plan
     from .plans import get_plan_limits
 
-    plan_id = get_tenant_plan(cursor, tenant_id)
-    limits = get_plan_limits(plan_id)
-    usage = get_tenant_usage(cursor, tenant_id)
+    try:
+        plan_id = get_tenant_plan(cursor, tenant_id)
+        limits = get_plan_limits(plan_id)
+        usage = get_tenant_usage(cursor, tenant_id)
 
-    commit_limit = limits.get('commit_limit')
-    current_commits = usage.get('commits', 0)
+        commit_limit = limits.get('commit_limit')
+        current_commits = usage.get('commits', 0)
 
-    if commit_limit is not None and current_commits >= commit_limit:
-        print(f"[BILLING] Commit limit hit: tenant={tenant_id}, plan={plan_id}, usage={current_commits}/{commit_limit}", flush=True)
-        return limit_exceeded_response('commit', current_commits, commit_limit, plan_id)
+        if commit_limit is not None and current_commits >= commit_limit:
+            print(f"[BILLING] Commit limit hit: tenant={tenant_id}, plan={plan_id}, usage={current_commits}/{commit_limit}", flush=True)
+            return limit_exceeded_response('commit', current_commits, commit_limit, plan_id)
 
-    return None
+        return None
+    except Exception as e:
+        print(f"[BILLING] Error in enforce_commit_limit: {e}", flush=True)
+        # Fail open - allow the operation if limit check fails
+        return None
 
 
 def enforce_branch_limit(cursor, tenant_id: str):
