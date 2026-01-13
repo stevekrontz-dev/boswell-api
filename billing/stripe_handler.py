@@ -270,14 +270,16 @@ def get_or_create_stripe_customer(tenant_id: str) -> str:
 
     try:
         # Check if tenant already has a Stripe customer
-        cur.execute("""
-            SELECT stripe_customer_id FROM subscriptions
-            WHERE tenant_id = %s AND stripe_customer_id IS NOT NULL
-        """, (tenant_id,))
-
-        row = cur.fetchone()
-        if row and row.get('stripe_customer_id'):
-            return row['stripe_customer_id']
+        try:
+            cur.execute("""
+                SELECT stripe_customer_id FROM subscriptions
+                WHERE tenant_id = %s AND stripe_customer_id IS NOT NULL
+            """, (tenant_id,))
+            row = cur.fetchone()
+            if row and row.get('stripe_customer_id'):
+                return row['stripe_customer_id']
+        except Exception as e:
+            print(f"[STRIPE] Subscription lookup error (table may not exist): {e}", flush=True)
 
         # Create new Stripe customer
         customer = stripe.Customer.create(
