@@ -1,0 +1,19 @@
+{
+  "name": "boswell-mcp-server",
+  "version": "1.0.0",
+  "description": "Boswell MCP Server - Git-style memory for AI assistants",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Boswell",
+  "license": "Proprietary"
+}
