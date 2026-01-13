@@ -276,8 +276,8 @@ def get_or_create_stripe_customer(tenant_id: str) -> str:
         """, (tenant_id,))
 
         row = cur.fetchone()
-        if row and row[0]:
-            return row[0]
+        if row and row.get('stripe_customer_id'):
+            return row['stripe_customer_id']
 
         # Create new Stripe customer
         customer = stripe.Customer.create(
@@ -309,24 +309,27 @@ def get_tenant_usage(tenant_id: str) -> dict:
     try:
         # Count commits this month
         cur.execute("""
-            SELECT COUNT(*) FROM commits
+            SELECT COUNT(*) as cnt FROM commits
             WHERE tenant_id = %s
             AND created_at >= date_trunc('month', CURRENT_TIMESTAMP)
         """, (tenant_id,))
-        commits = cur.fetchone()[0] or 0
+        row = cur.fetchone()
+        commits = row['cnt'] if row else 0
 
         # Count branches
         cur.execute("""
-            SELECT COUNT(*) FROM branches WHERE tenant_id = %s
+            SELECT COUNT(*) as cnt FROM branches WHERE tenant_id = %s
         """, (tenant_id,))
-        branches = cur.fetchone()[0] or 0
+        row = cur.fetchone()
+        branches = row['cnt'] if row else 0
 
         # Calculate storage (approximate from blob sizes)
         cur.execute("""
-            SELECT COALESCE(SUM(LENGTH(content)), 0) / 1048576.0
+            SELECT COALESCE(SUM(LENGTH(content)), 0) / 1048576.0 as storage
             FROM blobs WHERE tenant_id = %s
         """, (tenant_id,))
-        storage_mb = round(cur.fetchone()[0] or 0, 2)
+        row = cur.fetchone()
+        storage_mb = round(row['storage'] if row else 0, 2)
 
         return {
             'commits': commits,
@@ -437,7 +440,11 @@ def get_subscription():
         row = cur.fetchone()
 
         if row:
-            plan_id, status, stripe_sub_id, period_start, period_end = row
+            plan_id = row['plan_id']
+            status = row['status']
+            stripe_sub_id = row['stripe_subscription_id']
+            period_start = row['current_period_start']
+            period_end = row['current_period_end']
         else:
             # No subscription record = free tier
             plan_id = 'free'
