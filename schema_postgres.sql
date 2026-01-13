@@ -87,6 +87,21 @@ CREATE TABLE sessions (
   status VARCHAR(50)
 );
 
+-- PART 4B: BILLING TABLES (W2P3)
+CREATE TABLE subscriptions (
+  id SERIAL PRIMARY KEY,
+  tenant_id UUID REFERENCES tenants(id) UNIQUE,
+  stripe_customer_id VARCHAR(255),
+  stripe_subscription_id VARCHAR(255) UNIQUE,
+  plan_id VARCHAR(50) NOT NULL DEFAULT 'free',
+  status VARCHAR(50) NOT NULL DEFAULT 'active',
+  current_period_start TIMESTAMPTZ,
+  current_period_end TIMESTAMPTZ,
+  canceled_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- PART 5: INDEXES
 CREATE INDEX idx_branches_tenant ON branches(tenant_id);
 CREATE INDEX idx_blobs_tenant ON blobs(tenant_id);
@@ -95,6 +110,7 @@ CREATE INDEX idx_tree_entries_tenant ON tree_entries(tenant_id);
 CREATE INDEX idx_cross_references_tenant ON cross_references(tenant_id);
 CREATE INDEX idx_tags_tenant ON tags(tenant_id);
 CREATE INDEX idx_sessions_tenant ON sessions(tenant_id);
+CREATE INDEX idx_subscriptions_tenant ON subscriptions(tenant_id);
 
 -- PART 6: ROW LEVEL SECURITY
 ALTER TABLE branches ENABLE ROW LEVEL SECURITY;
@@ -104,6 +120,7 @@ ALTER TABLE tree_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cross_references ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON branches USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 CREATE POLICY tenant_isolation ON blobs USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
@@ -112,6 +129,7 @@ CREATE POLICY tenant_isolation ON tree_entries USING (tenant_id = current_settin
 CREATE POLICY tenant_isolation ON cross_references USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 CREATE POLICY tenant_isolation ON tags USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 CREATE POLICY tenant_isolation ON sessions USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+CREATE POLICY tenant_isolation ON subscriptions USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
 -- PART 7: VERIFY
 -- SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';
