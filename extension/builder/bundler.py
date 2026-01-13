@@ -53,6 +53,25 @@ class BundleBuilder:
     MANIFEST_VERSION = "0.3"
     BUNDLE_VERSION = "1.0.0"
 
+    # Files and directories to exclude from bundle
+    EXCLUDE_PATTERNS = {
+        '__pycache__',
+        '.git',
+        '.gitignore',
+        '.DS_Store',
+        'Thumbs.db',
+        '.env',
+        '.env.local',
+        '*.pyc',
+        '*.pyo',
+        '*.log',
+        'tmp*',
+        '*.tmp',
+        '.vscode',
+        '.idea',
+        'node_modules/.cache',
+    }
+
     def __init__(self, template_dir: Path, server_dir: Optional[Path] = None):
         """
         Initialize the bundle builder.
@@ -142,16 +161,43 @@ class BundleBuilder:
         }
         return manifest
 
+    def _should_exclude(self, file_path: Path) -> bool:
+        """Check if a file should be excluded from the bundle."""
+        import fnmatch
+        path_str = str(file_path)
+        name = file_path.name
+
+        for pattern in self.EXCLUDE_PATTERNS:
+            # Check exact name match
+            if name == pattern:
+                return True
+            # Check if any parent directory matches
+            for part in file_path.parts:
+                if part == pattern:
+                    return True
+            # Check glob patterns
+            if '*' in pattern and fnmatch.fnmatch(name, pattern):
+                return True
+            # Check path contains pattern
+            if pattern in path_str:
+                return True
+        return False
+
     def _create_zip(self, manifest: dict, output_path: Path) -> None:
         """Create the .mcpb ZIP archive."""
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             # Write manifest
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
 
-            # Copy server files
+            # Copy icon if it exists
+            icon_path = self.template_dir / "icon.png"
+            if icon_path.exists():
+                zf.write(icon_path, "icon.png")
+
+            # Copy server files (excluding temp files, cache, etc.)
             if self.server_dir.exists():
                 for file_path in self.server_dir.rglob("*"):
-                    if file_path.is_file():
+                    if file_path.is_file() and not self._should_exclude(file_path):
                         arcname = f"server/{file_path.relative_to(self.server_dir)}"
                         zf.write(file_path, arcname)
 
