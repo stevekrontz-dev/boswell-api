@@ -277,6 +277,15 @@ def create_branch():
     if not name:
         return jsonify({'error': 'Branch name required'}), 400
 
+    # W2P4: Check branch limit before creating
+    from billing.enforce import enforce_branch_limit
+    tenant_id = request.headers.get('X-Tenant-ID', DEFAULT_TENANT)
+    limit_cur = get_cursor()
+    limit_error = enforce_branch_limit(limit_cur, tenant_id)
+    limit_cur.close()
+    if limit_error:
+        return limit_error
+
     db = get_db()
     cur = get_cursor()
 
@@ -318,6 +327,15 @@ def create_commit():
 
     if not content:
         return jsonify({'error': 'Content required'}), 400
+
+    # W2P4: Check commit limit before creating
+    from billing.enforce import enforce_commit_limit
+    tenant_id = request.headers.get('X-Tenant-ID', DEFAULT_TENANT)
+    limit_cur = get_cursor()
+    limit_error = enforce_commit_limit(limit_cur, tenant_id)
+    limit_cur.close()
+    if limit_error:
+        return limit_error
 
     db = get_db()
     cur = get_cursor()
