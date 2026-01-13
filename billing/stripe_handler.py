@@ -307,29 +307,42 @@ def get_tenant_usage(tenant_id: str) -> dict:
     cur = get_cursor()
 
     try:
-        # Count commits this month
-        cur.execute("""
-            SELECT COUNT(*) as cnt FROM commits
-            WHERE tenant_id = %s
-            AND created_at >= date_trunc('month', CURRENT_TIMESTAMP)
-        """, (tenant_id,))
-        row = cur.fetchone()
-        commits = row['cnt'] if row else 0
+        commits = 0
+        branches = 0
+        storage_mb = 0.0
 
-        # Count branches
-        cur.execute("""
-            SELECT COUNT(*) as cnt FROM branches WHERE tenant_id = %s
-        """, (tenant_id,))
-        row = cur.fetchone()
-        branches = row['cnt'] if row else 0
+        try:
+            # Count commits this month
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM commits
+                WHERE tenant_id = %s
+                AND created_at >= date_trunc('month', CURRENT_TIMESTAMP)
+            """, (tenant_id,))
+            row = cur.fetchone()
+            commits = row['cnt'] if row else 0
+        except Exception:
+            pass
 
-        # Calculate storage (approximate from blob sizes)
-        cur.execute("""
-            SELECT COALESCE(SUM(LENGTH(content)), 0) / 1048576.0 as storage
-            FROM blobs WHERE tenant_id = %s
-        """, (tenant_id,))
-        row = cur.fetchone()
-        storage_mb = round(row['storage'] if row else 0, 2)
+        try:
+            # Count branches
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM branches WHERE tenant_id = %s
+            """, (tenant_id,))
+            row = cur.fetchone()
+            branches = row['cnt'] if row else 0
+        except Exception:
+            pass
+
+        try:
+            # Calculate storage (approximate from blob sizes)
+            cur.execute("""
+                SELECT COALESCE(SUM(LENGTH(content)), 0) / 1048576.0 as storage
+                FROM blobs WHERE tenant_id = %s
+            """, (tenant_id,))
+            row = cur.fetchone()
+            storage_mb = round(row['storage'] if row else 0, 2)
+        except Exception:
+            pass
 
         return {
             'commits': commits,
@@ -430,14 +443,17 @@ def get_subscription():
     cur = get_cursor()
 
     try:
-        # Get subscription record
-        cur.execute("""
-            SELECT plan_id, status, stripe_subscription_id,
-                   current_period_start, current_period_end
-            FROM subscriptions WHERE tenant_id = %s
-        """, (tenant_id,))
-
-        row = cur.fetchone()
+        # Get subscription record (may not exist if table not created)
+        try:
+            cur.execute("""
+                SELECT plan_id, status, stripe_subscription_id,
+                       current_period_start, current_period_end
+                FROM subscriptions WHERE tenant_id = %s
+            """, (tenant_id,))
+            row = cur.fetchone()
+        except Exception as e:
+            print(f"[BILLING] Subscription table query error: {e}", flush=True)
+            row = None
 
         if row:
             plan_id = row['plan_id']
