@@ -17,6 +17,9 @@ COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY extension/ ./extension/
 
+# Copy React dashboard build
+COPY static/dist/ ./static/dist/
+
 # Legacy SQLite file (kept for reference, not used in production)
 COPY boswell_v2.db /data/boswell_v2.db
 

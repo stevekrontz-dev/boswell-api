@@ -10,7 +10,7 @@ import hashlib
 import json
 import os
 from datetime import datetime
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 import time
 
@@ -2369,6 +2369,37 @@ def download_extension():
 
     except Exception as e:
         return jsonify({'error': f'Bundle generation failed: {str(e)}'}), 500
+
+
+
+# ============================================================
+# Dashboard Serving (React SPA)
+# ============================================================
+
+DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), 'static', 'dist')
+
+@app.route('/')
+def serve_dashboard():
+    """Serve the React dashboard index."""
+    return send_from_directory(DASHBOARD_DIR, 'index.html')
+
+@app.route('/assets/<path:filename>')
+def serve_assets(filename):
+    """Serve static assets (JS, CSS, etc.)."""
+    return send_from_directory(os.path.join(DASHBOARD_DIR, 'assets'), filename)
+
+@app.route('/<path:path>')
+def serve_spa(path):
+    """Catch-all route for SPA - return index.html for client-side routing."""
+    # Don't catch API routes
+    if path.startswith('v2/') or path.startswith('api/') or path.startswith('auth/') or path.startswith('mcp'):
+        return jsonify({'error': 'Not found'}), 404
+    # Check if it's a static file
+    static_path = os.path.join(DASHBOARD_DIR, path)
+    if os.path.isfile(static_path):
+        return send_from_directory(DASHBOARD_DIR, path)
+    # Otherwise return index.html for SPA routing
+    return send_from_directory(DASHBOARD_DIR, 'index.html')
 
 
 if __name__ == '__main__':
