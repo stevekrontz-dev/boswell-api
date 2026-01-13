@@ -3,9 +3,10 @@
   "name": "boswell-memory",
   "display_name": "Boswell Memory",
   "version": "1.0.0",
-  "description": "Git-style memory system for AI assistants. Commit, search, and recall memories across conversations.",
+  "description": "Your AI's persistent memory. Boswell gives Claude the ability to remember context across conversations - commit important decisions, search past interactions, and build a knowledge graph that grows with you.",
   "author": {
     "name": "Boswell",
+    "email": "support@askboswell.com",
     "url": "https://askboswell.com"
   },
   "license": "Proprietary",
