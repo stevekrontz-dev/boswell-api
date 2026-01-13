@@ -13,6 +13,7 @@ COPY app.py .
 COPY audit_service.py .
 COPY encryption_service.py .
 COPY passkey_auth.py .
+COPY auth/ ./auth/
 
 # Legacy SQLite file (kept for reference, not used in production)
 COPY boswell_v2.db /data/boswell_v2.db
