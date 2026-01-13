@@ -2275,6 +2275,12 @@ app.register_blueprint(registration_bp)
 from auth.api_keys import init_api_keys
 api_keys_bp = init_api_keys(get_db, get_cursor)
 app.register_blueprint(api_keys_bp)
+# =============================================================================
+# BILLING & STRIPE WEBHOOKS (W2P2 - CC2)
+# =============================================================================
+
+from billing.stripe_handler import billing_bp
+app.register_blueprint(billing_bp)
 
 
 # =============================================================================
