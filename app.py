@@ -6,7 +6,12 @@ PostgreSQL version with multi-tenant support + Encryption (Phase 2)
 
 import psycopg2
 import psycopg2.extras
-from pgvector.psycopg2 import register_vector
+try:
+    from pgvector.psycopg2 import register_vector
+    PGVECTOR_AVAILABLE = True
+except ImportError:
+    PGVECTOR_AVAILABLE = False
+    register_vector = None
 import hashlib
 import json
 import os
@@ -117,8 +122,12 @@ def get_db():
         # Add connection timeout to prevent hanging
         g.db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
         g.db.autocommit = False
-        # Register pgvector for embedding queries
-        register_vector(g.db)
+        # Register pgvector for embedding queries (if available)
+        if PGVECTOR_AVAILABLE and register_vector:
+            try:
+                register_vector(g.db)
+            except Exception:
+                pass  # pgvector extension not in DB, skip
         # Set tenant context for RLS
         cur = g.db.cursor()
         cur.execute(f"SET app.current_tenant = '{DEFAULT_TENANT}'")
