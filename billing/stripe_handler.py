@@ -79,16 +79,31 @@ def stripe_webhook():
 def handle_checkout_completed(session):
     """
     Handle successful checkout session.
-    Creates or updates subscription record for the tenant.
+    AUTO-PROVISIONS everything for self-service:
+    1. Creates tenant
+    2. Generates API key
+    3. Creates default branches
+    4. Updates user status to active
+    5. Creates subscription record
     """
+    import uuid
+    import secrets
+    import hashlib
+    from auth import encrypt_api_key
     get_db, get_cursor, DEFAULT_TENANT = get_db_functions()
 
     customer_id = session.get('customer')
     subscription_id = session.get('subscription')
-    tenant_id = session.get('client_reference_id') or DEFAULT_TENANT
+    metadata = session.get('metadata', {})
+    user_id = metadata.get('user_id') or session.get('client_reference_id')
+    plan_id = metadata.get('plan_id', 'pro')
 
     if not subscription_id:
         print(f"[STRIPE] checkout.session.completed without subscription_id", flush=True)
+        return
+
+    if not user_id:
+        print(f"[STRIPE] checkout.session.completed without user_id - cannot provision", flush=True)
         return
 
     # Fetch full subscription details from Stripe
@@ -103,7 +118,68 @@ def handle_checkout_completed(session):
     now = datetime.utcnow().isoformat() + 'Z'
 
     try:
-        # Upsert subscription record
+        # Get user email for tenant name
+        cur.execute('SELECT email, tenant_id FROM users WHERE id = %s', (user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            print(f"[STRIPE] User {user_id} not found - cannot provision", flush=True)
+            return
+
+        email = user['email']
+        existing_tenant_id = user.get('tenant_id')
+
+        # Only create tenant if user doesn't already have one
+        if existing_tenant_id:
+            tenant_id = existing_tenant_id
+            print(f"[STRIPE] User {user_id} already has tenant {tenant_id}", flush=True)
+        else:
+            # CREATE TENANT
+            tenant_id = str(uuid.uuid4())
+            cur.execute('''
+                INSERT INTO tenants (id, name, created_at)
+                VALUES (%s, %s, %s)
+            ''', (tenant_id, email, now))
+            print(f"[STRIPE] Created tenant {tenant_id} for {email}", flush=True)
+
+            # CREATE DEFAULT BRANCHES
+            default_branches = ['command-center', 'work', 'personal', 'research']
+            for branch_name in default_branches:
+                cur.execute('''
+                    INSERT INTO branches (tenant_id, name, head_commit, created_at)
+                    VALUES (%s, %s, 'GENESIS', %s)
+                ''', (tenant_id, branch_name, now))
+            print(f"[STRIPE] Created {len(default_branches)} default branches", flush=True)
+
+        # GENERATE API KEY
+        api_key = 'bos_' + secrets.token_urlsafe(32)
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+        # Store API key hash in api_keys table
+        key_id = str(uuid.uuid4())
+        cur.execute('''
+            INSERT INTO api_keys (id, tenant_id, user_id, key_hash, name, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (key_id, tenant_id, user_id, key_hash, 'Auto-generated', now))
+        print(f"[STRIPE] Created API key for user {user_id}", flush=True)
+
+        # Encrypt API key for display in dashboard
+        api_key_encrypted = encrypt_api_key(api_key)
+
+        # UPDATE USER with tenant, subscription, status, and encrypted API key
+        cur.execute('''
+            UPDATE users SET
+                tenant_id = %s,
+                stripe_customer_id = %s,
+                stripe_subscription_id = %s,
+                plan = %s,
+                status = 'active',
+                api_key_encrypted = %s,
+                updated_at = %s
+            WHERE id = %s
+        ''', (tenant_id, customer_id, subscription_id, plan_id, api_key_encrypted, now, user_id))
+
+        # CREATE/UPDATE SUBSCRIPTION RECORD
         cur.execute("""
             INSERT INTO subscriptions (
                 tenant_id, stripe_customer_id, stripe_subscription_id,
@@ -131,11 +207,11 @@ def handle_checkout_completed(session):
         ))
 
         db.commit()
-        print(f"[STRIPE] Created/updated subscription for tenant {tenant_id}: {plan_id}", flush=True)
+        print(f"[STRIPE] SELF-SERVICE COMPLETE: user={user_id} tenant={tenant_id} plan={plan_id}", flush=True)
 
     except Exception as e:
         db.rollback()
-        print(f"[STRIPE] Error saving subscription: {e}", flush=True)
+        print(f"[STRIPE] Error in self-service provisioning: {e}", flush=True)
         raise
     finally:
         cur.close()
@@ -361,25 +437,38 @@ def create_checkout_session():
     """
     Create a Stripe checkout session for plan upgrade.
 
+    Requires JWT authentication to link payment to user.
+
     Request body:
         plan_id: Target plan ('pro' or 'team')
-        success_url: Redirect URL after successful payment
-        cancel_url: Redirect URL if user cancels
+        success_url: Redirect URL after successful payment (optional, defaults to dashboard)
+        cancel_url: Redirect URL if user cancels (optional, defaults to pricing)
 
     Returns:
         checkout_url: URL to redirect user to Stripe checkout
         session_id: Checkout session ID for tracking
     """
     from .plans import PLANS
+    from auth import verify_jwt
     get_db, get_cursor, DEFAULT_TENANT = get_db_functions()
 
-    data = request.get_json() or {}
-    plan_id = data.get('plan_id')
-    success_url = data.get('success_url')
-    cancel_url = data.get('cancel_url')
+    # Require authentication
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'error': 'Authentication required'}), 401
 
-    # Get tenant from header or default
-    tenant_id = request.headers.get('X-Tenant-ID', DEFAULT_TENANT)
+    try:
+        token = auth_header[7:]
+        payload = verify_jwt(token)
+        user_id = payload.get('sub')
+        user_email = payload.get('email')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 401
+
+    data = request.get_json() or {}
+    plan_id = data.get('plan_id', 'pro')
+    success_url = data.get('success_url', 'https://askboswell.com/dashboard?session_id={CHECKOUT_SESSION_ID}')
+    cancel_url = data.get('cancel_url', 'https://askboswell.com/pricing')
 
     # Validate plan
     if plan_id not in PLANS:
@@ -390,17 +479,37 @@ def create_checkout_session():
     if not plan.get('stripe_price_id'):
         return jsonify({'error': f'Plan {plan_id} is not a paid plan'}), 400
 
-    if not success_url or not cancel_url:
-        return jsonify({'error': 'success_url and cancel_url are required'}), 400
-
     try:
-        # Get or create Stripe customer
-        customer_id = get_or_create_stripe_customer(tenant_id)
+        # Get or create Stripe customer for this user
+        db = get_db()
+        cur = get_cursor()
 
-        # Create checkout session
+        # Check if user already has a Stripe customer ID
+        cur.execute('SELECT stripe_customer_id FROM users WHERE id = %s', (user_id,))
+        row = cur.fetchone()
+        customer_id = row.get('stripe_customer_id') if row else None
+
+        if not customer_id:
+            # Create new Stripe customer
+            customer = stripe.Customer.create(
+                email=user_email,
+                metadata={'user_id': user_id}
+            )
+            customer_id = customer.id
+
+            # Save customer ID to user record
+            cur.execute(
+                'UPDATE users SET stripe_customer_id = %s WHERE id = %s',
+                (customer_id, user_id)
+            )
+            db.commit()
+
+        cur.close()
+
+        # Create checkout session with user_id in metadata
         session = stripe.checkout.Session.create(
             customer=customer_id,
-            client_reference_id=tenant_id,
+            client_reference_id=user_id,  # Link to user
             mode='subscription',
             line_items=[{
                 'price': plan['stripe_price_id'],
@@ -409,12 +518,12 @@ def create_checkout_session():
             success_url=success_url,
             cancel_url=cancel_url,
             metadata={
-                'tenant_id': tenant_id,
+                'user_id': user_id,  # CRITICAL: ties payment to user
                 'plan_id': plan_id
             }
         )
 
-        print(f"[STRIPE] Created checkout session {session.id} for tenant {tenant_id} -> {plan_id}", flush=True)
+        print(f"[STRIPE] Created checkout session {session.id} for user {user_id} -> {plan_id}", flush=True)
 
         return jsonify({
             'checkout_url': session.url,

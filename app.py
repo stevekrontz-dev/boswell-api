@@ -744,11 +744,36 @@ def semantic_startup():
                     'distance': float(row['distance'])
                 })
 
+    # Get open tasks (priority 1-3 = high, show first)
+    open_tasks = []
+    try:
+        cur.execute("""
+            SELECT id, description, branch, assigned_to, priority, created_at, metadata
+            FROM tasks 
+            WHERE tenant_id = %s AND status = 'open'
+            ORDER BY priority ASC, created_at ASC
+            LIMIT 10
+        """, (DEFAULT_TENANT,))
+        for row in cur.fetchall():
+            open_tasks.append({
+                'id': str(row['id']),
+                'description': row['description'],
+                'branch': row['branch'],
+                'assigned_to': row['assigned_to'],
+                'priority': row['priority'],
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                'metadata': row['metadata'] if row['metadata'] else {}
+            })
+    except Exception as e:
+        # tasks table might not exist - that's ok
+        pass
+
     cur.close()
     return jsonify({
         'sacred_manifest': sacred_manifest,
         'tool_registry': tool_registry,
         'relevant_memories': relevant_memories,
+        'open_tasks': open_tasks,
         'context_used': context,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
@@ -1861,6 +1886,76 @@ def release_task(task_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/tasks/stale', methods=['GET'])
+def get_stale_tasks():
+    """Get stale tasks for cron monitoring. 
+    
+    Returns open tasks older than threshold (default 24h) and 
+    claimed tasks older than threshold (default 4h).
+    
+    Can be called by Railway cron to alert about stuck work.
+    """
+    open_hours = request.args.get('open_hours', 24, type=int)
+    claimed_hours = request.args.get('claimed_hours', 4, type=int)
+    
+    cur = get_cursor()
+    
+    # Open tasks older than threshold
+    cur.execute("""
+        SELECT id, description, branch, priority, created_at, metadata
+        FROM tasks 
+        WHERE tenant_id = %s AND status = 'open'
+        AND created_at < NOW() - INTERVAL '%s hours'
+        ORDER BY priority ASC, created_at ASC
+    """, (DEFAULT_TENANT, open_hours))
+    
+    stale_open = []
+    for row in cur.fetchall():
+        stale_open.append({
+            'id': str(row['id']),
+            'description': row['description'],
+            'branch': row['branch'],
+            'priority': row['priority'],
+            'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+            'age_hours': round((datetime.utcnow() - row['created_at'].replace(tzinfo=None)).total_seconds() / 3600, 1) if row['created_at'] else None
+        })
+    
+    # Claimed tasks older than threshold (might be stuck)
+    cur.execute("""
+        SELECT t.id, t.description, t.branch, t.assigned_to, tc.claimed_at
+        FROM tasks t
+        JOIN task_claims tc ON t.id = tc.task_id AND t.tenant_id = tc.tenant_id
+        WHERE t.tenant_id = %s AND t.status = 'claimed'
+        AND tc.released_at IS NULL
+        AND tc.claimed_at < NOW() - INTERVAL '%s hours'
+        ORDER BY tc.claimed_at ASC
+    """, (DEFAULT_TENANT, claimed_hours))
+    
+    stale_claimed = []
+    for row in cur.fetchall():
+        stale_claimed.append({
+            'id': str(row['id']),
+            'description': row['description'],
+            'branch': row['branch'],
+            'assigned_to': row['assigned_to'],
+            'claimed_at': row['claimed_at'].isoformat() if row['claimed_at'] else None,
+            'age_hours': round((datetime.utcnow() - row['claimed_at'].replace(tzinfo=None)).total_seconds() / 3600, 1) if row['claimed_at'] else None
+        })
+    
+    cur.close()
+    
+    return jsonify({
+        'stale_open_tasks': stale_open,
+        'stale_claimed_tasks': stale_claimed,
+        'thresholds': {
+            'open_hours': open_hours,
+            'claimed_hours': claimed_hours
+        },
+        'alert': len(stale_open) > 0 or len(stale_claimed) > 0,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+
 @app.route('/v2/admin/spawn-agent', methods=['POST'])
 def spawn_agent():
     """Spawn a new agent with a task. Creates a task entry for agent coordination."""
@@ -2434,6 +2529,93 @@ app.register_blueprint(api_keys_bp)
 from auth.password_reset import init_password_reset
 password_reset_bp = init_password_reset(get_db, get_cursor)
 app.register_blueprint(password_reset_bp)
+
+
+# =============================================================================
+# USER PROFILE ENDPOINT (Self-Service Onboarding)
+# =============================================================================
+
+@app.route('/v2/me', methods=['GET'])
+def get_current_user():
+    """
+    Get current user's account info including API key.
+
+    Requires JWT authentication.
+    Returns user details, status, plan, and decrypted API key for dashboard display.
+    """
+    from auth import verify_jwt, decrypt_api_key
+
+    # Require JWT authentication
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'error': 'Authorization header required'}), 401
+
+    try:
+        token = auth_header[7:]
+        payload = verify_jwt(token)
+        user_id = payload.get('sub')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 401
+
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT email, name, tenant_id, plan, status, api_key_encrypted,
+                   stripe_customer_id, stripe_subscription_id, created_at
+            FROM users WHERE id = %s
+        ''', (user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        # Decrypt API key if present
+        api_key = None
+        if user.get('api_key_encrypted'):
+            try:
+                api_key = decrypt_api_key(user['api_key_encrypted'])
+            except Exception:
+                api_key = None
+
+        # Get usage stats if user has a tenant
+        usage = None
+        if user.get('tenant_id'):
+            try:
+                cur.execute('''
+                    SELECT COUNT(*) as branches FROM branches WHERE tenant_id = %s
+                ''', (user['tenant_id'],))
+                branch_count = cur.fetchone()['branches']
+
+                cur.execute('''
+                    SELECT COUNT(*) as commits FROM commits
+                    WHERE tenant_id = %s
+                    AND created_at >= date_trunc('month', CURRENT_TIMESTAMP)
+                ''', (user['tenant_id'],))
+                commit_count = cur.fetchone()['commits']
+
+                usage = {
+                    'branches': branch_count,
+                    'commits_this_month': commit_count
+                }
+            except Exception:
+                pass
+
+        return jsonify({
+            'id': user_id,
+            'email': user['email'],
+            'name': user.get('name'),
+            'tenant_id': str(user['tenant_id']) if user.get('tenant_id') else None,
+            'plan': user.get('plan') or 'free',
+            'status': user.get('status') or 'pending_payment',
+            'api_key': api_key,
+            'has_subscription': bool(user.get('stripe_subscription_id')),
+            'member_since': str(user['created_at']) if user.get('created_at') else None,
+            'usage': usage
+        })
+
+    finally:
+        cur.close()
 
 
 # =============================================================================
