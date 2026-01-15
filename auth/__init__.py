@@ -76,3 +76,28 @@ def require_jwt(f):
             return jsonify({'error': str(e)}), 401
 
     return decorated
+
+
+# Simple encryption for storing API keys (for display in dashboard)
+# Uses Fernet symmetric encryption derived from JWT_SECRET
+
+def get_fernet():
+    """Get Fernet instance for API key encryption."""
+    import base64
+    from cryptography.fernet import Fernet
+    # Derive a 32-byte key from JWT_SECRET
+    key_bytes = hashlib.sha256(JWT_SECRET.encode()).digest()
+    fernet_key = base64.urlsafe_b64encode(key_bytes)
+    return Fernet(fernet_key)
+
+
+def encrypt_api_key(api_key: str) -> str:
+    """Encrypt API key for storage."""
+    fernet = get_fernet()
+    return fernet.encrypt(api_key.encode()).decode()
+
+
+def decrypt_api_key(encrypted: str) -> str:
+    """Decrypt stored API key."""
+    fernet = get_fernet()
+    return fernet.decrypt(encrypted.encode()).decode()

@@ -57,3 +57,30 @@ export async function createApiKey() {
 export async function deleteApiKey(keyId: string) {
   return fetchWithAuth('/v2/auth/keys/' + keyId, { method: 'DELETE' });
 }
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  name: string | null;
+  tenant_id: string | null;
+  plan: string;
+  status: 'pending_payment' | 'active' | 'suspended';
+  api_key: string | null;
+  has_subscription: boolean;
+  member_since: string | null;
+  usage: {
+    branches: number;
+    commits_this_month: number;
+  } | null;
+}
+
+export async function getCurrentUser(): Promise<UserProfile> {
+  return fetchWithAuth('/v2/me');
+}
+
+export async function createCheckoutSession(planId: string = 'pro') {
+  return fetchWithAuth('/v2/billing/checkout', {
+    method: 'POST',
+    body: JSON.stringify({ plan_id: planId })
+  });
+}
