@@ -1092,6 +1092,7 @@ def backfill_embeddings():
     blobs = cur.fetchall()
     processed = 0
     failed = 0
+    errors = []
     
     for blob in blobs:
         blob_hash = blob['blob_hash']
@@ -1107,8 +1108,10 @@ def backfill_embeddings():
                 processed += 1
             except Exception as e:
                 print(f"[BACKFILL] Failed to store embedding for {blob_hash}: {e}", file=sys.stderr)
+                errors.append(f"store:{blob_hash[:8]}:{str(e)[:50]}")
                 failed += 1
         else:
+            errors.append(f"generate:{blob_hash[:8]}:embedding returned None")
             failed += 1
     
     db.commit()
@@ -1125,6 +1128,7 @@ def backfill_embeddings():
         'processed': processed,
         'failed': failed,
         'remaining': remaining,
+        'errors': errors[:10],
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
 
