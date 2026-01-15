@@ -462,12 +462,15 @@ def create_commit():
 
         for tag in tags:
             tag_str = tag if isinstance(tag, str) else str(tag)
-            cur.execute(
-                '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (tenant_id, blob_hash, tag) DO NOTHING''',
-                (DEFAULT_TENANT, blob_hash, tag_str, now)
-            )
+            try:
+                cur.execute(
+                    '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+                       VALUES (%s, %s, %s, %s)''',
+                    (DEFAULT_TENANT, blob_hash, tag_str, now)
+                )
+            except Exception:
+                # Tag already exists, ignore duplicate
+                pass
 
         db.commit()
         cur.close()
