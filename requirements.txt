@@ -6,3 +6,5 @@ google-cloud-kms>=2.21.0
 cryptography>=42.0.0
 PyJWT>=2.8.0
 stripe
+openai>=1.0.0
+pgvector>=0.2.0
