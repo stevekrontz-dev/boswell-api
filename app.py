@@ -14,6 +14,36 @@ from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 import time
 
+# OpenAI for embeddings (v3)
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+openai_client = None
+
+def get_openai_client():
+    """Lazy init OpenAI client."""
+    global openai_client
+    if openai_client is None and OPENAI_API_KEY:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return openai_client
+
+def generate_embedding(text: str) -> list:
+    """Generate embedding using OpenAI text-embedding-3-small."""
+    client = get_openai_client()
+    if not client:
+        return None
+    try:
+        if len(text) > 30000:
+            text = text[:30000]
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+            dimensions=1536
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"[EMBEDDING] Error: {e}")
+        return None
+
 app = Flask(__name__)
 CORS(app)
 
@@ -636,6 +666,85 @@ def quick_brief():
         'branches': branches,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
+
+
+@app.route('/v2/startup', methods=['GET'])
+def semantic_startup():
+    """v3 semantic startup - pull contextually relevant memories.
+
+    Uses semantic search to find the most relevant memories for the
+    current conversation context, rather than hardcoded lookups.
+
+    Query params:
+    - context: Optional context string to search for relevant memories
+    - k: Number of relevant memories to return (default: 5)
+    """
+    context = request.args.get('context', 'important decisions and active commitments')
+    k = request.args.get('k', 5, type=int)
+
+    cur = get_cursor()
+
+    # Always include sacred commitments via literal search
+    sacred_manifest = None
+    tool_registry = None
+
+    # Fetch sacred_manifest
+    cur.execute("""
+        SELECT b.content FROM blobs b
+        WHERE b.content LIKE %s AND b.tenant_id = %s
+        ORDER BY b.created_at DESC LIMIT 1
+    """, ('%"type": "sacred_manifest"%', DEFAULT_TENANT))
+    row = cur.fetchone()
+    if row:
+        try:
+            sacred_manifest = json.loads(row['content'])
+        except:
+            pass
+
+    # Fetch tool_registry
+    cur.execute("""
+        SELECT b.content FROM blobs b
+        WHERE b.content LIKE %s AND b.tenant_id = %s
+        ORDER BY b.created_at DESC LIMIT 1
+    """, ('%"type": "tool_registry"%', DEFAULT_TENANT))
+    row = cur.fetchone()
+    if row:
+        try:
+            tool_registry = json.loads(row['content'])
+        except:
+            pass
+
+    # Semantic search for contextually relevant memories
+    relevant_memories = []
+    if OPENAI_API_KEY:
+        query_embedding = generate_embedding(context)
+        if query_embedding:
+            cur.execute("""
+                SELECT b.blob_hash, substring(b.content, 1, 300) as preview,
+                       c.message, b.embedding <=> %s::vector AS distance
+                FROM blobs b
+                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+                ORDER BY distance LIMIT %s
+            """, (query_embedding, DEFAULT_TENANT, k))
+            for row in cur.fetchall():
+                relevant_memories.append({
+                    'blob_hash': row['blob_hash'],
+                    'preview': row['preview'],
+                    'message': row['message'],
+                    'distance': float(row['distance'])
+                })
+
+    cur.close()
+    return jsonify({
+        'sacred_manifest': sacred_manifest,
+        'tool_registry': tool_registry,
+        'relevant_memories': relevant_memories,
+        'context_used': context,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
 
 # ==================== CROSS-REFERENCES ====================
 
