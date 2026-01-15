@@ -420,6 +420,17 @@ def create_commit():
                 (blob_hash, DEFAULT_TENANT, content_str, memory_type, now, len(content_str))
             )
 
+        # Generate and store embedding for semantic search
+        embedding = generate_embedding(content_str)
+        if embedding:
+            try:
+                cur.execute(
+                    '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
+                    (embedding, blob_hash, DEFAULT_TENANT)
+                )
+            except Exception as e:
+                print(f"[EMBEDDING] Failed to store embedding: {e}", file=sys.stderr)
+
         tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
         cur.execute(
             '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
@@ -1056,6 +1067,87 @@ def reflect():
         'highly_connected': insights,
         'cross_branch_links': cross_branch_links,
         'insight': 'Memories with high link counts represent conceptual hubs. Cross-branch links reveal how ideas flow between cognitive domains.',
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+# ==================== EMBEDDINGS ====================
+
+@app.route('/v2/embeddings/backfill', methods=['POST'])
+def backfill_embeddings():
+    """Generate embeddings for all blobs that don't have them."""
+    if not OPENAI_API_KEY:
+        return jsonify({'error': 'OpenAI API key not configured'}), 500
+    
+    limit = request.args.get('limit', 100, type=int)
+    db = get_db()
+    cur = get_cursor()
+    
+    # Find blobs without embeddings
+    cur.execute('''
+        SELECT blob_hash, content FROM blobs 
+        WHERE tenant_id = %s AND embedding IS NULL
+        LIMIT %s
+    ''', (DEFAULT_TENANT, limit))
+    
+    blobs = cur.fetchall()
+    processed = 0
+    failed = 0
+    
+    for blob in blobs:
+        blob_hash = blob['blob_hash']
+        content = blob['content']
+        
+        embedding = generate_embedding(content)
+        if embedding:
+            try:
+                cur.execute(
+                    '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
+                    (embedding, blob_hash, DEFAULT_TENANT)
+                )
+                processed += 1
+            except Exception as e:
+                print(f"[BACKFILL] Failed to store embedding for {blob_hash}: {e}", file=sys.stderr)
+                failed += 1
+        else:
+            failed += 1
+    
+    db.commit()
+    cur.close()
+    
+    # Check how many still need processing
+    cur2 = get_cursor()
+    cur2.execute('SELECT COUNT(*) as remaining FROM blobs WHERE tenant_id = %s AND embedding IS NULL', (DEFAULT_TENANT,))
+    remaining = cur2.fetchone()['remaining']
+    cur2.close()
+    
+    return jsonify({
+        'status': 'completed',
+        'processed': processed,
+        'failed': failed,
+        'remaining': remaining,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+@app.route('/v2/embeddings/status', methods=['GET'])
+def embeddings_status():
+    """Check embedding coverage."""
+    cur = get_cursor()
+    cur.execute('''
+        SELECT 
+            COUNT(*) as total_blobs,
+            COUNT(embedding) as with_embedding,
+            COUNT(*) - COUNT(embedding) as without_embedding
+        FROM blobs WHERE tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+    row = cur.fetchone()
+    cur.close()
+    
+    return jsonify({
+        'total_blobs': row['total_blobs'],
+        'with_embedding': row['with_embedding'],
+        'without_embedding': row['without_embedding'],
+        'coverage_pct': round(100 * row['with_embedding'] / row['total_blobs'], 2) if row['total_blobs'] > 0 else 0,
+        'openai_configured': bool(OPENAI_API_KEY),
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
 
