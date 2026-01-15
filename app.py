@@ -33,12 +33,11 @@ def get_openai_client():
         openai_client = OpenAI(api_key=api_key)
     return openai_client
 
-def generate_embedding(text: str) -> list:
-    """Generate embedding using OpenAI text-embedding-3-small."""
+def generate_embedding(text: str) -> tuple:
+    """Generate embedding using OpenAI text-embedding-3-small. Returns (embedding, error)."""
     client = get_openai_client()
     if not client:
-        print(f"[EMBEDDING] No client - OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}", file=sys.stderr)
-        return None
+        return None, f"no_client:key_set={bool(os.environ.get('OPENAI_API_KEY'))}"
     try:
         if len(text) > 30000:
             text = text[:30000]
@@ -47,10 +46,10 @@ def generate_embedding(text: str) -> list:
             input=text,
             dimensions=1536
         )
-        return response.data[0].embedding
+        return response.data[0].embedding, None
     except Exception as e:
-        print(f"[EMBEDDING] Error: {e}")
-        return None
+        print(f"[EMBEDDING] Error: {e}", file=sys.stderr)
+        return None, str(e)[:100]
 
 app = Flask(__name__)
 CORS(app)
@@ -423,7 +422,7 @@ def create_commit():
             )
 
         # Generate and store embedding for semantic search
-        embedding = generate_embedding(content_str)
+        embedding, _ = generate_embedding(content_str)
         if embedding:
             try:
                 cur.execute(
@@ -1100,7 +1099,7 @@ def backfill_embeddings():
         blob_hash = blob['blob_hash']
         content = blob['content']
         
-        embedding = generate_embedding(content)
+        embedding, emb_error = generate_embedding(content)
         if embedding:
             try:
                 cur.execute(
@@ -1113,7 +1112,7 @@ def backfill_embeddings():
                 errors.append(f"store:{blob_hash[:8]}:{str(e)[:50]}")
                 failed += 1
         else:
-            errors.append(f"generate:{blob_hash[:8]}:embedding returned None")
+            errors.append(f"generate:{blob_hash[:8]}:{emb_error}")
             failed += 1
     
     db.commit()
