@@ -218,14 +218,21 @@ def health_check():
             if get_active_dek():
                 encryption_status = 'active'
 
+        # Debug: Check runtime env var
+        runtime_key = os.environ.get('OPENAI_API_KEY', '')
+        openai_keys = [k for k in os.environ.keys() if 'OPENAI' in k.upper()]
+
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '3.0.1-vector',
+            'version': '3.0.2-debug',
             'platform': 'railway',
             'database': 'postgres',
             'encryption': encryption_status,
-            'embeddings': 'enabled' if OPENAI_API_KEY else 'disabled',
+            'embeddings': 'enabled' if runtime_key else 'disabled',
+            'openai_key_set': bool(runtime_key),
+            'openai_key_prefix': runtime_key[:10] + '...' if runtime_key else None,
+            'openai_env_vars': openai_keys,
             'audit': 'enabled' if AUDIT_ENABLED else 'disabled',
             'branches': branch_count,
             'commits': commit_count,
