@@ -89,8 +89,8 @@ def init_registration(get_db, get_cursor):
             password_hash = hash_password(password)
 
             cur.execute(
-                '''INSERT INTO users (id, email, password_hash, name, created_at)
-                   VALUES (%s, %s, %s, %s, NOW())
+                '''INSERT INTO users (id, email, password_hash, name, status, created_at)
+                   VALUES (%s, %s, %s, %s, 'pending_payment', NOW())
                    RETURNING created_at''',
                 (user_id, email, password_hash, name or None)
             )
@@ -107,8 +107,10 @@ def init_registration(get_db, get_cursor):
                 'email': email,
                 'name': name or None,
                 'token': token,
+                'status': 'pending_payment',
                 'created_at': str(created_at),
-                'message': 'Registration successful'
+                'message': 'Registration successful',
+                'next': '/checkout'
             }), 201
 
         except Exception as e:
