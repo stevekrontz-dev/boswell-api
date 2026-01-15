@@ -221,10 +221,11 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '3.0.0-vector',
+            'version': '3.0.1-vector',
             'platform': 'railway',
             'database': 'postgres',
             'encryption': encryption_status,
+            'embeddings': 'enabled' if OPENAI_API_KEY else 'disabled',
             'audit': 'enabled' if AUDIT_ENABLED else 'disabled',
             'branches': branch_count,
             'commits': commit_count,
