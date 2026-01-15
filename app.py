@@ -569,6 +569,62 @@ def search_memories():
     cur.close()
     return jsonify({'query': query, 'results': results, 'count': len(results)})
 
+
+@app.route('/v2/semantic-search', methods=['GET'])
+def semantic_search():
+    """Semantic search using vector embeddings.
+
+    Query params:
+    - q: Search query (required)
+    - limit: Max results (default: 10)
+    """
+    query = request.args.get('q', '')
+    limit = request.args.get('limit', 10, type=int)
+
+    if not query:
+        return jsonify({'error': 'Search query required'}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({'error': 'Semantic search not available - OpenAI not configured'}), 503
+
+    # Generate embedding for the query
+    query_embedding = generate_embedding(query)
+    if not query_embedding:
+        return jsonify({'error': 'Failed to generate query embedding'}), 500
+
+    cur = get_cursor()
+
+    # Vector cosine search using pgvector
+    cur.execute("""
+        SELECT b.blob_hash, b.content, b.content_type, b.created_at,
+               c.commit_hash, c.message, c.author,
+               b.embedding <=> %s::vector AS distance
+        FROM blobs b
+        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+        ORDER BY distance
+        LIMIT %s
+    """, (query_embedding, DEFAULT_TENANT, limit))
+
+    results = []
+    for row in cur.fetchall():
+        content = row['content']
+        results.append({
+            'blob_hash': row['blob_hash'],
+            'content': content[:500] + '...' if len(content) > 500 else content,
+            'content_type': row['content_type'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'commit_hash': row['commit_hash'],
+            'message': row['message'],
+            'author': row['author'],
+            'distance': float(row['distance'])
+        })
+
+    cur.close()
+    return jsonify({'query': query, 'results': results, 'count': len(results)})
+
+
 def decrypt_blob_content(blob):
     """Decrypt blob content if encrypted, otherwise return plaintext."""
     # Check if blob has encrypted content
