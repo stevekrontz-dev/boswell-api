@@ -27,15 +27,17 @@ openai_client = None
 def get_openai_client():
     """Lazy init OpenAI client."""
     global openai_client
-    if openai_client is None and OPENAI_API_KEY:
+    api_key = os.environ.get('OPENAI_API_KEY')
+    if openai_client is None and api_key:
         from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        openai_client = OpenAI(api_key=api_key)
     return openai_client
 
 def generate_embedding(text: str) -> list:
     """Generate embedding using OpenAI text-embedding-3-small."""
     client = get_openai_client()
     if not client:
+        print(f"[EMBEDDING] No client - OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}", file=sys.stderr)
         return None
     try:
         if len(text) > 30000:
