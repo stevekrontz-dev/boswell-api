@@ -6,6 +6,7 @@ PostgreSQL version with multi-tenant support + Encryption (Phase 2)
 
 import psycopg2
 import psycopg2.extras
+from pgvector.psycopg2 import register_vector
 import hashlib
 import json
 import os
@@ -116,6 +117,8 @@ def get_db():
         # Add connection timeout to prevent hanging
         g.db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
         g.db.autocommit = False
+        # Register pgvector for embedding queries
+        register_vector(g.db)
         # Set tenant context for RLS
         cur = g.db.cursor()
         cur.execute(f"SET app.current_tenant = '{DEFAULT_TENANT}'")
@@ -686,9 +689,11 @@ def semantic_startup():
     Query params:
     - context: Optional context string to search for relevant memories
     - k: Number of relevant memories to return (default: 5)
+    - agent_id: Optional agent ID to filter tasks assigned to this agent
     """
     context = request.args.get('context', 'important decisions and active commitments')
     k = request.args.get('k', 5, type=int)
+    agent_id = request.args.get('agent_id')  # Filter tasks for specific agent
 
     cur = get_cursor()
 
@@ -745,38 +750,87 @@ def semantic_startup():
                 })
 
     # Get open tasks (priority 1-3 = high, show first)
+    # If agent_id provided, show: their assigned tasks + unassigned tasks
+    # If no agent_id, show all open tasks
     open_tasks = []
+    my_tasks = []  # Tasks assigned specifically to this agent
     try:
-        cur.execute("""
-            SELECT id, description, branch, assigned_to, priority, created_at, metadata
-            FROM tasks 
-            WHERE tenant_id = %s AND status = 'open'
-            ORDER BY priority ASC, created_at ASC
-            LIMIT 10
-        """, (DEFAULT_TENANT,))
-        for row in cur.fetchall():
-            open_tasks.append({
-                'id': str(row['id']),
-                'description': row['description'],
-                'branch': row['branch'],
-                'assigned_to': row['assigned_to'],
-                'priority': row['priority'],
-                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
-                'metadata': row['metadata'] if row['metadata'] else {}
-            })
+        if agent_id:
+            # Get tasks assigned to this agent
+            cur.execute("""
+                SELECT id, description, branch, assigned_to, priority, created_at, metadata
+                FROM tasks 
+                WHERE tenant_id = %s AND status = 'open' AND assigned_to = %s
+                ORDER BY priority ASC, created_at ASC
+            """, (DEFAULT_TENANT, agent_id))
+            for row in cur.fetchall():
+                my_tasks.append({
+                    'id': str(row['id']),
+                    'description': row['description'],
+                    'branch': row['branch'],
+                    'assigned_to': row['assigned_to'],
+                    'priority': row['priority'],
+                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                    'metadata': row['metadata'] if row['metadata'] else {}
+                })
+            # Also get unassigned tasks (available to claim)
+            cur.execute("""
+                SELECT id, description, branch, assigned_to, priority, created_at, metadata
+                FROM tasks 
+                WHERE tenant_id = %s AND status = 'open' AND assigned_to IS NULL
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 5
+            """, (DEFAULT_TENANT,))
+            for row in cur.fetchall():
+                open_tasks.append({
+                    'id': str(row['id']),
+                    'description': row['description'],
+                    'branch': row['branch'],
+                    'assigned_to': row['assigned_to'],
+                    'priority': row['priority'],
+                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                    'metadata': row['metadata'] if row['metadata'] else {}
+                })
+        else:
+            # No agent_id - return all open tasks
+            cur.execute("""
+                SELECT id, description, branch, assigned_to, priority, created_at, metadata
+                FROM tasks 
+                WHERE tenant_id = %s AND status = 'open'
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 10
+            """, (DEFAULT_TENANT,))
+            for row in cur.fetchall():
+                open_tasks.append({
+                    'id': str(row['id']),
+                    'description': row['description'],
+                    'branch': row['branch'],
+                    'assigned_to': row['assigned_to'],
+                    'priority': row['priority'],
+                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                    'metadata': row['metadata'] if row['metadata'] else {}
+                })
     except Exception as e:
         # tasks table might not exist - that's ok
         pass
 
     cur.close()
-    return jsonify({
+    
+    response = {
         'sacred_manifest': sacred_manifest,
         'tool_registry': tool_registry,
         'relevant_memories': relevant_memories,
         'open_tasks': open_tasks,
         'context_used': context,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
-    })
+    }
+    
+    # If agent_id provided, add their specific tasks
+    if agent_id:
+        response['agent_id'] = agent_id
+        response['my_tasks'] = my_tasks
+    
+    return jsonify(response)
 
 
 # ==================== CROSS-REFERENCES ====================
