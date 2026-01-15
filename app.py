@@ -221,7 +221,7 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '2.9.0-godmode',
+            'version': '3.0.0-vector',
             'platform': 'railway',
             'database': 'postgres',
             'encryption': encryption_status,
