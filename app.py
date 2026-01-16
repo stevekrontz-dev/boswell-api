@@ -2012,6 +2012,23 @@ def claim_task(task_id):
     cur = get_cursor()
 
     try:
+        # Check if system is halted
+        cur.execute('''
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = 'halt_state'
+            )
+        ''')
+        if cur.fetchone()[0]:
+            cur.execute('SELECT halted, reason FROM halt_state WHERE tenant_id = %s', (DEFAULT_TENANT,))
+            halt_row = cur.fetchone()
+            if halt_row and halt_row['halted']:
+                cur.close()
+                return jsonify({
+                    'error': 'System is halted. No new claims allowed.',
+                    'reason': halt_row['reason']
+                }), 503
+
         # Check if task exists and is claimable
         cur.execute(
             'SELECT * FROM tasks WHERE id = %s AND tenant_id = %s',
@@ -2208,6 +2225,150 @@ def get_stale_tasks():
         'alert': len(stale_open) > 0 or len(stale_claimed) > 0,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
+
+
+@app.route('/v2/tasks/halt', methods=['POST'])
+def halt_tasks():
+    """Emergency stop - halt all claimed tasks and prevent new claims."""
+    data = request.get_json() or {}
+    reason = data.get('reason', 'Manual emergency halt')
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Ensure halt_state table exists
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS halt_state (
+                id SERIAL PRIMARY KEY,
+                tenant_id VARCHAR(100) NOT NULL UNIQUE,
+                halted BOOLEAN DEFAULT FALSE,
+                halted_at TIMESTAMP,
+                reason TEXT
+            )
+        ''')
+
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        # Upsert halt state
+        cur.execute('''
+            INSERT INTO halt_state (tenant_id, halted, halted_at, reason)
+            VALUES (%s, TRUE, %s, %s)
+            ON CONFLICT (tenant_id) DO UPDATE
+            SET halted = TRUE, halted_at = EXCLUDED.halted_at, reason = EXCLUDED.reason
+        ''', (DEFAULT_TENANT, now, reason))
+
+        # Set all claimed tasks to blocked
+        cur.execute('''
+            UPDATE tasks SET status = 'blocked'
+            WHERE tenant_id = %s AND status = 'claimed'
+            RETURNING id
+        ''', (DEFAULT_TENANT,))
+        affected_tasks = [str(row['id']) for row in cur.fetchall()]
+
+        # Release all active claims with EMERGENCY_HALT reason
+        cur.execute('''
+            UPDATE task_claims SET released_at = %s, release_reason = 'EMERGENCY_HALT'
+            WHERE tenant_id = %s AND released_at IS NULL
+        ''', (now, DEFAULT_TENANT))
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'halted',
+            'affected_tasks': len(affected_tasks),
+            'task_ids': affected_tasks,
+            'halted_at': now,
+            'reason': reason
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/tasks/resume', methods=['POST'])
+def resume_tasks():
+    """Release the halt - allow new task claims again."""
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Check if halt_state table exists
+        cur.execute('''
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = 'halt_state'
+            )
+        ''')
+        if not cur.fetchone()[0]:
+            cur.close()
+            return jsonify({'status': 'not_halted', 'message': 'System was not halted'})
+
+        # Clear halt state
+        cur.execute('''
+            UPDATE halt_state SET halted = FALSE
+            WHERE tenant_id = %s
+            RETURNING halted_at, reason
+        ''', (DEFAULT_TENANT,))
+        row = cur.fetchone()
+
+        db.commit()
+        cur.close()
+
+        if row:
+            return jsonify({
+                'status': 'resumed',
+                'previous_halt_at': str(row['halted_at']) if row['halted_at'] else None,
+                'previous_reason': row['reason'],
+                'message': 'Task claims now allowed'
+            })
+        else:
+            return jsonify({'status': 'not_halted', 'message': 'System was not halted'})
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/tasks/halt-status', methods=['GET'])
+def halt_status():
+    """Check if the task system is currently halted."""
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = 'halt_state'
+            )
+        ''')
+        if not cur.fetchone()[0]:
+            cur.close()
+            return jsonify({'halted': False})
+
+        cur.execute('''
+            SELECT halted, halted_at, reason FROM halt_state
+            WHERE tenant_id = %s
+        ''', (DEFAULT_TENANT,))
+        row = cur.fetchone()
+        cur.close()
+
+        if row and row['halted']:
+            return jsonify({
+                'halted': True,
+                'halted_at': str(row['halted_at']) if row['halted_at'] else None,
+                'reason': row['reason']
+            })
+        else:
+            return jsonify({'halted': False})
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/v2/admin/spawn-agent', methods=['POST'])
