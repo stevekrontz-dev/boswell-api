@@ -2371,6 +2371,227 @@ def halt_status():
         return jsonify({'error': str(e)}), 500
 
 
+# ==================== TRAILS (Memory Path Tracking) ====================
+
+def ensure_trails_table():
+    """Create trails table if it doesn't exist."""
+    cur = get_cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS trails (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id VARCHAR(100) NOT NULL DEFAULT 'default',
+            source_blob VARCHAR(64) NOT NULL,
+            target_blob VARCHAR(64) NOT NULL,
+            traversal_count INTEGER DEFAULT 1,
+            last_traversed TIMESTAMP DEFAULT NOW(),
+            strength FLOAT DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(tenant_id, source_blob, target_blob)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_strength ON trails(strength DESC)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_source ON trails(source_blob)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_target ON trails(target_blob)')
+    get_db().commit()
+    cur.close()
+
+
+@app.route('/v2/trails/record', methods=['POST'])
+def record_trail():
+    """Record a traversal between two memories. Creates or strengthens the trail."""
+    ensure_trails_table()
+
+    data = request.get_json() or {}
+    source_blob = data.get('source_blob')
+    target_blob = data.get('target_blob')
+
+    if not source_blob or not target_blob:
+        return jsonify({'error': 'source_blob and target_blob required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            INSERT INTO trails (tenant_id, source_blob, target_blob, traversal_count, last_traversed, strength)
+            VALUES (%s, %s, %s, 1, NOW(), 1.0)
+            ON CONFLICT (tenant_id, source_blob, target_blob) DO UPDATE
+            SET traversal_count = trails.traversal_count + 1,
+                last_traversed = NOW(),
+                strength = LEAST(trails.strength * 1.1, 10.0)
+            RETURNING id, traversal_count, strength
+        ''', (DEFAULT_TENANT, source_blob, target_blob))
+
+        row = cur.fetchone()
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'recorded',
+            'trail_id': str(row['id']),
+            'source_blob': source_blob,
+            'target_blob': target_blob,
+            'traversal_count': row['traversal_count'],
+            'strength': row['strength']
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/hot', methods=['GET'])
+def get_hot_trails():
+    """Get strongest trails, sorted by strength. Use limit param (default 20)."""
+    ensure_trails_table()
+
+    limit = request.args.get('limit', 20, type=int)
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT id, source_blob, target_blob, traversal_count,
+                   last_traversed, strength, created_at
+            FROM trails
+            WHERE tenant_id = %s
+            ORDER BY strength DESC
+            LIMIT %s
+        ''', (DEFAULT_TENANT, limit))
+
+        trails = []
+        for row in cur.fetchall():
+            trails.append({
+                'id': str(row['id']),
+                'source_blob': row['source_blob'],
+                'target_blob': row['target_blob'],
+                'traversal_count': row['traversal_count'],
+                'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
+                'strength': row['strength'],
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None
+            })
+
+        cur.close()
+        return jsonify({'trails': trails, 'count': len(trails)})
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/from/<source_blob>', methods=['GET'])
+def get_trails_from(source_blob):
+    """Get outbound trails from a specific memory blob."""
+    ensure_trails_table()
+
+    limit = request.args.get('limit', 20, type=int)
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT id, source_blob, target_blob, traversal_count,
+                   last_traversed, strength
+            FROM trails
+            WHERE tenant_id = %s AND source_blob = %s
+            ORDER BY strength DESC
+            LIMIT %s
+        ''', (DEFAULT_TENANT, source_blob, limit))
+
+        trails = []
+        for row in cur.fetchall():
+            trails.append({
+                'id': str(row['id']),
+                'target_blob': row['target_blob'],
+                'traversal_count': row['traversal_count'],
+                'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
+                'strength': row['strength']
+            })
+
+        cur.close()
+        return jsonify({'source_blob': source_blob, 'outbound_trails': trails})
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/to/<target_blob>', methods=['GET'])
+def get_trails_to(target_blob):
+    """Get inbound trails to a specific memory blob."""
+    ensure_trails_table()
+
+    limit = request.args.get('limit', 20, type=int)
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT id, source_blob, target_blob, traversal_count,
+                   last_traversed, strength
+            FROM trails
+            WHERE tenant_id = %s AND target_blob = %s
+            ORDER BY strength DESC
+            LIMIT %s
+        ''', (DEFAULT_TENANT, target_blob, limit))
+
+        trails = []
+        for row in cur.fetchall():
+            trails.append({
+                'id': str(row['id']),
+                'source_blob': row['source_blob'],
+                'traversal_count': row['traversal_count'],
+                'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
+                'strength': row['strength']
+            })
+
+        cur.close()
+        return jsonify({'target_blob': target_blob, 'inbound_trails': trails})
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/decay', methods=['POST'])
+def decay_trails():
+    """Decay all trails by 10% and prune dead ones. Call via Railway cron daily."""
+    ensure_trails_table()
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            UPDATE trails SET strength = strength * 0.9
+            WHERE tenant_id = %s
+        ''', (DEFAULT_TENANT,))
+        decayed_count = cur.rowcount
+
+        cur.execute('''
+            DELETE FROM trails
+            WHERE tenant_id = %s AND strength < 0.01
+            RETURNING id
+        ''', (DEFAULT_TENANT,))
+        pruned = [str(row['id']) for row in cur.fetchall()]
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'decayed',
+            'trails_decayed': decayed_count,
+            'trails_pruned': len(pruned),
+            'pruned_ids': pruned,
+            'decay_factor': 0.9,
+            'prune_threshold': 0.01,
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/v2/admin/spawn-agent', methods=['POST'])
 def spawn_agent():
     """Spawn a new agent with a task. Creates a task entry for agent coordination."""
