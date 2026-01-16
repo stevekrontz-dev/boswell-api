@@ -1965,6 +1965,40 @@ def update_task(task_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/tasks/<task_id>', methods=['DELETE'])
+def delete_task(task_id):
+    """Soft delete a task by setting status to 'deleted'."""
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        cur.execute(
+            '''UPDATE tasks SET status = 'deleted'
+               WHERE id = %s AND tenant_id = %s
+               RETURNING id, description, status''',
+            (task_id, DEFAULT_TENANT)
+        )
+        row = cur.fetchone()
+
+        if not row:
+            cur.close()
+            return jsonify({'error': 'Task not found'}), 404
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'deleted',
+            'task_id': str(row['id']),
+            'description': row['description']
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/v2/tasks/<task_id>/claim', methods=['POST'])
 def claim_task(task_id):
     """Claim a task for an agent instance. Includes collision detection."""
