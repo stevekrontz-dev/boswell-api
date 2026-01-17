@@ -7,8 +7,16 @@ Task: W1P4 - Password Reset
 import secrets
 import hashlib
 import sys
+import os
+import resend
 from flask import Blueprint, request, jsonify
 from . import hash_password
+
+# Initialize Resend
+resend.api_key = os.environ.get('RESEND_API_KEY')
+
+# Frontend URL for reset links
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://delightful-imagination-production-f6a1.up.railway.app')
 
 password_reset_bp = Blueprint('password_reset', __name__, url_prefix='/v2/auth/password-reset')
 
@@ -87,10 +95,41 @@ def init_password_reset(get_db, get_cursor):
             result = cur.fetchone()
             db.commit()
 
-            # TODO: Send email with reset link
-            # For now, log token for testing (REMOVE IN PRODUCTION)
-            print(f"[PASSWORD RESET] Token for {email}: {raw_token}", file=sys.stderr)
-            print(f"[PASSWORD RESET] Expires: {result['expires_at']}", file=sys.stderr)
+            # Send email with reset link
+            reset_url = f"{FRONTEND_URL}/reset-password?token={raw_token}"
+
+            try:
+                if resend.api_key:
+                    resend.emails.send({
+                        "from": "Boswell <noreply@askboswell.com>",
+                        "to": [email],
+                        "subject": "Reset your Boswell password",
+                        "html": f"""
+                        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+                            <h2 style="color: #1a1a2e; margin-bottom: 24px;">Reset your password</h2>
+                            <p style="color: #4a4a5a; line-height: 1.6; margin-bottom: 24px;">
+                                Click the button below to reset your Boswell password. This link expires in 1 hour.
+                            </p>
+                            <a href="{reset_url}" style="display: inline-block; background: #e85d04; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 500;">
+                                Reset Password
+                            </a>
+                            <p style="color: #8a8a9a; font-size: 14px; margin-top: 32px;">
+                                If you didn't request this, you can safely ignore this email.
+                            </p>
+                            <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 32px 0;" />
+                            <p style="color: #8a8a9a; font-size: 12px;">
+                                Boswell - Your memory, amplified
+                            </p>
+                        </div>
+                        """
+                    })
+                    print(f"[PASSWORD RESET] Email sent to {email}", file=sys.stderr)
+                else:
+                    # Fallback: log token if no Resend API key
+                    print(f"[PASSWORD RESET] No RESEND_API_KEY - Token for {email}: {raw_token}", file=sys.stderr)
+            except Exception as email_error:
+                print(f"[PASSWORD RESET] Email send failed: {email_error}", file=sys.stderr)
+                # Still return success to prevent enumeration
 
             cur.close()
             return jsonify(success_message), 200
