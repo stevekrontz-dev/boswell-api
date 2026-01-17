@@ -335,18 +335,27 @@ def list_branches():
         except ValueError:
             pass  # Fall back to DEFAULT_TENANT
 
-    cur = get_cursor()
-    # Get branches
-    cur.execute('SELECT * FROM branches WHERE tenant_id = %s ORDER BY name', (tenant_id,))
-    branches = []
-    for row in cur.fetchall():
-        branch = dict(row)
-        # Add default values for frontend
-        branch['commits'] = 0
-        branch['last_activity'] = str(branch.get('created_at', ''))
-        branches.append(branch)
-    cur.close()
-    return jsonify({'branches': branches, 'count': len(branches)})
+    try:
+        cur = get_cursor()
+        # Get branches
+        cur.execute('SELECT * FROM branches WHERE tenant_id = %s ORDER BY name', (tenant_id,))
+        branches = []
+        for row in cur.fetchall():
+            branch = dict(row)
+            # Convert UUID and datetime to strings for JSON serialization
+            if branch.get('tenant_id'):
+                branch['tenant_id'] = str(branch['tenant_id'])
+            if branch.get('created_at'):
+                branch['last_activity'] = str(branch['created_at'])
+                branch['created_at'] = str(branch['created_at'])
+            else:
+                branch['last_activity'] = ''
+            branch['commits'] = 0
+            branches.append(branch)
+        cur.close()
+        return jsonify({'branches': branches, 'count': len(branches)})
+    except Exception as e:
+        return jsonify({'error': str(e), 'branches': [], 'count': 0}), 500
 
 @app.route('/v2/branch', methods=['POST'])
 def create_branch():
