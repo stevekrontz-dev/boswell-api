@@ -59,7 +59,7 @@ export default function Branches() {
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <div className="text-slate-400">Loading branches...</div>
+        <div className="text-parchment-200/50">Loading branches...</div>
       </div>
     );
   }
@@ -68,12 +68,12 @@ export default function Branches() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-slate-100">Branches</h1>
-          <p className="text-slate-400 mt-1">Organize your memories into separate branches.</p>
+          <h1 className="font-display text-2xl font-bold text-parchment-50">Branches</h1>
+          <p className="text-parchment-200/60 mt-1">Organize your memories into separate branches.</p>
         </div>
         <button
           onClick={() => setShowCreateModal(true)}
-          className="px-4 py-2 bg-orange-500 hover:bg-orange-400 text-slate-900 font-medium rounded-lg transition-colors"
+          className="px-4 py-2 bg-ember-500 hover:bg-ember-400 text-ink-950 font-medium rounded-lg transition-colors"
         >
           New Branch
         </button>
@@ -86,26 +86,26 @@ export default function Branches() {
       )}
 
       {branches.length === 0 ? (
-        <div className="bg-slate-900 rounded-xl p-12 border border-slate-800 text-center">
-          <p className="text-slate-400">No branches yet. Create your first branch to get started.</p>
+        <div className="card rounded-xl p-12 text-center">
+          <p className="text-parchment-200/60">No branches yet. Create your first branch to get started.</p>
         </div>
       ) : (
-        <div className="bg-slate-900 rounded-xl border border-slate-800 overflow-hidden">
+        <div className="card rounded-xl overflow-hidden">
           <table className="w-full">
-            <thead className="bg-slate-800/50">
+            <thead className="bg-ink-800/50">
               <tr>
-                <th className="px-4 py-3 text-left text-sm font-medium text-slate-400">Name</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-slate-400">Commits</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-slate-400">Last Activity</th>
-                <th className="px-4 py-3 text-left text-sm font-medium text-slate-400">Actions</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-parchment-200/60">Name</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-parchment-200/60">Commits</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-parchment-200/60">Last Activity</th>
+                <th className="px-4 py-3 text-left text-sm font-medium text-parchment-200/60">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800">
+            <tbody className="divide-y divide-parchment-50/10">
               {branches.map((branch) => (
-                <tr key={branch.name}>
-                  <td className="px-4 py-3 text-slate-200 font-mono">{branch.name}</td>
-                  <td className="px-4 py-3 text-slate-400">{branch.commits || 0}</td>
-                  <td className="px-4 py-3 text-slate-400">{formatDate(branch.last_activity)}</td>
+                <tr key={branch.name} className="hover:bg-ink-800/30 transition-colors">
+                  <td className="px-4 py-3 text-parchment-100 font-mono">{branch.name}</td>
+                  <td className="px-4 py-3 text-parchment-200/60">{branch.commits || 0}</td>
+                  <td className="px-4 py-3 text-parchment-200/60">{formatDate(branch.last_activity)}</td>
                   <td className="px-4 py-3">
                     <button className="text-red-400 hover:text-red-300 text-sm">Delete</button>
                   </td>
@@ -119,29 +119,29 @@ export default function Branches() {
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/60" onClick={() => !creating && setShowCreateModal(false)} />
-          <form onSubmit={handleCreateBranch} className="relative bg-slate-900 rounded-xl p-6 w-full max-w-md border border-slate-700">
-            <h2 className="text-xl font-bold text-slate-100 mb-4">Create Branch</h2>
+          <form onSubmit={handleCreateBranch} className="relative bg-ink-900 rounded-xl p-6 w-full max-w-md border border-parchment-50/10">
+            <h2 className="font-display text-xl font-bold text-parchment-50 mb-4">Create Branch</h2>
             <input
               type="text"
               value={newBranchName}
               onChange={(e) => setNewBranchName(e.target.value)}
               placeholder="Branch name"
               disabled={creating}
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-slate-100 focus:outline-none focus:border-orange-500 disabled:opacity-50"
+              className="w-full bg-ink-800 border border-parchment-50/10 rounded-lg px-4 py-2 text-parchment-100 focus:outline-none focus:border-ember-500/50 disabled:opacity-50"
             />
             <div className="flex justify-end gap-3 mt-4">
               <button
                 type="button"
                 onClick={() => setShowCreateModal(false)}
                 disabled={creating}
-                className="px-4 py-2 text-slate-400 hover:text-slate-200 disabled:opacity-50"
+                className="px-4 py-2 text-parchment-200/60 hover:text-parchment-100 disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={creating || !newBranchName.trim()}
-                className="px-4 py-2 bg-orange-500 hover:bg-orange-400 text-slate-900 font-medium rounded-lg disabled:opacity-50"
+                className="px-4 py-2 bg-ember-500 hover:bg-ember-400 text-ink-950 font-medium rounded-lg disabled:opacity-50"
               >
                 {creating ? 'Creating...' : 'Create'}
               </button>
