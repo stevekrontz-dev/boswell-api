@@ -100,7 +100,7 @@ def init_password_reset(get_db, get_cursor):
 
             try:
                 if resend.api_key:
-                    resend.emails.send({
+                    resend.Emails.send({
                         "from": "Boswell <noreply@askboswell.com>",
                         "to": [email],
                         "subject": "Reset your Boswell password",
