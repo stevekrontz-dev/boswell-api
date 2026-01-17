@@ -7,6 +7,7 @@ export default function Signup() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [agreedToTerms, setAgreedToTerms] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { register } = useAuth();
@@ -17,7 +18,7 @@ export default function Signup() {
     setError('');
     setLoading(true);
 
-    const result = await register(email, password, name);
+    const result = await register(email, password, name, agreedToTerms);
     setLoading(false);
 
     if (result.success) {
@@ -99,11 +100,33 @@ export default function Signup() {
               className="w-full bg-boswell-bg-secondary border border-boswell-border rounded-xl px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-ember-500 transition-colors"
             />
           </div>
+
+          {/* Terms Agreement */}
+          <div className="flex items-start gap-3">
+            <input
+              type="checkbox"
+              id="terms"
+              checked={agreedToTerms}
+              onChange={(e) => setAgreedToTerms(e.target.checked)}
+              required
+              className="mt-1 w-4 h-4 rounded border-boswell-border bg-boswell-bg-secondary text-ember-500 focus:ring-ember-500 focus:ring-offset-0"
+            />
+            <label htmlFor="terms" className="text-sm text-gray-400">
+              I agree to the{' '}
+              <a href="/legal/terms" target="_blank" className="text-ember-500 hover:text-ember-400 transition-colors">
+                Terms of Service
+              </a>{' '}
+              and{' '}
+              <a href="/legal/privacy" target="_blank" className="text-ember-500 hover:text-ember-400 transition-colors">
+                Privacy Policy
+              </a>
+            </label>
+          </div>
         </div>
 
         <button
           type="submit"
-          disabled={loading}
+          disabled={loading || !agreedToTerms}
           className="w-full mt-8 py-3.5 bg-ember-500 hover:bg-ember-400 disabled:bg-boswell-border disabled:text-gray-500 text-boswell-bg font-semibold rounded-full transition-all duration-200 hover:shadow-glow-sm"
         >
           {loading ? 'Creating account...' : 'Create account'}
