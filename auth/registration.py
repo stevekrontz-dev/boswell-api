@@ -43,7 +43,8 @@ def init_registration(get_db, get_cursor):
         {
             "email": "user@example.com",
             "password": "SecurePass123",
-            "name": "User Name"
+            "name": "User Name",
+            "agreed_to_terms": true
         }
 
         Returns:
@@ -60,6 +61,10 @@ def init_registration(get_db, get_cursor):
         email = data.get('email', '').strip().lower()
         password = data.get('password', '')
         name = data.get('name', '').strip()
+        agreed_to_terms = data.get('agreed_to_terms', False)
+
+        if not agreed_to_terms:
+            return jsonify({'error': 'You must agree to the Terms of Service and Privacy Policy'}), 400
 
         if not email:
             return jsonify({'error': 'email is required'}), 400
@@ -89,8 +94,8 @@ def init_registration(get_db, get_cursor):
             password_hash = hash_password(password)
 
             cur.execute(
-                '''INSERT INTO users (id, email, password_hash, name, status, created_at)
-                   VALUES (%s, %s, %s, %s, 'pending_payment', NOW())
+                '''INSERT INTO users (id, email, password_hash, name, status, terms_accepted_at, created_at)
+                   VALUES (%s, %s, %s, %s, 'pending_payment', NOW(), NOW())
                    RETURNING created_at''',
                 (user_id, email, password_hash, name or None)
             )

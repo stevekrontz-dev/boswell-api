@@ -8,6 +8,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(50) DEFAULT 'free';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS api_key_encrypted TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP;
 
 -- Index for Stripe customer lookup (for subscription updates)
 CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id);
@@ -18,3 +19,4 @@ COMMENT ON COLUMN users.stripe_customer_id IS 'Stripe customer ID for billing';
 COMMENT ON COLUMN users.stripe_subscription_id IS 'Active Stripe subscription ID';
 COMMENT ON COLUMN users.plan IS 'Current plan: free, pro, team';
 COMMENT ON COLUMN users.api_key_encrypted IS 'Encrypted API key for dashboard display (Fernet encrypted)';
+COMMENT ON COLUMN users.terms_accepted_at IS 'Timestamp when user accepted Terms of Service and Privacy Policy';
