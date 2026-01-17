@@ -127,7 +127,7 @@ export default function Signup() {
         <button
           type="submit"
           disabled={loading || !agreedToTerms}
-          className="w-full mt-8 py-3.5 bg-ember-500 hover:bg-ember-400 disabled:bg-boswell-border disabled:text-gray-500 text-boswell-bg font-semibold rounded-full transition-all duration-200 hover:shadow-glow-sm"
+          className="w-full mt-8 py-3.5 bg-ember-500 hover:bg-ember-400 disabled:bg-gray-700 disabled:text-gray-400 text-boswell-bg font-semibold rounded-full transition-all duration-200 hover:shadow-glow-sm disabled:cursor-not-allowed"
         >
           {loading ? 'Creating account...' : 'Create account'}
         </button>
