@@ -8,6 +8,7 @@ import Dashboard from './pages/Dashboard';
 import Connect from './pages/Connect';
 import Branches from './pages/Branches';
 import Billing from './pages/Billing';
+import Mindstate from './pages/Mindstate';
 
 function App() {
   return (
@@ -28,6 +29,7 @@ function App() {
             <Route path="connect" element={<Connect />} />
             <Route path="branches" element={<Branches />} />
             <Route path="billing" element={<Billing />} />
+            <Route path="mindstate" element={<Mindstate />} />
           </Route>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

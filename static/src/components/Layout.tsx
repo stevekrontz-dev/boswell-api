@@ -7,10 +7,13 @@ export default function Layout() {
 
   const navLinks = [
     { to: '/dashboard', label: 'Dashboard' },
+    { to: '/dashboard/mindstate', label: 'Mindstate' },
     { to: '/dashboard/connect', label: 'Connect' },
     { to: '/dashboard/branches', label: 'Branches' },
     { to: '/dashboard/billing', label: 'Billing' },
   ];
+
+  const isFullWidth = location.pathname === '/dashboard/mindstate';
 
   const isActive = (path: string) => location.pathname === path;
 
@@ -60,7 +63,7 @@ export default function Layout() {
       </nav>
 
       {/* Main Content */}
-      <main className="max-w-4xl mx-auto px-6 py-12">
+      <main className={isFullWidth ? '' : 'max-w-4xl mx-auto px-6 py-12'}>
         <Outlet />
       </main>
     </div>
