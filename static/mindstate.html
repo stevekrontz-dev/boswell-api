@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Steve's Mind State - Boswell Connectome</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=Instrument+Serif&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0c0c10;
+            overflow: hidden;
+            font-family: 'IBM Plex Mono', monospace;
+            display: flex;
+        }
+
+        /* Left: Graph */
+        #graph-panel {
+            flex: 1;
+            position: relative;
+            height: 100vh;
+        }
+
+        #graph-panel svg { display: block; width: 100%; height: 100%; }
+
+        /* Right: Git-style panel */
+        #memory-panel {
+            width: 420px;
+            background: #0f0f14;
+            border-left: 1px solid rgba(120,140,180,0.1);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        .panel-header {
+            padding: 20px;
+            border-bottom: 1px solid rgba(120,140,180,0.08);
+        }
+
+        .panel-title {
+            font-family: 'Instrument Serif', serif;
+            font-size: 18px;
+            color: #a0aab4;
+            margin-bottom: 14px;
+        }
+
+        .branch-pills {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .branch-pill {
+            background: transparent;
+            border: 1px solid rgba(120,140,180,0.15);
+            color: #5a6a7a;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            letter-spacing: 0.3px;
+        }
+
+        .branch-pill:hover {
+            border-color: rgba(120,140,180,0.3);
+            color: #8a9aaa;
+        }
+
+        .branch-pill.active {
+            border-color: var(--pill-color, #4a6a9a);
+            color: var(--pill-color, #4a6a9a);
+            background: rgba(74,106,154,0.1);
+        }
+
+        .search-wrapper {
+            padding: 12px 20px;
+            border-bottom: 1px solid rgba(120,140,180,0.08);
+        }
+
+        .search-input {
+            width: 100%;
+            background: rgba(20,20,28,0.8);
+            border: 1px solid rgba(120,140,180,0.1);
+            border-radius: 6px;
+            padding: 10px 14px;
+            color: #a0aab4;
+            font-size: 12px;
+            font-family: inherit;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: rgba(120,140,180,0.25);
+        }
+
+        .search-input::placeholder { color: #3a4a5a; }
+
+        /* Commit timeline */
+        .commit-timeline {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+
+        .commit-timeline::-webkit-scrollbar { width: 4px; }
+        .commit-timeline::-webkit-scrollbar-track { background: transparent; }
+        .commit-timeline::-webkit-scrollbar-thumb { background: rgba(120,140,180,0.15); border-radius: 2px; }
+
+        .commit-item {
+            display: grid;
+            grid-template-columns: 40px 1fr;
+            padding: 10px 20px 10px 10px;
+            cursor: pointer;
+            transition: background 0.15s;
+            position: relative;
+        }
+
+        .commit-item:hover { background: rgba(74,106,154,0.06); }
+        .commit-item.selected { background: rgba(74,106,154,0.1); }
+
+        .commit-graph {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+        }
+
+        .commit-line {
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 1px;
+            height: 100%;
+            background: rgba(120,140,180,0.1);
+        }
+
+        .commit-item:first-child .commit-line { top: 50%; height: 50%; }
+        .commit-item:last-child .commit-line { height: 50%; }
+
+        .commit-node {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            z-index: 1;
+            transition: all 0.2s;
+        }
+
+        .commit-item:hover .commit-node,
+        .commit-item.selected .commit-node {
+            transform: scale(1.3);
+            box-shadow: 0 0 8px currentColor;
+        }
+
+        .commit-content { padding-left: 8px; }
+
+        .commit-msg {
+            font-size: 11px;
+            line-height: 1.5;
+            color: #8090a0;
+            margin-bottom: 6px;
+        }
+
+        .commit-type {
+            display: inline-block;
+            font-size: 8px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin-right: 6px;
+        }
+
+        .type-vision { background: rgba(106,90,154,0.25); color: #8a7aaa; }
+        .type-decision { background: rgba(74,106,154,0.25); color: #7a9aba; }
+        .type-fix { background: rgba(58,138,138,0.25); color: #5aaa9a; }
+        .type-incident { background: rgba(154,90,90,0.25); color: #ba8a8a; }
+        .type-spec { background: rgba(154,122,58,0.25); color: #baa07a; }
+        .type-complete { background: rgba(58,138,106,0.25); color: #5aaa8a; }
+        .type-insight { background: rgba(138,74,138,0.25); color: #aa7aaa; }
+        .type-task { background: rgba(90,106,120,0.25); color: #8a9aa0; }
+
+        .commit-meta {
+            font-size: 9px;
+            color: #4a5a6a;
+            display: flex;
+            gap: 10px;
+        }
+
+        .commit-hash { font-family: 'IBM Plex Mono', monospace; color: #5a7a9a; }
+        .commit-branch { color: #5a8a7a; }
+
+        /* Detail drawer */
+        .detail-drawer {
+            border-top: 1px solid rgba(120,140,180,0.08);
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease;
+            background: #08080c;
+        }
+
+        .detail-drawer.open { max-height: 300px; }
+
+        .detail-header {
+            padding: 14px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(120,140,180,0.06);
+        }
+
+        .detail-header h3 {
+            font-family: 'Instrument Serif', serif;
+            font-size: 14px;
+            font-weight: 400;
+            color: #8090a0;
+        }
+
+        .detail-close {
+            background: none;
+            border: none;
+            color: #4a5a6a;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        .detail-content {
+            padding: 14px 20px;
+            overflow-y: auto;
+            max-height: 220px;
+        }
+
+        .detail-content pre {
+            background: rgba(16,16,22,0.5);
+            border: 1px solid rgba(120,140,180,0.06);
+            border-radius: 6px;
+            padding: 14px;
+            font-size: 10px;
+            line-height: 1.6;
+            color: #6a7a8a;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        /* Stats footer */
+        .stats-footer {
+            padding: 12px 20px;
+            border-top: 1px solid rgba(120,140,180,0.08);
+            font-size: 9px;
+            color: #4a5a6a;
+            display: flex;
+            justify-content: space-between;
+            letter-spacing: 0.3px;
+        }
+
+        /* Graph overlays */
+        #stats {
+            position: absolute;
+            top: 24px;
+            left: 24px;
+            background: rgba(12,12,16,0.92);
+            backdrop-filter: blur(10px);
+            color: #5a6a7a;
+            padding: 18px 22px;
+            border-radius: 8px;
+            border: 1px solid rgba(120,140,180,0.1);
+            font-size: 10px;
+            letter-spacing: 0.5px;
+        }
+
+        #stats h2 {
+            font-family: 'Instrument Serif', serif;
+            font-weight: 400;
+            margin-bottom: 14px;
+            color: #a0aab4;
+            font-size: 16px;
+            letter-spacing: 0;
+        }
+
+        #stats .stat {
+            display: flex;
+            justify-content: space-between;
+            margin: 8px 0;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(120,140,180,0.06);
+        }
+
+        #stats .stat:last-child { border-bottom: none; padding-bottom: 0; }
+        #stats b { color: #8090a0; font-weight: 500; }
+
+        #legend {
+            position: absolute;
+            bottom: 24px;
+            left: 24px;
+            background: rgba(12,12,16,0.92);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(120,140,180,0.1);
+            border-radius: 8px;
+            padding: 16px 20px;
+            font-size: 9px;
+            letter-spacing: 0.5px;
+        }
+
+        #legend .section-title {
+            color: #5a6a7a;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+            font-size: 8px;
+        }
+
+        #legend .item {
+            display: flex;
+            align-items: center;
+            margin: 7px 0;
+            color: #6a7a8a;
+        }
+
+        #legend .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+
+        #legend .line {
+            width: 16px;
+            height: 2px;
+            margin-right: 10px;
+            border-radius: 1px;
+        }
+
+        /* Thought bubble */
+        #thought-bubble {
+            position: fixed;
+            pointer-events: none;
+            opacity: 0;
+            transform: scale(0.8);
+            transition: opacity 0.25s ease, transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+            z-index: 1000;
+            filter: drop-shadow(0 8px 32px rgba(0,0,0,0.6));
+        }
+
+        #thought-bubble.visible {
+            opacity: 1;
+            transform: scale(1);
+            pointer-events: auto;
+        }
+
+        .bubble-content {
+            background: #16161c;
+            border: 1px solid rgba(120,140,180,0.15);
+            border-radius: 16px 16px 16px 4px;
+            padding: 20px 24px;
+            max-width: 380px;
+            min-width: 280px;
+            position: relative;
+        }
+
+        .bubble-content::before {
+            content: '';
+            position: absolute;
+            bottom: -12px;
+            left: 20px;
+            width: 24px;
+            height: 24px;
+            background: #16161c;
+            border: 1px solid rgba(120,140,180,0.15);
+            border-top: none;
+            border-right: none;
+            border-radius: 0 0 0 12px;
+            transform: rotate(-45deg);
+        }
+
+        .bubble-type {
+            font-size: 9px;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            color: #5a6a7a;
+            margin-bottom: 8px;
+        }
+
+        .bubble-title {
+            font-family: 'Instrument Serif', serif;
+            font-size: 18px;
+            color: #d0d8e0;
+            line-height: 1.3;
+            margin-bottom: 14px;
+        }
+
+        .bubble-body {
+            font-size: 11px;
+            color: #8090a0;
+            line-height: 1.6;
+            max-height: 180px;
+            overflow-y: auto;
+        }
+
+        .bubble-trails {
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(120,140,180,0.1);
+        }
+
+        .bubble-trail-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 10px;
+            color: #6a7a8a;
+            margin: 6px 0;
+        }
+
+        .trail-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .trail-type {
+            font-size: 8px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            opacity: 0.6;
+            width: 60px;
+        }
+
+        .node-group { cursor: pointer; transition: filter 0.2s; }
+        .node-group:hover { filter: brightness(1.2); }
+
+        /* Loading state */
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(12,12,16,0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            font-size: 14px;
+            color: #5a6a7a;
+        }
+        .loading-overlay.hidden { display: none; }
+
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            body { flex-direction: column; }
+
+            #graph-panel {
+                height: 50vh;
+                min-height: 300px;
+            }
+
+            #memory-panel {
+                width: 100%;
+                height: 50vh;
+                border-left: none;
+                border-top: 1px solid rgba(120,140,180,0.1);
+            }
+
+            #stats {
+                top: 10px;
+                left: 10px;
+                padding: 12px 16px;
+                font-size: 9px;
+            }
+
+            #stats h2 { font-size: 14px; margin-bottom: 10px; }
+
+            #legend {
+                display: none;
+            }
+
+            .panel-header { padding: 14px; }
+            .panel-title { font-size: 14px; }
+            .branch-pills { gap: 4px; }
+            .branch-pill { padding: 4px 10px; font-size: 9px; }
+
+            .search-wrapper { padding: 10px 14px; }
+            .search-input { padding: 8px 12px; font-size: 11px; }
+
+            .commit-item { padding: 8px 14px 8px 8px; }
+            .commit-msg { font-size: 10px; }
+            .commit-type { font-size: 7px; padding: 2px 5px; }
+            .commit-meta { font-size: 8px; }
+
+            .bubble-content {
+                max-width: calc(100vw - 40px);
+                min-width: auto;
+                padding: 16px 18px;
+            }
+            .bubble-title { font-size: 15px; }
+            .bubble-body { font-size: 10px; max-height: 120px; }
+
+            .detail-drawer.open { max-height: 200px; }
+            .detail-content { padding: 10px 14px; }
+            .detail-content pre { font-size: 9px; padding: 10px; }
+
+            .stats-footer { padding: 10px 14px; font-size: 8px; }
+        }
+
+        @media (max-width: 480px) {
+            #graph-panel { height: 40vh; min-height: 250px; }
+            #memory-panel { height: 60vh; }
+
+            #stats {
+                top: 8px;
+                left: 8px;
+                padding: 10px 12px;
+            }
+
+            #stats h2 { font-size: 12px; }
+            #stats .stat { font-size: 9px; }
+
+            .panel-title { font-size: 12px; }
+            .branch-pill { padding: 3px 8px; font-size: 8px; }
+        }
+    </style>
+</head>
+<body>
+
+<div id="graph-panel">
+    <svg id="graph"></svg>
+
+    <div id="stats">
+        <h2>Boswell Connectome</h2>
+        <div class="stat"><span>Branches</span> <b>6</b></div>
+        <div class="stat"><span>Memories</span> <b id="n-memories">35</b></div>
+        <div class="stat"><span>Trails</span> <b id="n-trails">0</b></div>
+    </div>
+
+    <div id="legend">
+        <div class="section-title">Branches</div>
+        <div class="item"><div class="dot" style="background:#4a6a9a"></div> Boswell</div>
+        <div class="item"><div class="dot" style="background:#6a5a9a"></div> Command</div>
+        <div class="item"><div class="dot" style="background:#3a8a8a"></div> Tint ATL</div>
+        <div class="item"><div class="dot" style="background:#8a4a8a"></div> IRIS</div>
+        <div class="item"><div class="dot" style="background:#3a8a6a"></div> Empire</div>
+        <div class="item"><div class="dot" style="background:#9a7a3a"></div> Family</div>
+        <div style="height:12px"></div>
+        <div class="section-title">Connections</div>
+        <div class="item"><div class="line" style="background:#4a6a5a"></div> Trail</div>
+        <div class="item"><div class="line" style="background:#2a3a4a"></div> Hierarchy</div>
+    </div>
+</div>
+
+<div id="memory-panel">
+    <div class="panel-header">
+        <div class="panel-title">Memory Timeline</div>
+        <div class="branch-pills" id="branch-pills"></div>
+    </div>
+
+    <div class="search-wrapper">
+        <input type="text" class="search-input" id="search" placeholder="Search memories...">
+    </div>
+
+    <div class="commit-timeline" id="timeline"></div>
+
+    <div class="detail-drawer" id="detail-drawer">
+        <div class="detail-header">
+            <h3>Memory Content</h3>
+            <button class="detail-close" onclick="closeDetail()">×</button>
+        </div>
+        <div class="detail-content">
+            <pre id="detail-json"></pre>
+        </div>
+    </div>
+
+    <div class="stats-footer">
+        <span id="stats-count">Loading...</span>
+        <span id="stats-connections"></span>
+    </div>
+</div>
+
+<div id="thought-bubble">
+    <div class="bubble-content">
+        <div class="bubble-type" id="bubble-type"></div>
+        <div class="bubble-title" id="bubble-title"></div>
+        <div class="bubble-body" id="bubble-body"></div>
+        <div class="bubble-trails" id="bubble-trails"></div>
+    </div>
+</div>
+
+<script>
+// Boswell API Configuration
+const API_BASE = 'https://delightful-imagination-production-f6a1.up.railway.app';
+
+// Branch configuration
+const BRANCHES = {
+    'boswell':        { color: '#4a6a9a', label: 'Boswell' },
+    'command-center': { color: '#6a5a9a', label: 'Command' },
+    'tint-atlanta':   { color: '#3a8a8a', label: 'Tint ATL' },
+    'iris':           { color: '#8a4a8a', label: 'IRIS' },
+    'tint-empire':    { color: '#3a8a6a', label: 'Empire' },
+    'family':         { color: '#9a7a3a', label: 'Family' }
+};
+
+function getBranch(preview) {
+    const p = (preview || '').toLowerCase();
+    if (p.includes('square') || p.includes('payment') || p.includes('order') || p.includes('webhook') || p.includes('ux_fix') || p.includes('crm') || p.includes('tint-atlanta')) return 'tint-atlanta';
+    if (p.includes('iris') || p.includes('faculty') || p.includes('ksu') || p.includes('research') || p.includes('semantic layer')) return 'iris';
+    if (p.includes('franchise') || p.includes('empire') || p.includes('satellite')) return 'tint-empire';
+    if (p.includes('family') || p.includes('diego') || p.includes('lineage') || p.includes('music') || p.includes('personal')) return 'family';
+    if (p.includes('infrastructure') || p.includes('thalamus') || p.includes('deployment') || p.includes('mcp') || p.includes('fix') || p.includes('endpoint') || p.includes('swarm') || p.includes('diagnostic') || p.includes('performance') || p.includes('config') || p.includes('security') || p.includes('sacred_rule') || p.includes('sacred_lesson')) return 'command-center';
+    return 'boswell';
+}
+
+function extractType(preview) {
+    const match = (preview || '').match(/"type":\s*"([^"]+)"/);
+    if (match) return match[1].replace(/_/g, ' ');
+    const colonMatch = (preview || '').match(/^([a-z_]+):/);
+    return colonMatch ? colonMatch[1].replace(/_/g, ' ') : 'memory';
+}
+
+function getTypeClass(type) {
+    if (type.includes('vision') || type.includes('core')) return 'vision';
+    if (type.includes('decision') || type.includes('strategic') || type.includes('sacred')) return 'decision';
+    if (type.includes('fix') || type.includes('resolved')) return 'fix';
+    if (type.includes('incident') || type.includes('security')) return 'incident';
+    if (type.includes('spec') || type.includes('infrastructure')) return 'spec';
+    if (type.includes('complete') || type.includes('milestone')) return 'complete';
+    if (type.includes('insight') || type.includes('lesson')) return 'insight';
+    return 'task';
+}
+
+// Live data containers
+let MEMORIES = [];
+let TRAILS = [];
+let LINKS = [];
+
+// Fetch live data from Boswell API
+async function fetchBoswellData() {
+    document.getElementById('stats-count').textContent = 'Loading from Boswell...';
+
+    try {
+        // Fetch graph (nodes + edges) and trails in parallel
+        const [graphRes, trailsRes, linksRes] = await Promise.all([
+            fetch(`${API_BASE}/v2/graph?limit=300`),
+            fetch(`${API_BASE}/v2/trails/hot?limit=100`),
+            fetch(`${API_BASE}/v2/links?limit=100`)
+        ]);
+
+        const graphData = await graphRes.json();
+        const trailsData = await trailsRes.json();
+        const linksData = await linksRes.json();
+
+        // Process memories from graph nodes
+        MEMORIES = (graphData.nodes || []).map(node => ({
+            id: node.id.substring(0, 8),
+            fullId: node.id,
+            preview: node.preview || '',
+            content: node.preview || '',
+            type: node.type,
+            created_at: node.created_at
+        }));
+
+        // Process trails
+        TRAILS = (trailsData.trails || []).map(trail => ({
+            source: trail.source_blob.substring(0, 8),
+            target: trail.target_blob.substring(0, 8),
+            fullSource: trail.source_blob,
+            fullTarget: trail.target_blob,
+            strength: trail.strength || 0.5,
+            type: 'trail'
+        }));
+
+        // Process semantic links (cross-references)
+        LINKS = (linksData.links || []).map(link => ({
+            source: link.source_blob.substring(0, 8),
+            target: link.target_blob.substring(0, 8),
+            fullSource: link.source_blob,
+            fullTarget: link.target_blob,
+            strength: link.weight || 0.5,
+            type: link.link_type || 'resonance',
+            reasoning: link.reasoning
+        }));
+
+        console.log(`Loaded: ${MEMORIES.length} memories, ${TRAILS.length} trails, ${LINKS.length} links`);
+        return true;
+    } catch (err) {
+        console.error('Failed to fetch Boswell data:', err);
+        document.getElementById('stats-count').textContent = 'API Error - using cached data';
+        return false;
+    }
+}
+
+// Build graph data
+let nodes = [];
+let graphLinks = [];
+let nodeMap = new Map();
+let simulation;
+let node, link;
+
+async function initGraph() {
+    // Fetch live data first
+    await fetchBoswellData();
+
+    nodes = [];
+    graphLinks = [];
+    nodeMap = new Map();
+
+    // Hub nodes for branches
+    Object.entries(BRANCHES).forEach(([id, cfg]) => {
+        const n = { id: `hub-${id}`, type: 'hub', branch: id, label: cfg.label, color: cfg.color, radius: 22 };
+        nodes.push(n);
+        nodeMap.set(n.id, n);
+    });
+
+    // Hub backbone - branches connect to each other
+    [['hub-boswell','hub-command-center'],['hub-boswell','hub-iris'],['hub-boswell','hub-tint-atlanta'],
+     ['hub-boswell','hub-tint-empire'],['hub-boswell','hub-family'],['hub-command-center','hub-iris'],
+     ['hub-command-center','hub-tint-atlanta'],['hub-tint-atlanta','hub-tint-empire']].forEach(([s,t]) => {
+        graphLinks.push({ source: s, target: t, type: 'backbone' });
+    });
+
+    // Calculate "heat" for each memory based on trail connections (pheromone intensity)
+    const heatMap = new Map();
+    TRAILS.forEach(t => {
+        heatMap.set(t.source, (heatMap.get(t.source) || 0) + (t.strength || 0.5));
+        heatMap.set(t.target, (heatMap.get(t.target) || 0) + (t.strength || 0.5));
+    });
+    LINKS.forEach(l => {
+        heatMap.set(l.source, (heatMap.get(l.source) || 0) + (l.strength || 0.3));
+        heatMap.set(l.target, (heatMap.get(l.target) || 0) + (l.strength || 0.3));
+    });
+
+    // Find max heat for normalization
+    const maxHeat = Math.max(...heatMap.values(), 1);
+
+    // Memory nodes - size based on pheromone intensity
+    MEMORIES.forEach(m => {
+        const branch = getBranch(m.preview);
+        const heat = heatMap.get(m.id) || 0;
+        const normalizedHeat = heat / maxHeat;
+        // Radius ranges from 4 (cold) to 14 (hot)
+        const radius = 4 + (normalizedHeat * 10);
+        const n = {
+            id: m.id, fullId: m.fullId, type: 'memory', preview: m.preview, content: m.content,
+            memoryType: extractType(m.preview), branch, color: BRANCHES[branch].color,
+            radius: radius, heat: heat, normalizedHeat: normalizedHeat
+        };
+        nodes.push(n);
+        nodeMap.set(m.id, n);
+        graphLinks.push({ source: `hub-${branch}`, target: m.id, type: 'hierarchy' });
+    });
+
+    // Trail connections (the semantic web!)
+    TRAILS.forEach(t => {
+        if (nodeMap.has(t.source) && nodeMap.has(t.target)) {
+            graphLinks.push({ source: t.source, target: t.target, type: 'trail', strength: t.strength, trailType: t.type });
+        }
+    });
+
+    // Semantic links (cross-references)
+    LINKS.forEach(l => {
+        if (nodeMap.has(l.source) && nodeMap.has(l.target)) {
+            graphLinks.push({ source: l.source, target: l.target, type: 'link', strength: l.strength, linkType: l.type, reasoning: l.reasoning });
+        }
+    });
+
+    // Update stats
+    document.getElementById('n-memories').textContent = MEMORIES.length;
+    document.getElementById('n-trails').textContent = TRAILS.length + LINKS.length;
+
+    // Now render the graph
+    renderGraph();
+    renderTimeline();
+}
+
+function renderGraph() {
+    // SVG setup
+    const graphPanel = document.getElementById('graph-panel');
+    const width = graphPanel.clientWidth;
+    const height = graphPanel.clientHeight;
+
+    // Clear existing
+    d3.select('#graph').selectAll('*').remove();
+
+    const svg = d3.select('#graph').attr('width', width).attr('height', height);
+    const g = svg.append('g');
+
+    svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', e => g.attr('transform', e.transform)));
+
+    // Force simulation
+    simulation = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(graphLinks).id(d => d.id)
+            .distance(d => d.type === 'backbone' ? 160 : d.type === 'hierarchy' ? 65 : 90)
+            .strength(d => d.type === 'backbone' ? 0.7 : d.type === 'hierarchy' ? 0.5 : 0.12))
+        .force('charge', d3.forceManyBody().strength(d => d.type === 'hub' ? -350 : -40))
+        .force('center', d3.forceCenter(width / 2, height / 2))
+        .force('collision', d3.forceCollide().radius(d => d.radius + 8));
+
+    // Draw links
+    link = g.append('g').selectAll('line').data(graphLinks).join('line')
+        .attr('stroke', d => d.type === 'backbone' ? '#2a3a4a' : d.type === 'hierarchy' ? '#1a2530' : d.type === 'link' ? '#5a4a6a' : '#4a6a5a')
+        .attr('stroke-width', d => d.type === 'backbone' ? 1.5 : (d.type === 'trail' || d.type === 'link') ? (d.strength || 0.5) * 2 : 0.8)
+        .attr('stroke-opacity', d => d.type === 'backbone' ? 0.3 : d.type === 'hierarchy' ? 0.15 : 0.4);
+
+    // Draw nodes
+    node = g.append('g').selectAll('g').data(nodes).join('g')
+        .attr('class', 'node-group')
+        .call(d3.drag()
+            .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+            .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+            .on('end', (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
+
+    // Hub glow
+    node.filter(d => d.type === 'hub').append('circle')
+        .attr('r', d => d.radius + 8)
+        .attr('fill', d => d.color)
+        .attr('fill-opacity', 0.06);
+
+    // Hot memory glow (pheromone intensity visualization)
+    node.filter(d => d.type === 'memory' && d.normalizedHeat > 0.3).append('circle')
+        .attr('r', d => d.radius + 4 + (d.normalizedHeat * 6))
+        .attr('fill', d => d.color)
+        .attr('fill-opacity', d => d.normalizedHeat * 0.15);
+
+    // Main circles - opacity scales with heat for memory nodes
+    node.append('circle')
+        .attr('r', d => d.radius)
+        .attr('fill', d => d.color)
+        .attr('fill-opacity', d => d.type === 'hub' ? 0.7 : 0.35 + (d.normalizedHeat || 0) * 0.5)
+        .attr('stroke', d => d.color)
+        .attr('stroke-width', d => d.type === 'hub' ? 1.5 : 1 + (d.normalizedHeat || 0) * 1.5)
+        .attr('stroke-opacity', d => d.type === 'hub' ? 0.6 : 0.4 + (d.normalizedHeat || 0) * 0.4);
+
+    // Hub labels
+    node.filter(d => d.type === 'hub').append('text')
+        .attr('text-anchor', 'middle')
+        .attr('dy', d => d.radius + 16)
+        .attr('fill', d => d.color)
+        .attr('fill-opacity', 0.6)
+        .attr('font-size', '9px')
+        .attr('font-weight', '400')
+        .attr('letter-spacing', '1px')
+        .text(d => d.label.toUpperCase());
+
+    // Node click handlers
+    node.on('click', function(e, d) {
+        e.stopPropagation();
+        if (d.type === 'memory') {
+            if (activeBubble === d.id) hideBubble();
+            else showBubble(d, e.pageX, e.pageY);
+        } else if (d.type === 'hub') {
+            filterBranch(d.branch);
+        }
+    });
+
+    svg.on('click', hideBubble);
+
+    // Simulation tick
+    simulation.on('tick', () => {
+        link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+        node.attr('transform', d => `translate(${d.x},${d.y})`);
+    });
+} // end renderGraph
+
+// Thought bubble logic
+const bubble = document.getElementById('thought-bubble');
+const bubbleType = document.getElementById('bubble-type');
+const bubbleTitle = document.getElementById('bubble-title');
+const bubbleBody = document.getElementById('bubble-body');
+const bubbleTrails = document.getElementById('bubble-trails');
+
+let activeBubble = null;
+
+function showBubble(d, x, y) {
+    if (d.type !== 'memory') return;
+
+    activeBubble = d.id;
+
+    const title = d.preview.split(': ').slice(1).join(': ') || d.preview;
+    bubbleType.textContent = d.memoryType;
+    bubbleTitle.textContent = title;
+    bubbleBody.textContent = d.content;
+
+    // Find connections from trails and links
+    const connections = [];
+    [...TRAILS, ...LINKS].forEach(t => {
+        if (t.source === d.id && nodeMap.has(t.target)) {
+            connections.push({ type: t.type || 'link', node: nodeMap.get(t.target), dir: 'to' });
+        }
+        if (t.target === d.id && nodeMap.has(t.source)) {
+            connections.push({ type: t.type || 'link', node: nodeMap.get(t.source), dir: 'from' });
+        }
+    });
+
+    if (connections.length > 0) {
+        bubbleTrails.innerHTML = connections.map(c => {
+            const targetTitle = (c.node.preview || '').split(': ').slice(1).join(': ') || c.node.preview || c.node.id;
+            return `<div class="bubble-trail-item">
+                <div class="trail-dot" style="background:${c.node.color}"></div>
+                <span class="trail-type">${c.type}</span>
+                <span>${(targetTitle || '').substring(0, 40)}${(targetTitle || '').length > 40 ? '...' : ''}</span>
+            </div>`;
+        }).join('');
+        bubbleTrails.style.display = 'block';
+    } else {
+        bubbleTrails.style.display = 'none';
+    }
+
+    // Position - responsive for mobile
+    const isMobile = window.innerWidth < 768;
+    const bw = isMobile ? window.innerWidth - 40 : 380;
+    let bx, by;
+
+    if (isMobile) {
+        bx = 20;
+        by = 20;
+    } else {
+        bx = x + 20;
+        by = y - 300;
+        if (bx + bw > window.innerWidth - 440) bx = x - bw - 20;
+        if (by < 20) by = y + 40;
+    }
+
+    bubble.style.left = bx + 'px';
+    bubble.style.top = by + 'px';
+    bubble.classList.add('visible');
+
+    // Highlight connections
+    const connected = new Set([d.id]);
+    graphLinks.forEach(l => {
+        const sid = l.source.id || l.source;
+        const tid = l.target.id || l.target;
+        if (sid === d.id) connected.add(tid);
+        if (tid === d.id) connected.add(sid);
+    });
+
+    node.select('circle:last-child')
+        .transition().duration(200)
+        .attr('fill-opacity', n => connected.has(n.id) ? (n.type === 'hub' ? 0.8 : 0.7) : 0.15);
+
+    link.transition().duration(200)
+        .attr('stroke-opacity', l => {
+            const sid = l.source.id || l.source;
+            const tid = l.target.id || l.target;
+            return (sid === d.id || tid === d.id) ? 0.7 : 0.05;
+        });
+}
+
+function hideBubble() {
+    activeBubble = null;
+    bubble.classList.remove('visible');
+
+    if (node) {
+        node.select('circle:last-child')
+            .transition().duration(200)
+            .attr('fill-opacity', d => d.type === 'hub' ? 0.7 : 0.5);
+    }
+
+    if (link) {
+        link.transition().duration(200)
+            .attr('stroke-opacity', d => d.type === 'backbone' ? 0.3 : d.type === 'hierarchy' ? 0.15 : 0.4);
+    }
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideBubble(); });
+
+// ========================================
+// GIT-STYLE PANEL
+// ========================================
+
+const branchPills = document.getElementById('branch-pills');
+const timeline = document.getElementById('timeline');
+const searchInput = document.getElementById('search');
+const detailDrawer = document.getElementById('detail-drawer');
+const detailJson = document.getElementById('detail-json');
+
+let currentBranch = 'all';
+
+// Create branch pills
+['all', ...Object.keys(BRANCHES)].forEach(branch => {
+    const pill = document.createElement('button');
+    pill.className = 'branch-pill' + (branch === 'all' ? ' active' : '');
+    pill.textContent = branch === 'all' ? 'all' : BRANCHES[branch].label;
+    pill.style.setProperty('--pill-color', branch === 'all' ? '#5a6a7a' : BRANCHES[branch].color);
+    pill.onclick = () => filterBranch(branch);
+    branchPills.appendChild(pill);
+});
+
+function filterBranch(branch) {
+    currentBranch = branch;
+    document.querySelectorAll('.branch-pill').forEach(p => {
+        const pBranch = p.textContent === 'all' ? 'all' : Object.entries(BRANCHES).find(([k,v]) => v.label === p.textContent)?.[0];
+        p.classList.toggle('active', pBranch === branch);
+    });
+    renderTimeline();
+}
+
+function renderTimeline() {
+    const search = searchInput.value.toLowerCase();
+    const filtered = MEMORIES.filter(m => {
+        const branch = getBranch(m.preview);
+        const matchBranch = currentBranch === 'all' || branch === currentBranch;
+        const matchSearch = !search || m.preview.toLowerCase().includes(search) || m.content.toLowerCase().includes(search);
+        return matchBranch && matchSearch;
+    });
+
+    timeline.innerHTML = filtered.map(m => {
+        const branch = getBranch(m.preview);
+        const type = extractType(m.preview);
+        const typeClass = getTypeClass(type);
+        const title = m.preview.split(': ').slice(1).join(': ') || m.preview;
+        const color = BRANCHES[branch].color;
+
+        return `
+            <div class="commit-item" data-id="${m.id}">
+                <div class="commit-graph">
+                    <div class="commit-line"></div>
+                    <div class="commit-node" style="background:${color};color:${color}"></div>
+                </div>
+                <div class="commit-content">
+                    <div class="commit-msg">
+                        <span class="commit-type type-${typeClass}">${type}</span>
+                        ${title}
+                    </div>
+                    <div class="commit-meta">
+                        <span class="commit-hash">${m.id}</span>
+                        <span class="commit-branch">${BRANCHES[branch].label}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    document.querySelectorAll('.commit-item').forEach(item => {
+        item.onclick = () => showDetail(item.dataset.id);
+    });
+
+    document.getElementById('stats-count').textContent = `${filtered.length} memories`;
+    document.getElementById('stats-connections').textContent = `${TRAILS.length + LINKS.length} connections`;
+}
+
+function showDetail(id) {
+    const memory = MEMORIES.find(m => m.id === id);
+    if (!memory) return;
+
+    document.querySelectorAll('.commit-item').forEach(i => {
+        i.classList.toggle('selected', i.dataset.id === id);
+    });
+
+    detailJson.textContent = memory.content;
+    detailDrawer.classList.add('open');
+}
+
+window.closeDetail = () => {
+    detailDrawer.classList.remove('open');
+    document.querySelectorAll('.commit-item').forEach(i => i.classList.remove('selected'));
+};
+
+searchInput.addEventListener('input', renderTimeline);
+
+// Resize handler
+window.addEventListener('resize', () => {
+    const graphPanel = document.getElementById('graph-panel');
+    if (!graphPanel || !simulation) return;
+    const w = graphPanel.clientWidth;
+    const h = graphPanel.clientHeight;
+    d3.select('#graph').attr('width', w).attr('height', h);
+    simulation.force('center', d3.forceCenter(w / 2, h / 2));
+    simulation.alpha(0.3).restart();
+});
+
+// Initialize on load
+initGraph();
+</script>
+</body>
+</html>
