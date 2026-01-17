@@ -336,25 +336,15 @@ def list_branches():
             pass  # Fall back to DEFAULT_TENANT
 
     cur = get_cursor()
-    # Get branches with commit count
-    cur.execute('''
-        SELECT b.*,
-               COALESCE(c.commit_count, 0) as commits,
-               COALESCE(c.last_commit, b.created_at) as last_activity
-        FROM branches b
-        LEFT JOIN (
-            SELECT
-                (SELECT branch FROM branches WHERE head_commit = commits.commit_hash AND tenant_id = %s LIMIT 1) as branch_name,
-                COUNT(*) as commit_count,
-                MAX(created_at) as last_commit
-            FROM commits
-            WHERE tenant_id = %s
-            GROUP BY branch_name
-        ) c ON b.name = c.branch_name
-        WHERE b.tenant_id = %s
-        ORDER BY b.name
-    ''', (tenant_id, tenant_id, tenant_id))
-    branches = [dict(row) for row in cur.fetchall()]
+    # Get branches
+    cur.execute('SELECT * FROM branches WHERE tenant_id = %s ORDER BY name', (tenant_id,))
+    branches = []
+    for row in cur.fetchall():
+        branch = dict(row)
+        # Add default values for frontend
+        branch['commits'] = 0
+        branch['last_activity'] = str(branch.get('created_at', ''))
+        branches.append(branch)
     cur.close()
     return jsonify({'branches': branches, 'count': len(branches)})
 
