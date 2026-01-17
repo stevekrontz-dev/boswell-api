@@ -312,9 +312,48 @@ def checkout_branch():
 
 @app.route('/v2/branches', methods=['GET'])
 def list_branches():
-    """List all cognitive branches."""
+    """List all cognitive branches for the authenticated user."""
+    from auth import verify_jwt
+
+    # Get user's tenant_id from JWT
+    auth_header = request.headers.get('Authorization', '')
+    tenant_id = DEFAULT_TENANT  # Fallback for API key auth
+
+    if auth_header.startswith('Bearer '):
+        try:
+            token = auth_header[7:]
+            payload = verify_jwt(token)
+            user_id = payload.get('sub')
+
+            # Get user's tenant_id
+            cur = get_cursor()
+            cur.execute('SELECT tenant_id FROM users WHERE id = %s', (user_id,))
+            user = cur.fetchone()
+            if user and user.get('tenant_id'):
+                tenant_id = str(user['tenant_id'])
+            cur.close()
+        except ValueError:
+            pass  # Fall back to DEFAULT_TENANT
+
     cur = get_cursor()
-    cur.execute('SELECT * FROM branches WHERE tenant_id = %s ORDER BY name', (DEFAULT_TENANT,))
+    # Get branches with commit count
+    cur.execute('''
+        SELECT b.*,
+               COALESCE(c.commit_count, 0) as commits,
+               COALESCE(c.last_commit, b.created_at) as last_activity
+        FROM branches b
+        LEFT JOIN (
+            SELECT
+                (SELECT branch FROM branches WHERE head_commit = commits.commit_hash AND tenant_id = %s LIMIT 1) as branch_name,
+                COUNT(*) as commit_count,
+                MAX(created_at) as last_commit
+            FROM commits
+            WHERE tenant_id = %s
+            GROUP BY branch_name
+        ) c ON b.name = c.branch_name
+        WHERE b.tenant_id = %s
+        ORDER BY b.name
+    ''', (tenant_id, tenant_id, tenant_id))
     branches = [dict(row) for row in cur.fetchall()]
     cur.close()
     return jsonify({'branches': branches, 'count': len(branches)})

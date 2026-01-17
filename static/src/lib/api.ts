@@ -84,3 +84,22 @@ export async function createCheckoutSession(planId: string = 'pro') {
     body: JSON.stringify({ plan_id: planId })
   });
 }
+
+export interface Branch {
+  name: string;
+  head_commit: string | null;
+  created_at: string;
+  commits: number;
+  last_activity: string;
+}
+
+export async function getBranches(): Promise<{ branches: Branch[]; count: number }> {
+  return fetchWithAuth('/v2/branches');
+}
+
+export async function createBranch(name: string, fromBranch: string = 'command-center'): Promise<Branch> {
+  return fetchWithAuth('/v2/branch', {
+    method: 'POST',
+    body: JSON.stringify({ name, from: fromBranch })
+  });
+}
