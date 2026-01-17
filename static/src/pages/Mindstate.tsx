@@ -81,6 +81,12 @@ export default function Mindstate() {
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
   const [currentBranch, setCurrentBranch] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
+  const [thoughtBubble, setThoughtBubble] = useState<{
+    memory: Memory;
+    x: number;
+    y: number;
+    connections: Array<{ memory: Memory; type: string; strength: number; reasoning?: string }>;
+  } | null>(null);
 
   // Check Pro subscription
   useEffect(() => {
@@ -303,8 +309,48 @@ export default function Mindstate() {
     node.on('click', (_e: any, d: any) => {
       if (d.type === 'memory') {
         setSelectedMemory(d);
+
+        // Find connected memories for thought bubble
+        const connections: Array<{ memory: Memory; type: string; strength: number; reasoning?: string }> = [];
+        const memoryMap = new Map(memories.map(m => [m.id, m]));
+
+        // Find trail connections
+        trails.forEach(t => {
+          if (t.source === d.id && memoryMap.has(t.target)) {
+            connections.push({ memory: memoryMap.get(t.target)!, type: 'trail', strength: t.strength });
+          } else if (t.target === d.id && memoryMap.has(t.source)) {
+            connections.push({ memory: memoryMap.get(t.source)!, type: 'trail', strength: t.strength });
+          }
+        });
+
+        // Find semantic link connections
+        links.forEach(l => {
+          if (l.source === d.id && memoryMap.has(l.target)) {
+            connections.push({ memory: memoryMap.get(l.target)!, type: l.type, strength: l.strength, reasoning: l.reasoning });
+          } else if (l.target === d.id && memoryMap.has(l.source)) {
+            connections.push({ memory: memoryMap.get(l.source)!, type: l.type, strength: l.strength, reasoning: l.reasoning });
+          }
+        });
+
+        // Sort by strength descending
+        connections.sort((a, b) => b.strength - a.strength);
+
+        setThoughtBubble({
+          memory: d,
+          x: d.x,
+          y: d.y,
+          connections: connections.slice(0, 8) // Top 8 connections
+        });
       } else if (d.type === 'hub') {
         setCurrentBranch(d.branch);
+        setThoughtBubble(null);
+      }
+    });
+
+    // Click on background to close thought bubble
+    svg.on('click', (e: any) => {
+      if (e.target === svgRef.current) {
+        setThoughtBubble(null);
       }
     });
 
@@ -394,6 +440,86 @@ export default function Mindstate() {
             </div>
           ))}
         </div>
+
+        {/* Thought Bubble */}
+        {thoughtBubble && (
+          <div
+            className="absolute bg-[#14141c]/95 backdrop-blur-md border border-gray-600/40 rounded-xl p-4 shadow-2xl z-50 max-w-sm"
+            style={{
+              left: Math.min(Math.max(thoughtBubble.x + 20, 20), window.innerWidth - 400),
+              top: Math.min(Math.max(thoughtBubble.y - 100, 20), window.innerHeight - 350),
+            }}
+          >
+            {/* Header */}
+            <div className="flex justify-between items-start mb-3">
+              <div>
+                <div className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded inline-block mb-1"
+                  style={{ background: `${thoughtBubble.memory.color}30`, color: thoughtBubble.memory.color }}>
+                  {thoughtBubble.memory.memoryType}
+                </div>
+                <div className="text-gray-300 text-sm font-medium">
+                  {thoughtBubble.memory.preview.substring(0, 50)}...
+                </div>
+                <div className="text-gray-600 text-[10px] font-mono mt-1">{thoughtBubble.memory.id}</div>
+              </div>
+              <button
+                onClick={() => setThoughtBubble(null)}
+                className="text-gray-500 hover:text-gray-300 text-lg leading-none ml-2"
+              >
+                ×
+              </button>
+            </div>
+
+            {/* Connections */}
+            {thoughtBubble.connections.length > 0 ? (
+              <div>
+                <div className="text-gray-500 text-[10px] uppercase tracking-wider mb-2 border-t border-gray-700/30 pt-2">
+                  Connected Memories ({thoughtBubble.connections.length})
+                </div>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {thoughtBubble.connections.map((conn, i) => (
+                    <div
+                      key={i}
+                      onClick={() => {
+                        setSelectedMemory(conn.memory);
+                        setThoughtBubble(null);
+                      }}
+                      className="flex items-start gap-2 p-2 rounded bg-[#0c0c10]/50 hover:bg-[#1a1a24] cursor-pointer transition-colors"
+                    >
+                      <div className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0" style={{ background: conn.memory.color }} />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-gray-400 text-[11px] truncate">
+                          {conn.memory.preview.substring(0, 45)}...
+                        </div>
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className="text-[9px] px-1.5 py-0.5 rounded"
+                            style={{
+                              background: conn.type === 'trail' ? '#4a6a5a30' : '#5a4a6a30',
+                              color: conn.type === 'trail' ? '#6a9a7a' : '#9a7aaa'
+                            }}>
+                            {conn.type}
+                          </span>
+                          <span className="text-gray-600 text-[9px]">
+                            {(conn.strength * 100).toFixed(0)}% strength
+                          </span>
+                        </div>
+                        {conn.reasoning && (
+                          <div className="text-gray-500 text-[9px] italic mt-1">
+                            "{conn.reasoning.substring(0, 60)}..."
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="text-gray-600 text-xs italic border-t border-gray-700/30 pt-2">
+                No direct connections found
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Memory Panel */}
