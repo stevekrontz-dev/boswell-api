@@ -1,10 +1,10 @@
 const API_BASE = 'https://delightful-imagination-production-f6a1.up.railway.app';
 
-export async function register(email: string, password: string, name: string) {
+export async function register(email: string, password: string, name: string, agreedToTerms: boolean = false) {
   const res = await fetch(`${API_BASE}/v2/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password, name })
+    body: JSON.stringify({ email, password, name, agreed_to_terms: agreedToTerms })
   });
   const data = await res.json();
 
