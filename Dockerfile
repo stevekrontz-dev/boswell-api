@@ -1,3 +1,13 @@
+# Stage 1: Build React frontend
+FROM node:20-alpine AS frontend-build
+
+WORKDIR /frontend
+COPY static/package*.json ./
+RUN npm ci
+COPY static/ ./
+RUN npm run build
+
+# Stage 2: Python API
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -17,8 +27,8 @@ COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY extension/ ./extension/
 
-# Copy React dashboard build
-COPY static/dist/ ./static/dist/
+# Copy React dashboard build from frontend stage
+COPY --from=frontend-build /frontend/dist/ ./static/dist/
 
 # Legacy SQLite file (kept for reference, not used in production)
 COPY boswell_v2.db /data/boswell_v2.db
