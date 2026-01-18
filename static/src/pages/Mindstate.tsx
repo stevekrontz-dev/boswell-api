@@ -296,7 +296,7 @@ export default function Mindstate() {
         // Process memories
         const processedMemories: Memory[] = (graphData.nodes || []).map((node: any) => {
           const id = node.id.substring(0, 8);
-          const branch = getBranch(node.preview || '');
+          const branch = node.branch || getBranch(node.preview || '');  // Use backend branch, fallback to heuristic
           const branchConfig = branches[branch] || { color: '#666', label: branch };
           const heat = heatMap.get(id) || 0;
           const normalizedHeat = heat / maxHeat;

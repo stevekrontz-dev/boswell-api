@@ -1173,11 +1173,13 @@ def get_graph():
 
     nodes = []
     for row in cur.fetchall():
+        blob_branch = get_blob_branch(cur, row['blob_hash'], DEFAULT_TENANT)
         nodes.append({
             'id': row['blob_hash'],
             'type': row['content_type'],
             'created_at': str(row['created_at']) if row['created_at'] else None,
-            'preview': row['preview']
+            'preview': row['preview'],
+            'branch': blob_branch
         })
 
     if branch:
