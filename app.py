@@ -360,6 +360,8 @@ def list_branches():
 @app.route('/v2/branch', methods=['POST'])
 def create_branch():
     """Create a new cognitive branch."""
+    from auth import verify_jwt
+
     data = request.get_json() or {}
     name = data.get('name')
     from_branch = data.get('from', 'command-center')
@@ -367,9 +369,28 @@ def create_branch():
     if not name:
         return jsonify({'error': 'Branch name required'}), 400
 
+    # Get user's tenant_id from JWT (same pattern as list_branches)
+    auth_header = request.headers.get('Authorization', '')
+    tenant_id = DEFAULT_TENANT  # Fallback for API key auth
+
+    if auth_header.startswith('Bearer '):
+        try:
+            token = auth_header[7:]
+            payload = verify_jwt(token)
+            user_id = payload.get('sub')
+
+            # Get user's tenant_id
+            cur = get_cursor()
+            cur.execute('SELECT tenant_id FROM users WHERE id = %s', (user_id,))
+            user = cur.fetchone()
+            if user and user.get('tenant_id'):
+                tenant_id = str(user['tenant_id'])
+            cur.close()
+        except ValueError:
+            pass  # Fall back to DEFAULT_TENANT
+
     # W2P4: Check branch limit before creating
     from billing.enforce import enforce_branch_limit
-    tenant_id = request.headers.get('X-Tenant-ID', DEFAULT_TENANT)
     limit_cur = get_cursor()
     limit_error = enforce_branch_limit(limit_cur, tenant_id)
     limit_cur.close()
@@ -379,12 +400,12 @@ def create_branch():
     db = get_db()
     cur = get_cursor()
 
-    cur.execute('SELECT name FROM branches WHERE name = %s AND tenant_id = %s', (name, DEFAULT_TENANT))
+    cur.execute('SELECT name FROM branches WHERE name = %s AND tenant_id = %s', (name, tenant_id))
     if cur.fetchone():
         cur.close()
         return jsonify({'error': f'Branch {name} already exists'}), 409
 
-    cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (from_branch, DEFAULT_TENANT))
+    cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (from_branch, tenant_id))
     source = cur.fetchone()
     head_commit = source['head_commit'] if source else 'GENESIS'
 
@@ -392,7 +413,7 @@ def create_branch():
     cur.execute(
         '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
            VALUES (%s, %s, %s, %s)''',
-        (DEFAULT_TENANT, name, head_commit, now)
+        (tenant_id, name, head_commit, now)
     )
     db.commit()
     cur.close()
