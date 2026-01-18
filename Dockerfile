@@ -1,9 +1,12 @@
 # Stage 1: Build React frontend
 FROM node:20-alpine AS frontend-build
 
+# Limit Node memory to prevent OOM during build
+ENV NODE_OPTIONS="--max_old_space_size=512"
+
 WORKDIR /frontend
 COPY static/package*.json ./
-RUN npm ci
+RUN npm ci --maxsockets 1
 COPY static/ ./
 RUN npm run build
 
