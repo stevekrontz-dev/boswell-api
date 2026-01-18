@@ -1,16 +1,4 @@
-# Stage 1: Build React frontend
-FROM node:20-alpine AS frontend-build
-
-# Limit Node memory to prevent OOM during build
-ENV NODE_OPTIONS="--max_old_space_size=512"
-
-WORKDIR /frontend
-COPY static/package*.json ./
-RUN npm ci --maxsockets 1
-COPY static/ ./
-RUN npm run build
-
-# Stage 2: Python API
+# Single stage: Python API with pre-built frontend
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -30,8 +18,8 @@ COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY extension/ ./extension/
 
-# Copy React dashboard build from frontend stage
-COPY --from=frontend-build /frontend/dist/ ./static/dist/
+# Copy pre-built React dashboard (built locally, committed to repo)
+COPY static/dist/ ./static/dist/
 
 # Legacy SQLite file (kept for reference, not used in production)
 COPY boswell_v2.db /data/boswell_v2.db
