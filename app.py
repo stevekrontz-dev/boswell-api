@@ -1126,7 +1126,7 @@ def reflect():
     # Postgres version - wrap in subquery to filter by computed column
     sql = '''
         SELECT * FROM (
-            SELECT b.blob_hash, b.content_type, substring(b.content, 1, 500) as preview,
+            SELECT b.blob_hash, b.content_type, b.content as preview,
                    (SELECT COUNT(*) FROM cross_references cr
                     WHERE (cr.source_blob = b.blob_hash OR cr.target_blob = b.blob_hash)
                     AND cr.tenant_id = %s) as link_count
