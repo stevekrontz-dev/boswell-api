@@ -189,6 +189,9 @@ function formatRelativeTime(dateStr: string | undefined): string {
 export default function Mindstate() {
   const navigate = useNavigate();
   const svgRef = useRef<SVGSVGElement>(null);
+  const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
+  const nodesRef = useRef<any[]>([]);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [memories, setMemories] = useState<Memory[]>([]);
   const [trails, setTrails] = useState<Trail[]>([]);
@@ -199,6 +202,7 @@ export default function Mindstate() {
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
   const [currentBranch, setCurrentBranch] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
+  const [viewMode, setViewMode] = useState<'graph' | 'timeline'>('graph');
   const [showMobilePanel, setShowMobilePanel] = useState(false);
   const [thoughtBubble, setThoughtBubble] = useState<{
     memory: Memory;
@@ -357,11 +361,14 @@ export default function Mindstate() {
     const height = svgRef.current.clientHeight;
 
     const g = svg.append('g');
+    gRef.current = g;
 
     // Zoom
-    svg.call(d3.zoom<SVGSVGElement, unknown>()
+    const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.2, 4])
-      .on('zoom', (e) => g.attr('transform', e.transform)));
+      .on('zoom', (e) => g.attr('transform', e.transform));
+    svg.call(zoom);
+    zoomRef.current = zoom;
 
     // Build nodes
     const nodes: any[] = [];
@@ -423,6 +430,9 @@ export default function Mindstate() {
         graphLinks.push({ source: l.source, target: l.target, type: 'link', strength: l.strength });
       }
     });
+
+    // Store nodes ref for zoom-to-branch
+    nodesRef.current = nodes;
 
     // Force simulation
     const simulation = d3.forceSimulation(nodes)
@@ -536,6 +546,101 @@ export default function Mindstate() {
 
   }, [loading, memories, trails, links, branches]);
 
+  // Zoom to branch when selected
+  useEffect(() => {
+    if (currentBranch === 'all' || !svgRef.current || !zoomRef.current || !gRef.current || nodesRef.current.length === 0) return;
+
+    const svg = d3.select(svgRef.current);
+    const zoom = zoomRef.current;
+    const width = svgRef.current.clientWidth;
+    const height = svgRef.current.clientHeight;
+
+    // Find nodes belonging to this branch (including the hub)
+    const branchNodes = nodesRef.current.filter((n: any) =>
+      n.branch === currentBranch || n.id === `hub-${currentBranch}`
+    );
+
+    if (branchNodes.length === 0) return;
+
+    // Calculate bounding box
+    const xs = branchNodes.map((n: any) => n.x).filter((x: any) => x !== undefined);
+    const ys = branchNodes.map((n: any) => n.y).filter((y: any) => y !== undefined);
+
+    if (xs.length === 0 || ys.length === 0) return;
+
+    const minX = Math.min(...xs) - 50;
+    const maxX = Math.max(...xs) + 50;
+    const minY = Math.min(...ys) - 50;
+    const maxY = Math.max(...ys) + 50;
+
+    const boxWidth = maxX - minX;
+    const boxHeight = maxY - minY;
+
+    // Calculate transform to fit branch in view
+    const scale = Math.min(width / boxWidth, height / boxHeight, 2) * 0.85;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    const transform = d3.zoomIdentity
+      .translate(width / 2, height / 2)
+      .scale(scale)
+      .translate(-centerX, -centerY);
+
+    svg.transition().duration(750).call(zoom.transform, transform);
+  }, [currentBranch]);
+
+  // Handle view mode toggle (graph vs timeline)
+  useEffect(() => {
+    if (!svgRef.current || !zoomRef.current || !gRef.current || nodesRef.current.length === 0) return;
+
+    const svg = d3.select(svgRef.current);
+    const zoom = zoomRef.current;
+    const width = svgRef.current.clientWidth;
+    const height = svgRef.current.clientHeight;
+
+    if (viewMode === 'timeline') {
+      // Sort memory nodes by creation date, exclude hubs
+      const memoryNodes = nodesRef.current
+        .filter((n: any) => n.type === 'memory' && n.createdAt)
+        .sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+      if (memoryNodes.length === 0) return;
+
+      // Calculate timeline positions
+      const padding = 100;
+      const timelineWidth = Math.max(memoryNodes.length * 40, width * 2);
+      const centerY = height / 2;
+
+      memoryNodes.forEach((node: any, i: number) => {
+        node.fx = padding + (i * (timelineWidth - 2 * padding) / Math.max(memoryNodes.length - 1, 1));
+        node.fy = centerY + (Math.sin(i * 0.3) * 30); // Slight wave for visual interest
+      });
+
+      // Hide hub nodes
+      nodesRef.current.filter((n: any) => n.type === 'hub').forEach((node: any) => {
+        node.fx = -1000;
+        node.fy = -1000;
+      });
+
+      // Zoom to fit timeline
+      const transform = d3.zoomIdentity
+        .translate(0, 0)
+        .scale(Math.min(width / timelineWidth, 1) * 0.9);
+
+      svg.transition().duration(750).call(zoom.transform, transform);
+    } else {
+      // Reset to force-directed layout
+      nodesRef.current.forEach((node: any) => {
+        node.fx = null;
+        node.fy = null;
+      });
+
+      // Reset zoom
+      const transform = d3.zoomIdentity.translate(0, 0).scale(1);
+      svg.transition().duration(750).call(zoom.transform, transform);
+    }
+  }, [viewMode]);
+
   const filteredMemories = memories.filter(m => {
     const matchBranch = currentBranch === 'all' || m.branch === currentBranch;
     const matchSearch = !searchTerm ||
@@ -600,6 +705,25 @@ export default function Mindstate() {
             <div className="flex justify-between gap-4 md:gap-8"><span>Branches</span> <span className="text-gray-400">{branchCount}</span></div>
             <div className="flex justify-between gap-4 md:gap-8"><span>Memories</span> <span className="text-gray-400">{memories.length}</span></div>
             <div className="flex justify-between gap-4 md:gap-8"><span>Connections</span> <span className="text-gray-400">{trails.length + links.length}</span></div>
+          </div>
+          {/* View toggle */}
+          <div className="flex gap-1 mt-3 pt-3 border-t border-gray-700/30">
+            <button
+              onClick={() => setViewMode('graph')}
+              className={`px-2 py-1 rounded text-[10px] transition-all ${
+                viewMode === 'graph' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30' : 'text-gray-500 hover:text-gray-400'
+              }`}
+            >
+              Graph
+            </button>
+            <button
+              onClick={() => setViewMode('timeline')}
+              className={`px-2 py-1 rounded text-[10px] transition-all ${
+                viewMode === 'timeline' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30' : 'text-gray-500 hover:text-gray-400'
+              }`}
+            >
+              Timeline
+            </button>
           </div>
         </div>
 
