@@ -77,9 +77,21 @@ function getTypeClass(type: string): string {
 function narrateMemory(preview: string): { narrative: string; emotion?: string } {
   if (!preview) return { narrative: 'A moment I wanted to remember.' };
 
+  let data: any = null;
+
+  // Try to parse as JSON - handle cases where braces are missing
   try {
-    // Try to parse as JSON
-    const data = JSON.parse(preview);
+    data = JSON.parse(preview);
+  } catch {
+    // Try wrapping in braces if it looks like JSON without them
+    if (preview.includes('"type"') || preview.includes('"title"')) {
+      try {
+        data = JSON.parse(`{${preview}}`);
+      } catch { /* still not valid */ }
+    }
+  }
+
+  if (data) {
     const type = data.type || '';
 
     // Lesson learned
@@ -151,9 +163,6 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
     if (title) {
       return { narrative: context ? `${title}. ${context}` : title };
     }
-
-  } catch {
-    // Not JSON - try to extract from plain text
   }
 
   // Fallback: extract from commit message format "TYPE: message"

@@ -1061,7 +1061,7 @@ def get_graph():
     if branch:
         nodes_sql = '''
             SELECT DISTINCT b.blob_hash, b.content_type, b.created_at,
-                   substring(b.content, 1, 200) as preview
+                   b.content as preview
             FROM blobs b
             JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
             JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
@@ -1073,7 +1073,7 @@ def get_graph():
     else:
         nodes_sql = '''
             SELECT blob_hash, content_type, created_at,
-                   substring(content, 1, 200) as preview
+                   content as preview
             FROM blobs WHERE tenant_id = %s ORDER BY created_at DESC LIMIT %s
         '''
         cur.execute(nodes_sql, (DEFAULT_TENANT, limit))
