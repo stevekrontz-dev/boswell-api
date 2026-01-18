@@ -19,6 +19,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 import time
+import numpy as np
 
 # OpenAI for embeddings (v3)
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
@@ -1267,6 +1268,337 @@ def reflect():
         'insight': 'Memories with high link counts represent conceptual hubs. Cross-branch links reveal how ideas flow between cognitive domains.',
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
+
+# ==================== CONNECTOME ANALYSIS ====================
+
+# Domain classification markers for content analysis
+DOMAIN_MARKERS = {
+    'thalamus': ['browser', 'automation', 'screenshot', 'perception', 'chrome', 'tab', 'click', 'navigate', 'mcp', 'claude-in-chrome'],
+    'infrastructure': ['deploy', 'railway', 'api', 'endpoint', 'migration', 'schema', 'database', 'postgres', 'redis', 'docker', 'server'],
+    'business': ['tint', 'crm', 'customer', 'franchise', 'atlanta', 'empire', 'square', 'payment', 'invoice', 'booking'],
+    'research': ['iris', 'bci', 'neural', 'research', 'embedding', 'vector', 'semantic', 'ml', 'model'],
+    'personal': ['family', 'diego', 'lineage', 'personal'],
+    'boswell': ['memory', 'commit', 'branch', 'graph', 'connectome', 'recall', 'startup', 'trail']
+}
+
+# Common stopwords to exclude from shared word analysis
+STOPWORDS = {
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+    'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be', 'have', 'has', 'had',
+    'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must',
+    'that', 'this', 'these', 'those', 'it', 'its', 'they', 'them', 'their', 'he', 'she',
+    'his', 'her', 'we', 'our', 'you', 'your', 'i', 'my', 'me', 'not', 'no', 'yes',
+    'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such',
+    'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'also', 'now', 'here',
+    'there', 'when', 'where', 'why', 'how', 'what', 'which', 'who', 'whom', 'whose',
+    'if', 'then', 'else', 'because', 'while', 'although', 'though', 'after', 'before',
+    'true', 'false', 'null', 'none', 'type', 'date', 'time', 'status', 'data', 'value',
+    'new', 'get', 'set', 'add', 'update', 'delete', 'create', 'read', 'write'
+}
+
+
+def classify_content(content: str) -> list:
+    """Classify content into semantic domains based on keyword markers."""
+    if not content:
+        return ['general']
+    content_lower = content.lower()
+    domains = []
+    for domain, markers in DOMAIN_MARKERS.items():
+        if any(marker in content_lower for marker in markers):
+            domains.append(domain)
+    return domains or ['general']
+
+
+def generate_link_reasoning(content_a: str, content_b: str, distance: float) -> str:
+    """Generate reasoning for why two memories are linked."""
+    domains_a = classify_content(content_a)
+    domains_b = classify_content(content_b)
+    shared_domains = set(domains_a) & set(domains_b)
+
+    if shared_domains:
+        return f"Both relate to: {', '.join(sorted(shared_domains))}"
+
+    # Extract key terms (words > 4 chars, not stopwords)
+    words_a = set(w for w in content_a.lower().split() if len(w) > 4 and w not in STOPWORDS)
+    words_b = set(w for w in content_b.lower().split() if len(w) > 4 and w not in STOPWORDS)
+    shared_words = words_a & words_b
+
+    if len(shared_words) >= 3:
+        top_shared = sorted(shared_words, key=lambda w: len(w), reverse=True)[:5]
+        return f"Shared concepts: {', '.join(top_shared)}"
+
+    return f"Semantic similarity (distance: {distance:.3f})"
+
+
+def get_blob_branch(cur, blob_hash: str, tenant_id: str) -> str:
+    """Get the branch a blob belongs to via the commit chain."""
+    cur.execute('''
+        SELECT br.name
+        FROM blobs b
+        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+        JOIN branches br ON c.commit_hash = br.head_commit AND c.tenant_id = br.tenant_id
+        WHERE b.blob_hash = %s AND b.tenant_id = %s
+        LIMIT 1
+    ''', (blob_hash, tenant_id))
+    row = cur.fetchone()
+    if row:
+        return row['name']
+
+    # Fallback: check if blob appears in any commit on any branch
+    cur.execute('''
+        SELECT DISTINCT br.name
+        FROM tree_entries t
+        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+        JOIN branches br ON br.tenant_id = c.tenant_id
+        WHERE t.blob_hash = %s AND t.tenant_id = %s
+        LIMIT 1
+    ''', (blob_hash, tenant_id))
+    row = cur.fetchone()
+    return row['name'] if row else 'unknown'
+
+
+@app.route('/v2/analyze', methods=['POST'])
+def analyze_connectome():
+    """
+    Analyze the memory graph and discover semantic relationships.
+
+    Request body (JSON):
+    - similarity_threshold: float (default 0.25) - max cosine distance for linking
+    - min_weight: float (default 0.5) - minimum link weight to create
+    - dry_run: bool (default True) - if True, return analysis without creating links
+    - propagate_tags: bool (default False) - if True, propagate tags to similar blobs
+    - tag_threshold: float (default 0.3) - max distance for tag propagation
+    - limit: int (default 100) - max number of links to create/preview
+
+    Returns:
+    - stats: analysis statistics
+    - links_preview: proposed or created links
+    - tags_preview: proposed tag propagations (if propagate_tags=True)
+    - cross_branch_insights: summary of cross-branch connections
+    """
+    data = request.get_json() or {}
+    similarity_threshold = data.get('similarity_threshold', 0.25)
+    min_weight = data.get('min_weight', 0.5)
+    dry_run = data.get('dry_run', True)
+    propagate_tags = data.get('propagate_tags', False)
+    tag_threshold = data.get('tag_threshold', 0.3)
+    limit = min(data.get('limit', 100), 500)  # Cap at 500
+
+    if not OPENAI_API_KEY:
+        return jsonify({'error': 'Semantic analysis not available - OpenAI not configured'}), 503
+
+    cur = get_cursor()
+    db = get_db()
+
+    # 1. Load all blobs with embeddings
+    cur.execute('''
+        SELECT blob_hash, content, embedding
+        FROM blobs
+        WHERE embedding IS NOT NULL AND tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+
+    blobs = []
+    for row in cur.fetchall():
+        blobs.append({
+            'hash': row['blob_hash'],
+            'content': row['content'] or '',
+            'embedding': row['embedding']
+        })
+
+    # 2. Load existing links to avoid duplicates
+    cur.execute('''
+        SELECT source_blob || '-' || target_blob as link_key
+        FROM cross_references
+        WHERE tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+    existing_links = set(row['link_key'] for row in cur.fetchall())
+
+    # Also add reverse keys
+    cur.execute('''
+        SELECT target_blob || '-' || source_blob as link_key
+        FROM cross_references
+        WHERE tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+    existing_links.update(row['link_key'] for row in cur.fetchall())
+
+    # 3. Compute pairwise similarities for blobs with embeddings
+    proposed_links = []
+    cross_branch_stats = {}
+
+    for i, blob_a in enumerate(blobs):
+        if len(proposed_links) >= limit:
+            break
+
+        for blob_b in blobs[i+1:]:
+            if len(proposed_links) >= limit:
+                break
+
+            # Check if link already exists
+            link_key = f"{blob_a['hash']}-{blob_b['hash']}"
+            reverse_key = f"{blob_b['hash']}-{blob_a['hash']}"
+            if link_key in existing_links or reverse_key in existing_links:
+                continue
+
+            # Compute cosine distance
+            try:
+                emb_a = np.array(blob_a['embedding'])
+                emb_b = np.array(blob_b['embedding'])
+                # Cosine distance = 1 - cosine_similarity
+                cos_sim = np.dot(emb_a, emb_b) / (np.linalg.norm(emb_a) * np.linalg.norm(emb_b))
+                distance = 1 - cos_sim
+            except Exception:
+                continue
+
+            if distance < similarity_threshold:
+                weight = 1 / (distance + 0.1)
+                if weight >= min_weight:
+                    # Get branches for both blobs
+                    source_branch = get_blob_branch(cur, blob_a['hash'], DEFAULT_TENANT)
+                    target_branch = get_blob_branch(cur, blob_b['hash'], DEFAULT_TENANT)
+
+                    reasoning = generate_link_reasoning(
+                        blob_a['content'][:1000],
+                        blob_b['content'][:1000],
+                        distance
+                    )
+
+                    proposed_links.append({
+                        'source': blob_a['hash'],
+                        'target': blob_b['hash'],
+                        'source_branch': source_branch,
+                        'target_branch': target_branch,
+                        'distance': round(distance, 4),
+                        'weight': round(weight, 2),
+                        'reasoning': reasoning,
+                        'cross_branch': source_branch != target_branch
+                    })
+
+                    # Track cross-branch stats
+                    if source_branch != target_branch:
+                        key = tuple(sorted([source_branch, target_branch]))
+                        if key not in cross_branch_stats:
+                            cross_branch_stats[key] = {'count': 0, 'total_weight': 0}
+                        cross_branch_stats[key]['count'] += 1
+                        cross_branch_stats[key]['total_weight'] += weight
+
+    # 4. Tag propagation (if requested)
+    proposed_tags = []
+    if propagate_tags:
+        # Get all unique tags
+        cur.execute('SELECT DISTINCT tag FROM tags WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        all_tags = [row['tag'] for row in cur.fetchall()]
+
+        for tag in all_tags[:20]:  # Limit to 20 tags
+            # Get blobs with this tag
+            cur.execute('''
+                SELECT b.blob_hash, b.embedding
+                FROM blobs b
+                JOIN tags t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                WHERE t.tag = %s AND b.embedding IS NOT NULL AND b.tenant_id = %s
+            ''', (tag, DEFAULT_TENANT))
+            tagged_blobs = [{'hash': r['blob_hash'], 'embedding': r['embedding']} for r in cur.fetchall()]
+
+            if not tagged_blobs:
+                continue
+
+            # Get blobs without this tag
+            cur.execute('''
+                SELECT blob_hash, embedding
+                FROM blobs
+                WHERE embedding IS NOT NULL AND tenant_id = %s
+                AND blob_hash NOT IN (SELECT blob_hash FROM tags WHERE tag = %s AND tenant_id = %s)
+                LIMIT 100
+            ''', (DEFAULT_TENANT, tag, DEFAULT_TENANT))
+            untagged_blobs = [{'hash': r['blob_hash'], 'embedding': r['embedding']} for r in cur.fetchall()]
+
+            for untagged in untagged_blobs:
+                if len(proposed_tags) >= 50:  # Cap tag propagations
+                    break
+                for tagged in tagged_blobs:
+                    try:
+                        emb_a = np.array(tagged['embedding'])
+                        emb_b = np.array(untagged['embedding'])
+                        cos_sim = np.dot(emb_a, emb_b) / (np.linalg.norm(emb_a) * np.linalg.norm(emb_b))
+                        distance = 1 - cos_sim
+                    except Exception:
+                        continue
+
+                    if distance < tag_threshold:
+                        proposed_tags.append({
+                            'tag': tag,
+                            'blob_hash': untagged['hash'],
+                            'distance': round(distance, 4),
+                            'reason': f"Similar to {tagged['hash'][:8]}..."
+                        })
+                        break  # One match is enough
+
+    # 5. Execute if not dry_run
+    created_links = 0
+    created_tags = 0
+
+    if not dry_run:
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        for link in proposed_links:
+            try:
+                cur.execute('''
+                    INSERT INTO cross_references
+                    (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                     link_type, weight, reasoning, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    DEFAULT_TENANT, link['source'], link['target'],
+                    link['source_branch'], link['target_branch'],
+                    'resonance', link['weight'], link['reasoning'], now
+                ))
+                created_links += 1
+            except Exception as e:
+                print(f"[ANALYZE] Link creation failed: {e}", file=sys.stderr)
+                continue
+
+        for tag_prop in proposed_tags:
+            try:
+                cur.execute('''
+                    INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+                    VALUES (%s, %s, %s, %s)
+                ''', (DEFAULT_TENANT, tag_prop['blob_hash'], tag_prop['tag'], now))
+                created_tags += 1
+            except Exception:
+                continue  # Tag might already exist
+
+        db.commit()
+
+    cur.close()
+
+    # Format cross-branch insights
+    cross_branch_insights = [
+        {
+            'branches': list(key),
+            'link_count': stats['count'],
+            'avg_weight': round(stats['total_weight'] / stats['count'], 2)
+        }
+        for key, stats in sorted(cross_branch_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+    ]
+
+    return jsonify({
+        'status': 'executed' if not dry_run else 'analyzed',
+        'dry_run': dry_run,
+        'stats': {
+            'total_blobs': len(blobs),
+            'blobs_with_embeddings': len(blobs),
+            'existing_links': len(existing_links) // 2,  # Divide by 2 since we added both directions
+            'proposed_links': len(proposed_links),
+            'created_links': created_links,
+            'proposed_tags': len(proposed_tags),
+            'created_tags': created_tags
+        },
+        'links_preview': proposed_links[:50],  # Preview first 50
+        'tags_preview': proposed_tags[:20] if propagate_tags else [],
+        'cross_branch_insights': cross_branch_insights,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
 
 # ==================== EMBEDDINGS ====================
 
