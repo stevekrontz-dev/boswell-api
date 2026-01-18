@@ -479,8 +479,8 @@ export default function Mindstate() {
       .attr('letter-spacing', '1px')
       .text((d: any) => d.label.toUpperCase());
 
-    // Click handler
-    node.on('click', (_e: any, d: any) => {
+    // Click handler - use event coordinates for bubble positioning
+    node.on('click', (event: any, d: any) => {
       if (d.type === 'memory') {
         setSelectedMemory(d);
 
@@ -505,10 +505,15 @@ export default function Mindstate() {
 
         connections.sort((a, b) => b.strength - a.strength);
 
+        // Get click position relative to graph panel
+        const svgRect = svgRef.current?.getBoundingClientRect();
+        const clickX = event.clientX - (svgRect?.left || 0);
+        const clickY = event.clientY - (svgRect?.top || 0);
+
         setThoughtBubble({
           memory: d,
-          x: d.x,
-          y: d.y,
+          x: clickX,
+          y: clickY,
           connections: connections.slice(0, 8)
         });
       } else if (d.type === 'hub') {
