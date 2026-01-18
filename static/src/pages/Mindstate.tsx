@@ -468,7 +468,7 @@ export default function Mindstate() {
   const branchCount = Object.keys(branches).length;
 
   return (
-    <div className="flex flex-col md:flex-row h-[calc(100vh-4rem)] bg-[#0c0c10]">
+    <div className="flex flex-col md:flex-row h-[calc(100vh-3.5rem)] md:h-[calc(100vh-4rem)] bg-[#0c0c10] overflow-hidden">
       {/* Graph Panel */}
       <div className="flex-1 relative min-h-[50vh] md:min-h-0">
         <svg ref={svgRef} className="w-full h-full touch-none" />
