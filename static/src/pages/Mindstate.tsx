@@ -735,11 +735,12 @@ export default function Mindstate() {
                     style={{ background: `${m.color}30`, color: m.color }}>
                     {m.memoryType}
                   </span>
-                  {m.preview.split(': ').slice(1).join(': ').substring(0, 60) || m.preview.substring(0, 60)}
+                  {narrateMemory(m.preview).narrative.substring(0, 70)}
                 </div>
                 <div className="text-[9px] text-gray-600 flex gap-3">
                   <span className="font-mono text-blue-400/60">{m.id}</span>
                   <span className="text-green-400/50">{branches[m.branch]?.label || m.branch}</span>
+                  {m.createdAt && <span className="text-gray-600">{formatRelativeTime(m.createdAt)}</span>}
                 </div>
               </div>
             </div>
