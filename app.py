@@ -1722,6 +1722,60 @@ def cleanup_links():
     })
 
 
+@app.route('/v2/links/debug-branch', methods=['POST'])
+def debug_branch_detection():
+    """Debug branch detection for a specific blob."""
+    data = request.get_json() or {}
+    blob_hash = data.get('blob_hash')
+
+    if not blob_hash:
+        # Pick a random blob with embedding
+        cur = get_cursor()
+        cur.execute('''
+            SELECT blob_hash FROM blobs
+            WHERE embedding IS NOT NULL AND tenant_id = %s
+            LIMIT 1
+        ''', (DEFAULT_TENANT,))
+        row = cur.fetchone()
+        blob_hash = row['blob_hash'] if row else None
+        cur.close()
+
+    if not blob_hash:
+        return jsonify({'error': 'No blob found'}), 404
+
+    cur = get_cursor()
+    debug_info = {'blob_hash': blob_hash}
+
+    # Step 1: Check if blob exists
+    cur.execute('SELECT blob_hash FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+    debug_info['blob_exists'] = cur.fetchone() is not None
+
+    # Step 2: Check tree_entries for this blob
+    cur.execute('SELECT tree_hash, name FROM tree_entries WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+    tree_entries = cur.fetchall()
+    debug_info['tree_entries'] = [{'tree_hash': r['tree_hash'], 'name': r['name']} for r in tree_entries]
+
+    # Step 3: For each tree_entry, find the commit
+    commits_found = []
+    for te in tree_entries:
+        cur.execute('SELECT commit_hash, message FROM commits WHERE tree_hash = %s AND tenant_id = %s', (te['tree_hash'], DEFAULT_TENANT))
+        commits = cur.fetchall()
+        for c in commits:
+            commits_found.append({'tree_hash': te['tree_hash'], 'commit_hash': c['commit_hash'], 'message': c['message'][:50]})
+    debug_info['commits_found'] = commits_found
+
+    # Step 4: Check branch heads
+    cur.execute('SELECT name, head_commit FROM branches WHERE tenant_id = %s', (DEFAULT_TENANT,))
+    branches = [{'name': r['name'], 'head_commit': r['head_commit']} for r in cur.fetchall()]
+    debug_info['branches'] = branches
+
+    # Step 5: Run the actual get_blob_branch function
+    debug_info['detected_branch'] = get_blob_branch(cur, blob_hash, DEFAULT_TENANT)
+
+    cur.close()
+    return jsonify(debug_info)
+
+
 # ==================== EMBEDDINGS ====================
 
 @app.route('/v2/embeddings/backfill', methods=['POST'])
