@@ -1297,6 +1297,60 @@ STOPWORDS = {
 }
 
 
+@app.route('/v2/analyze/debug', methods=['GET'])
+def analyze_debug():
+    """Debug endpoint to test numpy and embedding loading."""
+    try:
+        import numpy as np
+        numpy_version = np.__version__
+
+        cur = get_cursor()
+
+        # Test 1: Can we query blobs?
+        cur.execute('SELECT COUNT(*) as cnt FROM blobs WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        blob_count = cur.fetchone()['cnt']
+
+        # Test 2: Can we get embeddings?
+        cur.execute('''
+            SELECT blob_hash, embedding
+            FROM blobs
+            WHERE embedding IS NOT NULL AND tenant_id = %s
+            LIMIT 1
+        ''', (DEFAULT_TENANT,))
+        row = cur.fetchone()
+
+        embedding_info = None
+        if row:
+            emb = row['embedding']
+            embedding_info = {
+                'type': str(type(emb)),
+                'has_data': emb is not None,
+            }
+            # Try to convert to numpy
+            try:
+                arr = np.array(emb)
+                embedding_info['numpy_shape'] = str(arr.shape)
+                embedding_info['numpy_dtype'] = str(arr.dtype)
+            except Exception as e:
+                embedding_info['numpy_error'] = str(e)
+
+        cur.close()
+
+        return jsonify({
+            'numpy_version': numpy_version,
+            'blob_count': blob_count,
+            'embedding_info': embedding_info,
+            'status': 'ok'
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+
 def classify_content(content: str) -> list:
     """Classify content into semantic domains based on keyword markers."""
     if not content:
