@@ -425,6 +425,57 @@ def create_branch():
         'head_commit': head_commit
     }), 201
 
+@app.route('/v2/branch/<name>', methods=['DELETE'])
+def delete_branch(name):
+    """Delete a cognitive branch."""
+    from auth import verify_jwt
+
+    if not name:
+        return jsonify({'error': 'Branch name required'}), 400
+
+    # Prevent deleting core branches
+    protected_branches = ['main', 'command-center']
+    if name in protected_branches:
+        return jsonify({'error': f'Cannot delete protected branch: {name}'}), 403
+
+    # Get user's tenant_id from JWT
+    auth_header = request.headers.get('Authorization', '')
+    tenant_id = DEFAULT_TENANT
+
+    if auth_header.startswith('Bearer '):
+        try:
+            token = auth_header[7:]
+            payload = verify_jwt(token)
+            user_id = payload.get('sub')
+
+            cur = get_cursor()
+            cur.execute('SELECT tenant_id FROM users WHERE id = %s', (user_id,))
+            user = cur.fetchone()
+            if user and user.get('tenant_id'):
+                tenant_id = str(user['tenant_id'])
+            cur.close()
+        except ValueError:
+            pass
+
+    db = get_db()
+    cur = get_cursor()
+
+    # Check branch exists and belongs to tenant
+    cur.execute('SELECT name FROM branches WHERE name = %s AND tenant_id = %s', (name, tenant_id))
+    if not cur.fetchone():
+        cur.close()
+        return jsonify({'error': f'Branch {name} not found'}), 404
+
+    # Delete the branch
+    cur.execute('DELETE FROM branches WHERE name = %s AND tenant_id = %s', (name, tenant_id))
+    db.commit()
+    cur.close()
+
+    return jsonify({
+        'status': 'deleted',
+        'branch': name
+    }), 200
+
 @app.route('/v2/commit', methods=['POST'])
 def create_commit():
     """Commit a memory to the repository."""

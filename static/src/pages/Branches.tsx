@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getBranches, createBranch, type Branch } from '../lib/api';
+import { getBranches, createBranch, deleteBranch, type Branch } from '../lib/api';
 
 export default function Branches() {
   const [branches, setBranches] = useState<Branch[]>([]);
@@ -8,6 +8,9 @@ export default function Branches() {
   const [newBranchName, setNewBranchName] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [deletingBranch, setDeletingBranch] = useState<string | null>(null);
+
+  const protectedBranches = ['main', 'command-center'];
 
   useEffect(() => {
     loadBranches();
@@ -41,6 +44,29 @@ export default function Branches() {
       console.error('Failed to create branch:', err);
     } finally {
       setCreating(false);
+    }
+  };
+
+  const handleDeleteBranch = async (name: string) => {
+    if (protectedBranches.includes(name)) {
+      setError(`Cannot delete protected branch: ${name}`);
+      return;
+    }
+
+    if (!confirm(`Delete branch "${name}"? This cannot be undone.`)) {
+      return;
+    }
+
+    setDeletingBranch(name);
+    setError(null);
+    try {
+      await deleteBranch(name);
+      loadBranches();
+    } catch (err: any) {
+      console.error('Failed to delete branch:', err);
+      setError(err.message || 'Failed to delete branch');
+    } finally {
+      setDeletingBranch(null);
     }
   };
 
@@ -107,7 +133,17 @@ export default function Branches() {
                   <td className="px-4 py-3 text-parchment-200/60">{branch.commits || 0}</td>
                   <td className="px-4 py-3 text-parchment-200/60">{formatDate(branch.last_activity)}</td>
                   <td className="px-4 py-3">
-                    <button className="text-red-400 hover:text-red-300 text-sm">Delete</button>
+                    {protectedBranches.includes(branch.name) ? (
+                      <span className="text-parchment-200/30 text-sm">Protected</span>
+                    ) : (
+                      <button
+                        onClick={() => handleDeleteBranch(branch.name)}
+                        disabled={deletingBranch === branch.name}
+                        className="text-red-400 hover:text-red-300 text-sm disabled:opacity-50"
+                      >
+                        {deletingBranch === branch.name ? 'Deleting...' : 'Delete'}
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

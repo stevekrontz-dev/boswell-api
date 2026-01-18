@@ -110,3 +110,9 @@ export async function createBranch(name: string, fromBranch: string = 'command-c
     body: JSON.stringify({ name, from: fromBranch })
   });
 }
+
+export async function deleteBranch(name: string): Promise<{ status: string; branch: string }> {
+  return fetchWithAuth(`/v2/branch/${encodeURIComponent(name)}`, {
+    method: 'DELETE'
+  });
+}
