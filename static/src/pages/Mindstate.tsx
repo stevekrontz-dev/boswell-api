@@ -15,6 +15,7 @@ interface Memory {
   heat: number;
   normalizedHeat: number;
   memoryType: string;
+  createdAt?: string;
 }
 
 interface Trail {
@@ -70,6 +71,50 @@ function getTypeClass(type: string): string {
   if (type.includes('complete') || type.includes('milestone')) return 'complete';
   if (type.includes('insight') || type.includes('lesson')) return 'insight';
   return 'task';
+}
+
+// Extract human-readable title from memory preview/content
+function extractTitle(preview: string): string {
+  if (!preview) return 'Memory';
+  // Try to find a title or message field in JSON
+  const titleMatch = preview.match(/"(?:title|message|commitment|decision)":\s*"([^"]+)"/);
+  if (titleMatch) return titleMatch[1];
+  // Try commit message format "TYPE: message"
+  const colonMatch = preview.match(/^[A-Z_]+:\s*(.+?)(?:\.|{|$)/);
+  if (colonMatch) return colonMatch[1].trim();
+  // Fallback: first meaningful chunk
+  const clean = preview.replace(/[{}"]/g, '').trim();
+  return clean.substring(0, 80) + (clean.length > 80 ? '...' : '');
+}
+
+// Extract the WHY/meaning from memory content
+function extractMeaning(preview: string): string {
+  if (!preview) return '';
+  // Look for rationale, reasoning, context, or why fields
+  const meaningMatch = preview.match(/"(?:rationale|reasoning|context|why|insight|principle)":\s*"([^"]+)"/);
+  if (meaningMatch) return meaningMatch[1];
+  // Look for description
+  const descMatch = preview.match(/"description":\s*"([^"]+)"/);
+  if (descMatch) return descMatch[1];
+  return '';
+}
+
+// Format timestamp as relative human time
+function formatRelativeTime(dateStr: string | undefined): string {
+  if (!dateStr) return '';
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMins / 60);
+  const diffDays = Math.floor(diffHours / 24);
+  
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins} min ago`;
+  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+  if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+  if (diffDays < 30) return `${Math.floor(diffDays / 7)} week${Math.floor(diffDays / 7) > 1 ? 's' : ''} ago`;
+  return date.toLocaleDateString();
 }
 
 export default function Mindstate() {
@@ -197,7 +242,8 @@ export default function Mindstate() {
             radius: 4 + (normalizedHeat * 10),
             heat,
             normalizedHeat,
-            memoryType: extractType(node.preview || '')
+            memoryType: extractType(node.preview || ''),
+            createdAt: node.created_at || node.timestamp
           };
         });
 
@@ -507,78 +553,30 @@ export default function Mindstate() {
         {/* Thought Bubble */}
         {thoughtBubble && (
           <div
-            className="absolute bg-[#14141c]/95 backdrop-blur-md border border-gray-600/40 rounded-xl p-4 shadow-2xl z-50 max-w-[90vw] md:max-w-sm"
+            className="absolute bg-[#14141c]/95 backdrop-blur-md border border-gray-600/40 rounded-xl p-5 shadow-2xl z-50 max-w-[90vw] md:max-w-sm"
             style={{
               left: Math.min(Math.max(thoughtBubble.x + 20, 20), window.innerWidth - 320),
               top: Math.min(Math.max(thoughtBubble.y - 100, 20), window.innerHeight - 350),
             }}
           >
-            <div className="flex justify-between items-start mb-3">
-              <div>
-                <div className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded inline-block mb-1"
-                  style={{ background: `${thoughtBubble.memory.color}30`, color: thoughtBubble.memory.color }}>
-                  {thoughtBubble.memory.memoryType}
-                </div>
-                <div className="text-gray-300 text-sm font-medium">
-                  {thoughtBubble.memory.preview.substring(0, 50)}...
-                </div>
-                <div className="text-gray-600 text-[10px] font-mono mt-1">{thoughtBubble.memory.id}</div>
+            <button
+              onClick={() => setThoughtBubble(null)}
+              className="absolute top-3 right-3 text-gray-500 hover:text-gray-300 text-lg leading-none p-1"
+            >
+              ×
+            </button>
+            
+            <div className="pr-6">
+              <div className="text-gray-200 text-base font-medium leading-snug mb-2">
+                {extractTitle(thoughtBubble.memory.preview)}
               </div>
-              <button
-                onClick={() => setThoughtBubble(null)}
-                className="text-gray-500 hover:text-gray-300 text-lg leading-none ml-2 p-1"
-              >
-                ×
-              </button>
+              <div className="text-gray-400 text-sm leading-relaxed">
+                {extractMeaning(thoughtBubble.memory.preview)}
+              </div>
+              <div className="text-gray-600 text-xs mt-3">
+                {formatRelativeTime(thoughtBubble.memory.createdAt)}
+              </div>
             </div>
-
-            {thoughtBubble.connections.length > 0 ? (
-              <div>
-                <div className="text-gray-500 text-[10px] uppercase tracking-wider mb-2 border-t border-gray-700/30 pt-2">
-                  Connected Memories ({thoughtBubble.connections.length})
-                </div>
-                <div className="space-y-2 max-h-48 overflow-y-auto">
-                  {thoughtBubble.connections.map((conn, i) => (
-                    <div
-                      key={i}
-                      onClick={() => {
-                        setSelectedMemory(conn.memory);
-                        setThoughtBubble(null);
-                      }}
-                      className="flex items-start gap-2 p-2 rounded bg-[#0c0c10]/50 hover:bg-[#1a1a24] cursor-pointer transition-colors"
-                    >
-                      <div className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0" style={{ background: conn.memory.color }} />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-gray-400 text-[11px] truncate">
-                          {conn.memory.preview.substring(0, 45)}...
-                        </div>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          <span className="text-[9px] px-1.5 py-0.5 rounded"
-                            style={{
-                              background: conn.type === 'trail' ? '#4a6a5a30' : '#5a4a6a30',
-                              color: conn.type === 'trail' ? '#6a9a7a' : '#9a7aaa'
-                            }}>
-                            {conn.type}
-                          </span>
-                          <span className="text-gray-600 text-[9px]">
-                            {(conn.strength * 100).toFixed(0)}% strength
-                          </span>
-                        </div>
-                        {conn.reasoning && (
-                          <div className="text-gray-500 text-[9px] italic mt-1">
-                            "{conn.reasoning.substring(0, 60)}..."
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="text-gray-600 text-xs italic border-t border-gray-700/30 pt-2">
-                No direct connections found
-              </div>
-            )}
           </div>
         )}
       </div>
