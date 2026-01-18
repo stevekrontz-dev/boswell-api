@@ -14,9 +14,9 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 # WebAuthn configuration
-RP_ID = os.environ.get('WEBAUTHN_RP_ID', 'boswell-dashboard-production.up.railway.app')
-RP_NAME = os.environ.get('WEBAUTHN_RP_NAME', 'Boswell God Mode')
-ORIGIN = os.environ.get('WEBAUTHN_ORIGIN', 'https://boswell-dashboard-production.up.railway.app')
+RP_ID = os.environ.get('WEBAUTHN_RP_ID', 'delightful-imagination-production-f6a1.up.railway.app')
+RP_NAME = os.environ.get('WEBAUTHN_RP_NAME', 'Boswell')
+ORIGIN = os.environ.get('WEBAUTHN_ORIGIN', 'https://delightful-imagination-production-f6a1.up.railway.app')
 
 # For local development
 if os.environ.get('FLASK_ENV') == 'development':

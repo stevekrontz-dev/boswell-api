@@ -11,6 +11,7 @@ import Connect from './pages/Connect';
 import Branches from './pages/Branches';
 import Billing from './pages/Billing';
 import Mindstate from './pages/Mindstate';
+import Security from './pages/Security';
 
 function App() {
   return (
@@ -34,6 +35,7 @@ function App() {
             <Route path="branches" element={<Branches />} />
             <Route path="billing" element={<Billing />} />
             <Route path="mindstate" element={<Mindstate />} />
+            <Route path="security" element={<Security />} />
           </Route>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

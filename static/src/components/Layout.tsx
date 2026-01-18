@@ -12,6 +12,7 @@ export default function Layout() {
     { to: '/dashboard/mindstate', label: 'Mindstate' },
     { to: '/dashboard/connect', label: 'Connect' },
     { to: '/dashboard/branches', label: 'Branches' },
+    { to: '/dashboard/security', label: 'Security' },
     { to: '/dashboard/billing', label: 'Billing' },
   ];
 

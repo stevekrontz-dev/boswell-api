@@ -74,8 +74,15 @@ export interface UserProfile {
   } | null;
 }
 
-export async function getCurrentUser(): Promise<UserProfile> {
-  return fetchWithAuth('/v2/me');
+export async function getCurrentUser(tokenOverride?: string): Promise<UserProfile> {
+  const token = tokenOverride || localStorage.getItem('boswell_token');
+  const res = await fetch(`${API_BASE}/v2/me`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token && { 'Authorization': `Bearer ${token}` }),
+    },
+  });
+  return res.json();
 }
 
 export async function createCheckoutSession(planId: string = 'pro') {
