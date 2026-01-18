@@ -619,57 +619,93 @@ export default function Mindstate() {
           </svg>
         </button>
 
-        {/* Thought Bubble */}
-        {thoughtBubble && (
-          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50">
-            {/* Main bubble */}
-            <div
-              className="relative bg-[#1a1a24] border border-gray-500/30 rounded-[2rem] p-6 shadow-2xl max-w-[90vw] md:max-w-md"
-              style={{
-                boxShadow: '0 0 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05)'
-              }}
-            >
-              <button
-                onClick={() => setThoughtBubble(null)}
-                className="absolute top-4 right-4 text-gray-500 hover:text-gray-300 text-lg leading-none p-1"
-              >
-                ×
-              </button>
+        {/* Thought Bubble - positioned relative to node */}
+        {thoughtBubble && (() => {
+          // Calculate bubble position - float above the node
+          const bubbleWidth = 320;
+          const bubbleHeight = 140;
+          const padding = 20;
+          const tailLength = 50;
 
-              <div className="pr-6">
-                {(() => {
-                  const { narrative, emotion } = narrateMemory(thoughtBubble.memory.preview);
-                  return (
-                    <>
-                      <div className="text-gray-200 text-base leading-relaxed mb-3 font-light italic">
-                        "{narrative}"
-                      </div>
-                      {emotion && (
-                        <div className="text-gray-400 text-sm mb-3">
-                          — {emotion}
+          // Get graph container bounds (approximate)
+          const graphWidth = window.innerWidth - 384; // minus sidebar
+          const graphHeight = window.innerHeight - 64; // minus nav
+
+          // Position bubble above node, keep within bounds
+          let bubbleX = thoughtBubble.x - bubbleWidth / 2;
+          let bubbleY = thoughtBubble.y - bubbleHeight - tailLength;
+
+          // Clamp to viewport
+          bubbleX = Math.max(padding, Math.min(bubbleX, graphWidth - bubbleWidth - padding));
+          bubbleY = Math.max(padding, Math.min(bubbleY, graphHeight - bubbleHeight - padding));
+
+          // If bubble would be above viewport, put it below the node
+          const bubbleBelow = thoughtBubble.y < bubbleHeight + tailLength + 60;
+          if (bubbleBelow) {
+            bubbleY = thoughtBubble.y + tailLength;
+          }
+
+          // Calculate tail position to point at node
+          const tailX = Math.max(30, Math.min(thoughtBubble.x - bubbleX, bubbleWidth - 30));
+
+          return (
+            <div
+              className="absolute z-50 transition-all duration-200"
+              style={{ left: bubbleX, top: bubbleY }}
+            >
+              {/* Main bubble */}
+              <div
+                className="relative bg-[#1a1a24] border border-gray-500/30 rounded-[1.5rem] p-5 shadow-2xl"
+                style={{
+                  width: bubbleWidth,
+                  boxShadow: '0 0 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05)'
+                }}
+              >
+                <button
+                  onClick={() => setThoughtBubble(null)}
+                  className="absolute top-3 right-3 text-gray-500 hover:text-gray-300 text-lg leading-none p-1"
+                >
+                  ×
+                </button>
+
+                <div className="pr-6">
+                  {(() => {
+                    const { narrative, emotion } = narrateMemory(thoughtBubble.memory.preview);
+                    return (
+                      <>
+                        <div className="text-gray-200 text-sm leading-relaxed mb-2 font-light italic">
+                          "{narrative}"
                         </div>
-                      )}
-                      <div className="text-gray-500 text-xs flex items-center gap-3">
-                        <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider"
-                          style={{ background: `${thoughtBubble.memory.color}30`, color: thoughtBubble.memory.color }}>
-                          {thoughtBubble.memory.memoryType}
-                        </span>
-                        <span>{formatRelativeTime(thoughtBubble.memory.createdAt)}</span>
-                      </div>
-                    </>
-                  );
-                })()}
+                        {emotion && (
+                          <div className="text-gray-400 text-xs mb-2">
+                            — {emotion}
+                          </div>
+                        )}
+                        <div className="text-gray-500 text-xs flex items-center gap-2">
+                          <span className="px-2 py-0.5 rounded-full text-[9px] uppercase tracking-wider"
+                            style={{ background: `${thoughtBubble.memory.color}30`, color: thoughtBubble.memory.color }}>
+                            {thoughtBubble.memory.memoryType}
+                          </span>
+                          <span>{formatRelativeTime(thoughtBubble.memory.createdAt)}</span>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              {/* Thought bubble tail - points toward node */}
+              <div
+                className={`absolute flex items-center gap-1 ${bubbleBelow ? '-top-6 flex-col-reverse' : '-bottom-6 flex-col'}`}
+                style={{ left: tailX, transform: 'translateX(-50%)' }}
+              >
+                <div className="w-3.5 h-3.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
+                <div className="w-2.5 h-2.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
+                <div className="w-1.5 h-1.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
               </div>
             </div>
-
-            {/* Thought bubble tail - three diminishing circles */}
-            <div className="absolute -bottom-4 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1">
-              <div className="w-4 h-4 rounded-full bg-[#1a1a24] border border-gray-500/30" />
-              <div className="w-2.5 h-2.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
-              <div className="w-1.5 h-1.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
-            </div>
-          </div>
-        )}
+          );
+        })()}
       </div>
 
       {/* Memory Panel - slides up on mobile */}
