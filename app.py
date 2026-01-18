@@ -1385,31 +1385,45 @@ def generate_link_reasoning(content_a: str, content_b: str, distance: float) -> 
 
 
 def get_blob_branch(cur, blob_hash: str, tenant_id: str) -> str:
-    """Get the branch a blob belongs to via the commit chain."""
+    """Get the branch a blob belongs to by walking commit chains from HEAD."""
+    # First, find the commit that contains this blob
     cur.execute('''
-        SELECT br.name
-        FROM blobs b
-        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
-        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        JOIN branches br ON c.commit_hash = br.head_commit AND c.tenant_id = br.tenant_id
-        WHERE b.blob_hash = %s AND b.tenant_id = %s
-        LIMIT 1
-    ''', (blob_hash, tenant_id))
-    row = cur.fetchone()
-    if row:
-        return row['name']
-
-    # Fallback: check if blob appears in any commit on any branch
-    cur.execute('''
-        SELECT DISTINCT br.name
+        SELECT c.commit_hash
         FROM tree_entries t
         JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        JOIN branches br ON br.tenant_id = c.tenant_id
         WHERE t.blob_hash = %s AND t.tenant_id = %s
         LIMIT 1
     ''', (blob_hash, tenant_id))
+    commit_row = cur.fetchone()
+    if not commit_row:
+        return 'unknown'
+
+    target_commit = commit_row['commit_hash']
+
+    # Now find which branch contains this commit by walking from each HEAD
+    cur.execute('''
+        WITH RECURSIVE commit_chain AS (
+            -- Start from all branch heads
+            SELECT br.name as branch_name, c.commit_hash, c.parent_hash, 1 as depth
+            FROM branches br
+            JOIN commits c ON br.head_commit = c.commit_hash AND br.tenant_id = c.tenant_id
+            WHERE br.tenant_id = %s AND br.head_commit != 'GENESIS'
+
+            UNION ALL
+
+            -- Walk backwards through parent commits
+            SELECT cc.branch_name, c.commit_hash, c.parent_hash, cc.depth + 1
+            FROM commit_chain cc
+            JOIN commits c ON cc.parent_hash = c.commit_hash
+            WHERE c.tenant_id = %s AND cc.depth < 500
+        )
+        SELECT branch_name FROM commit_chain
+        WHERE commit_hash = %s
+        LIMIT 1
+    ''', (tenant_id, tenant_id, target_commit))
+
     row = cur.fetchone()
-    return row['name'] if row else 'unknown'
+    return row['branch_name'] if row else 'unknown'
 
 
 @app.route('/v2/analyze', methods=['POST'])
