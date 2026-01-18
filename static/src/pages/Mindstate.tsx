@@ -621,39 +621,52 @@ export default function Mindstate() {
 
         {/* Thought Bubble */}
         {thoughtBubble && (
-          <div
-            className="absolute bg-[#14141c]/95 backdrop-blur-md border border-gray-600/40 rounded-xl p-5 shadow-2xl z-50 max-w-[90vw] md:max-w-sm"
-            style={{
-              left: Math.min(Math.max(thoughtBubble.x + 20, 20), window.innerWidth - 320),
-              top: Math.min(Math.max(thoughtBubble.y - 100, 20), window.innerHeight - 350),
-            }}
-          >
-            <button
-              onClick={() => setThoughtBubble(null)}
-              className="absolute top-3 right-3 text-gray-500 hover:text-gray-300 text-lg leading-none p-1"
+          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50">
+            {/* Main bubble */}
+            <div
+              className="relative bg-[#1a1a24] border border-gray-500/30 rounded-[2rem] p-6 shadow-2xl max-w-[90vw] md:max-w-md"
+              style={{
+                boxShadow: '0 0 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05)'
+              }}
             >
-              ×
-            </button>
-            
-            <div className="pr-6">
-              {(() => {
-                const { narrative, emotion } = narrateMemory(thoughtBubble.memory.preview);
-                return (
-                  <>
-                    <div className="text-gray-200 text-sm leading-relaxed mb-2 font-light">
-                      {narrative}
-                    </div>
-                    {emotion && (
-                      <div className="text-gray-500 text-xs italic mb-2">
-                        "{emotion}"
+              <button
+                onClick={() => setThoughtBubble(null)}
+                className="absolute top-4 right-4 text-gray-500 hover:text-gray-300 text-lg leading-none p-1"
+              >
+                ×
+              </button>
+
+              <div className="pr-6">
+                {(() => {
+                  const { narrative, emotion } = narrateMemory(thoughtBubble.memory.preview);
+                  return (
+                    <>
+                      <div className="text-gray-200 text-base leading-relaxed mb-3 font-light italic">
+                        "{narrative}"
                       </div>
-                    )}
-                    <div className="text-gray-600 text-xs">
-                      {formatRelativeTime(thoughtBubble.memory.createdAt)}
-                    </div>
-                  </>
-                );
-              })()}
+                      {emotion && (
+                        <div className="text-gray-400 text-sm mb-3">
+                          — {emotion}
+                        </div>
+                      )}
+                      <div className="text-gray-500 text-xs flex items-center gap-3">
+                        <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider"
+                          style={{ background: `${thoughtBubble.memory.color}30`, color: thoughtBubble.memory.color }}>
+                          {thoughtBubble.memory.memoryType}
+                        </span>
+                        <span>{formatRelativeTime(thoughtBubble.memory.createdAt)}</span>
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+
+            {/* Thought bubble tail - three diminishing circles */}
+            <div className="absolute -bottom-4 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1">
+              <div className="w-4 h-4 rounded-full bg-[#1a1a24] border border-gray-500/30" />
+              <div className="w-2.5 h-2.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
+              <div className="w-1.5 h-1.5 rounded-full bg-[#1a1a24] border border-gray-500/30" />
             </div>
           </div>
         )}

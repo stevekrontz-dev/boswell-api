@@ -1,6 +1,35 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
-import { getCurrentUser, createCheckoutSession, type UserProfile } from '../lib/api';
+import { getCurrentUser, createCheckoutSession, fetchWithAuth, type UserProfile } from '../lib/api';
+
+interface Insight {
+  blob_hash: string;
+  preview: string;
+  link_count: number;
+}
+
+// Simplified narrative generator for insights
+function narrateInsight(preview: string): string {
+  if (!preview) return 'A memory worth revisiting';
+  try {
+    const data = JSON.parse(preview);
+    const contentFields = ['achievement', 'title', 'decision', 'insight', 'principle', 'problem', 'action', 'summary', 'message', 'description'];
+    for (const field of contentFields) {
+      if (data[field] && typeof data[field] === 'string' && data[field].length > 3) {
+        return data[field].substring(0, 100);
+      }
+    }
+    // Fallback to first non-metadata string
+    const metadataFields = ['type', 'date', 'timestamp', 'created_at', 'id', 'task_id', 'worker_id', 'branch'];
+    for (const [key, value] of Object.entries(data)) {
+      if (!metadataFields.includes(key) && typeof value === 'string' && value.length > 3) {
+        return (value as string).substring(0, 100);
+      }
+    }
+  } catch { /* not JSON */ }
+  return preview.replace(/[{}"]/g, '').substring(0, 100);
+}
 
 const API_BASE = 'https://delightful-imagination-production-f6a1.up.railway.app';
 
@@ -10,10 +39,31 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const [checkoutLoading, setCheckoutLoading] = useState(false);
+  const [insights, setInsights] = useState<Insight[]>([]);
+  const [insightsLoading, setInsightsLoading] = useState(false);
 
   useEffect(() => {
     loadProfile();
   }, []);
+
+  // Load insights when profile is ready and has subscription
+  useEffect(() => {
+    if (profile?.has_subscription && profile?.status === 'active') {
+      loadInsights();
+    }
+  }, [profile]);
+
+  const loadInsights = async () => {
+    setInsightsLoading(true);
+    try {
+      const data = await fetchWithAuth('/v2/reflect?min_links=1&limit=5');
+      setInsights(data.highly_connected || []);
+    } catch (err) {
+      console.error('Failed to load insights:', err);
+    } finally {
+      setInsightsLoading(false);
+    }
+  };
 
   const loadProfile = async () => {
     try {
@@ -209,6 +259,67 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* Insights Section - only for Pro users */}
+      {profile?.has_subscription && profile?.status === 'active' && (
+        <div className="card rounded-2xl p-6 reveal delay-3">
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
+                <svg className="w-5 h-5 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="font-display text-xl text-parchment-50">Worth Remembering</h2>
+                <p className="text-parchment-200/40 text-sm">Highly connected memories you might want to revisit</p>
+              </div>
+            </div>
+            <Link to="/dashboard/mindstate" className="text-sm text-ember-500 hover:text-ember-400 transition-colors">
+              View all →
+            </Link>
+          </div>
+
+          {insightsLoading ? (
+            <div className="text-center py-8 text-parchment-200/40">Loading insights...</div>
+          ) : insights.length === 0 ? (
+            <div className="text-center py-8">
+              <div className="text-parchment-200/40 mb-2">No insights yet</div>
+              <p className="text-parchment-200/30 text-sm">As you build memories, connections will surface here.</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {insights.map((insight) => (
+                <div
+                  key={insight.blob_hash}
+                  className="p-4 rounded-xl bg-ink-900/50 border border-parchment-200/5 hover:border-purple-500/20 transition-all group"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-parchment-100 text-sm leading-relaxed truncate">
+                        {narrateInsight(insight.preview)}
+                      </p>
+                      <div className="flex items-center gap-3 mt-2 text-xs text-parchment-200/40">
+                        <span className="font-mono">{insight.blob_hash.substring(0, 8)}</span>
+                        <span className="flex items-center gap-1">
+                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                          </svg>
+                          {insight.link_count} connections
+                        </span>
+                      </div>
+                    </div>
+                    <div className="w-8 h-8 rounded-full bg-purple-500/10 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                      <svg className="w-4 h-4 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                      </svg>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Quick Start */}
       <div className="card rounded-2xl p-8 reveal delay-3">
