@@ -86,19 +86,38 @@ def get_tenant_plan(cursor, tenant_id: str) -> str:
     Returns:
         Plan ID string ('free', 'pro', 'team')
     """
+    # First check users table (source of truth for plan from Stripe webhooks)
     try:
-        cursor.execute("SAVEPOINT tenant_plan")
+        cursor.execute("SAVEPOINT tenant_plan_users")
+        cursor.execute("""
+            SELECT plan FROM users
+            WHERE tenant_id = %s AND status = 'active'
+            LIMIT 1
+        """, (tenant_id,))
+        row = cursor.fetchone()
+        cursor.execute("RELEASE SAVEPOINT tenant_plan_users")
+        if row and row.get('plan'):
+            return row['plan']
+    except Exception:
+        try:
+            cursor.execute("ROLLBACK TO SAVEPOINT tenant_plan_users")
+        except Exception:
+            pass
+
+    # Fall back to subscriptions table (legacy)
+    try:
+        cursor.execute("SAVEPOINT tenant_plan_subs")
         cursor.execute("""
             SELECT plan_id FROM subscriptions
             WHERE tenant_id = %s AND status = 'active'
         """, (tenant_id,))
         row = cursor.fetchone()
-        cursor.execute("RELEASE SAVEPOINT tenant_plan")
+        cursor.execute("RELEASE SAVEPOINT tenant_plan_subs")
         if row and row.get('plan_id'):
             return row['plan_id']
     except Exception:
         try:
-            cursor.execute("ROLLBACK TO SAVEPOINT tenant_plan")
+            cursor.execute("ROLLBACK TO SAVEPOINT tenant_plan_subs")
         except Exception:
             pass  # Savepoint may not exist
 

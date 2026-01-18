@@ -118,8 +118,8 @@ export default function Branches() {
 
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/60" onClick={() => !creating && setShowCreateModal(false)} />
-          <form onSubmit={handleCreateBranch} className="relative bg-ink-900 rounded-xl p-6 w-full max-w-md border border-parchment-50/10">
+          <div className="absolute inset-0 bg-black/90 backdrop-blur-sm" onClick={() => !creating && setShowCreateModal(false)} />
+          <form onSubmit={handleCreateBranch} className="relative bg-ink-950 rounded-xl p-6 w-full max-w-md border border-parchment-50/10 shadow-2xl">
             <h2 className="font-display text-xl font-bold text-parchment-50 mb-4">Create Branch</h2>
             <input
               type="text"
