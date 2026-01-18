@@ -1396,6 +1396,14 @@ def get_blob_branch(cur, blob_hash: str, tenant_id: str) -> str:
     ''', (blob_hash, tenant_id))
     commit_row = cur.fetchone()
     if not commit_row:
+        # Fallback: check blob content for known patterns (orphaned bulk imports)
+        cur.execute('SELECT content FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, tenant_id))
+        blob_row = cur.fetchone()
+        if blob_row and blob_row['content']:
+            content_lower = blob_row['content'].lower()
+            # Iris research data patterns
+            if any(p in content_lower for p in ['institution', 'faculty', 'neuroscience', 'professor', 'research']):
+                return 'iris'
         return 'unknown'
 
     target_commit = commit_row['commit_hash']
