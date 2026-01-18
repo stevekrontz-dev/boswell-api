@@ -337,8 +337,20 @@ def list_branches():
 
     try:
         cur = get_cursor()
-        # Get branches
-        cur.execute('SELECT * FROM branches WHERE tenant_id = %s ORDER BY name', (tenant_id,))
+        # Get branches with commit counts
+        cur.execute('''
+            SELECT b.*, COALESCE(c.commit_count, 0) as commits,
+                   COALESCE(c.last_commit, b.created_at) as last_activity
+            FROM branches b
+            LEFT JOIN (
+                SELECT branch, COUNT(*) as commit_count, MAX(created_at) as last_commit
+                FROM commits
+                WHERE tenant_id = %s
+                GROUP BY branch
+            ) c ON b.name = c.branch
+            WHERE b.tenant_id = %s
+            ORDER BY b.name
+        ''', (tenant_id, tenant_id))
         branches = []
         for row in cur.fetchall():
             branch = dict(row)
@@ -346,11 +358,11 @@ def list_branches():
             if branch.get('tenant_id'):
                 branch['tenant_id'] = str(branch['tenant_id'])
             if branch.get('created_at'):
-                branch['last_activity'] = str(branch['created_at'])
                 branch['created_at'] = str(branch['created_at'])
+            if branch.get('last_activity'):
+                branch['last_activity'] = str(branch['last_activity'])
             else:
                 branch['last_activity'] = ''
-            branch['commits'] = 0
             branches.append(branch)
         cur.close()
         return jsonify({'branches': branches, 'count': len(branches)})
