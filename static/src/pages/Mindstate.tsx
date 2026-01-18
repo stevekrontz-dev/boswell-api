@@ -32,23 +32,26 @@ interface Link {
   reasoning?: string;
 }
 
-const BRANCHES: Record<string, { color: string; label: string }> = {
-  'boswell': { color: '#4a6a9a', label: 'Boswell' },
-  'command-center': { color: '#6a5a9a', label: 'Command' },
-  'tint-atlanta': { color: '#3a8a8a', label: 'Tint ATL' },
-  'iris': { color: '#8a4a8a', label: 'IRIS' },
-  'tint-empire': { color: '#3a8a6a', label: 'Empire' },
-  'family': { color: '#9a7a3a', label: 'Family' }
-};
+interface BranchConfig {
+  color: string;
+  label: string;
+}
 
-function getBranch(preview: string): string {
-  const p = (preview || '').toLowerCase();
-  if (p.includes('square') || p.includes('payment') || p.includes('crm') || p.includes('tint-atlanta')) return 'tint-atlanta';
-  if (p.includes('iris') || p.includes('faculty') || p.includes('research')) return 'iris';
-  if (p.includes('franchise') || p.includes('empire')) return 'tint-empire';
-  if (p.includes('family') || p.includes('diego') || p.includes('music') || p.includes('personal')) return 'family';
-  if (p.includes('infrastructure') || p.includes('thalamus') || p.includes('mcp') || p.includes('fix') || p.includes('swarm')) return 'command-center';
-  return 'boswell';
+// Default colors for branches - will be augmented dynamically
+const BRANCH_COLORS = [
+  '#4a6a9a', '#6a5a9a', '#3a8a8a', '#8a4a8a', '#3a8a6a', '#9a7a3a',
+  '#7a4a4a', '#4a7a9a', '#9a6a4a', '#5a8a5a', '#8a6a6a', '#6a8a7a'
+];
+
+function generateBranchColor(index: number): string {
+  return BRANCH_COLORS[index % BRANCH_COLORS.length];
+}
+
+function formatBranchLabel(name: string): string {
+  return name
+    .split('-')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
 }
 
 function extractType(preview: string): string {
@@ -76,11 +79,13 @@ export default function Mindstate() {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [trails, setTrails] = useState<Trail[]>([]);
   const [links, setLinks] = useState<Link[]>([]);
+  const [branches, setBranches] = useState<Record<string, BranchConfig>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
   const [currentBranch, setCurrentBranch] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
+  const [showMobilePanel, setShowMobilePanel] = useState(false);
   const [thoughtBubble, setThoughtBubble] = useState<{
     memory: Memory;
     x: number;
@@ -95,7 +100,6 @@ export default function Mindstate() {
         const user = await getCurrentUser();
         setProfile(user);
         if (user.status !== 'active' || !user.has_subscription) {
-          // Not a Pro user - will show upgrade prompt
           setLoading(false);
         }
       } catch (err) {
@@ -107,9 +111,32 @@ export default function Mindstate() {
     checkSubscription();
   }, []);
 
-  // Fetch data from Boswell API (only if Pro)
+  // Fetch branches dynamically
   useEffect(() => {
     if (!profile || profile.status !== 'active' || !profile.has_subscription) return;
+
+    async function fetchBranches() {
+      try {
+        const data = await fetchWithAuth('/v2/branches');
+        const branchConfig: Record<string, BranchConfig> = {};
+        (data.branches || []).forEach((b: any, index: number) => {
+          branchConfig[b.name] = {
+            color: generateBranchColor(index),
+            label: formatBranchLabel(b.name)
+          };
+        });
+        setBranches(branchConfig);
+      } catch (err) {
+        console.error('Failed to load branches:', err);
+      }
+    }
+    fetchBranches();
+  }, [profile]);
+
+  // Fetch data from Boswell API (only if Pro and branches loaded)
+  useEffect(() => {
+    if (!profile || profile.status !== 'active' || !profile.has_subscription) return;
+    if (Object.keys(branches).length === 0) return;
 
     async function fetchData() {
       try {
@@ -135,10 +162,28 @@ export default function Mindstate() {
         });
         const maxHeat = Math.max(...heatMap.values(), 1);
 
+        // Helper to detect branch from content
+        function getBranch(preview: string): string {
+          const p = (preview || '').toLowerCase();
+          // Check for explicit branch mentions first
+          for (const branchName of Object.keys(branches)) {
+            if (p.includes(branchName)) return branchName;
+          }
+          // Fallback heuristics
+          if (p.includes('square') || p.includes('payment') || p.includes('crm')) return 'tint-atlanta';
+          if (p.includes('iris') || p.includes('faculty') || p.includes('research')) return 'iris';
+          if (p.includes('franchise') || p.includes('empire')) return 'tint-empire';
+          if (p.includes('family') || p.includes('diego') || p.includes('music') || p.includes('personal')) return 'family';
+          if (p.includes('mining') || p.includes('crypto') || p.includes('hashrate') || p.includes('xmr')) return 'crypto-mining';
+          if (p.includes('infrastructure') || p.includes('thalamus') || p.includes('mcp') || p.includes('fix') || p.includes('swarm')) return 'command-center';
+          return 'boswell';
+        }
+
         // Process memories
         const processedMemories: Memory[] = (graphData.nodes || []).map((node: any) => {
           const id = node.id.substring(0, 8);
           const branch = getBranch(node.preview || '');
+          const branchConfig = branches[branch] || { color: '#666', label: branch };
           const heat = heatMap.get(id) || 0;
           const normalizedHeat = heat / maxHeat;
           return {
@@ -148,7 +193,7 @@ export default function Mindstate() {
             content: node.preview || '',
             type: node.type,
             branch,
-            color: BRANCHES[branch].color,
+            color: branchConfig.color,
             radius: 4 + (normalizedHeat * 10),
             heat,
             normalizedHeat,
@@ -184,11 +229,11 @@ export default function Mindstate() {
       }
     }
     fetchData();
-  }, [profile]);
+  }, [profile, branches]);
 
   // D3 Visualization
   useEffect(() => {
-    if (loading || !svgRef.current || memories.length === 0) return;
+    if (loading || !svgRef.current || memories.length === 0 || Object.keys(branches).length === 0) return;
 
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
@@ -207,8 +252,8 @@ export default function Mindstate() {
     const nodes: any[] = [];
     const nodeMap = new Map();
 
-    // Hub nodes
-    Object.entries(BRANCHES).forEach(([id, cfg]) => {
+    // Hub nodes from dynamic branches
+    Object.entries(branches).forEach(([id, cfg]) => {
       const node = { id: `hub-${id}`, type: 'hub', branch: id, label: cfg.label, color: cfg.color, radius: 22 };
       nodes.push(node);
       nodeMap.set(node.id, node);
@@ -224,16 +269,30 @@ export default function Mindstate() {
     // Build links
     const graphLinks: any[] = [];
 
-    // Hub backbone
-    [['hub-boswell','hub-command-center'],['hub-boswell','hub-iris'],['hub-boswell','hub-tint-atlanta'],
-     ['hub-boswell','hub-tint-empire'],['hub-boswell','hub-family'],['hub-command-center','hub-iris'],
-     ['hub-command-center','hub-tint-atlanta'],['hub-tint-atlanta','hub-tint-empire']].forEach(([s,t]) => {
-      graphLinks.push({ source: s, target: t, type: 'backbone' });
+    // Hub backbone - connect all hubs to boswell as center, plus some cross-connections
+    const branchNames = Object.keys(branches);
+    const boswellHub = 'hub-boswell';
+    branchNames.forEach(name => {
+      if (name !== 'boswell') {
+        graphLinks.push({ source: boswellHub, target: `hub-${name}`, type: 'backbone' });
+      }
     });
+    // Some extra backbone connections
+    if (branches['command-center'] && branches['iris']) {
+      graphLinks.push({ source: 'hub-command-center', target: 'hub-iris', type: 'backbone' });
+    }
+    if (branches['command-center'] && branches['tint-atlanta']) {
+      graphLinks.push({ source: 'hub-command-center', target: 'hub-tint-atlanta', type: 'backbone' });
+    }
+    if (branches['tint-atlanta'] && branches['tint-empire']) {
+      graphLinks.push({ source: 'hub-tint-atlanta', target: 'hub-tint-empire', type: 'backbone' });
+    }
 
     // Hierarchy links
     memories.forEach(m => {
-      graphLinks.push({ source: `hub-${m.branch}`, target: m.id, type: 'hierarchy' });
+      if (branches[m.branch]) {
+        graphLinks.push({ source: `hub-${m.branch}`, target: m.id, type: 'hierarchy' });
+      }
     });
 
     // Trail links
@@ -310,11 +369,9 @@ export default function Mindstate() {
       if (d.type === 'memory') {
         setSelectedMemory(d);
 
-        // Find connected memories for thought bubble
         const connections: Array<{ memory: Memory; type: string; strength: number; reasoning?: string }> = [];
         const memoryMap = new Map(memories.map(m => [m.id, m]));
 
-        // Find trail connections
         trails.forEach(t => {
           if (t.source === d.id && memoryMap.has(t.target)) {
             connections.push({ memory: memoryMap.get(t.target)!, type: 'trail', strength: t.strength });
@@ -323,7 +380,6 @@ export default function Mindstate() {
           }
         });
 
-        // Find semantic link connections
         links.forEach(l => {
           if (l.source === d.id && memoryMap.has(l.target)) {
             connections.push({ memory: memoryMap.get(l.target)!, type: l.type, strength: l.strength, reasoning: l.reasoning });
@@ -332,14 +388,13 @@ export default function Mindstate() {
           }
         });
 
-        // Sort by strength descending
         connections.sort((a, b) => b.strength - a.strength);
 
         setThoughtBubble({
           memory: d,
           x: d.x,
           y: d.y,
-          connections: connections.slice(0, 8) // Top 8 connections
+          connections: connections.slice(0, 8)
         });
       } else if (d.type === 'hub') {
         setCurrentBranch(d.branch);
@@ -347,23 +402,20 @@ export default function Mindstate() {
       }
     });
 
-    // Click on background to close thought bubble
     svg.on('click', (e: any) => {
       if (e.target === svgRef.current) {
         setThoughtBubble(null);
       }
     });
 
-    // Tick
     simulation.on('tick', () => {
       link.attr('x1', (d: any) => d.source.x).attr('y1', (d: any) => d.source.y)
           .attr('x2', (d: any) => d.target.x).attr('y2', (d: any) => d.target.y);
       node.attr('transform', (d: any) => `translate(${d.x},${d.y})`);
     });
 
-  }, [loading, memories, trails, links]);
+  }, [loading, memories, trails, links, branches]);
 
-  // Filter memories for timeline
   const filteredMemories = memories.filter(m => {
     const matchBranch = currentBranch === 'all' || m.branch === currentBranch;
     const matchSearch = !searchTerm ||
@@ -388,11 +440,10 @@ export default function Mindstate() {
     );
   }
 
-  // Pro upgrade prompt
   if (profile && (profile.status !== 'active' || !profile.has_subscription)) {
     return (
-      <div className="flex items-center justify-center h-full bg-[#0c0c10]">
-        <div className="text-center max-w-md p-8">
+      <div className="flex items-center justify-center h-full bg-[#0c0c10] p-4">
+        <div className="text-center max-w-md">
           <div className="text-6xl mb-6">🍄</div>
           <h2 className="text-2xl font-serif text-gray-200 mb-4">Boswell Connectome</h2>
           <p className="text-gray-500 mb-6">
@@ -414,26 +465,28 @@ export default function Mindstate() {
     );
   }
 
+  const branchCount = Object.keys(branches).length;
+
   return (
-    <div className="flex h-[calc(100vh-4rem)] bg-[#0c0c10]">
+    <div className="flex flex-col md:flex-row h-[calc(100vh-4rem)] bg-[#0c0c10]">
       {/* Graph Panel */}
-      <div className="flex-1 relative">
-        <svg ref={svgRef} className="w-full h-full" />
+      <div className="flex-1 relative min-h-[50vh] md:min-h-0">
+        <svg ref={svgRef} className="w-full h-full touch-none" />
 
         {/* Stats overlay */}
-        <div className="absolute top-6 left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-4 text-xs text-gray-500">
-          <h2 className="text-gray-300 text-base font-serif mb-3">Boswell Connectome</h2>
-          <div className="space-y-2">
-            <div className="flex justify-between gap-8"><span>Branches</span> <span className="text-gray-400">6</span></div>
-            <div className="flex justify-between gap-8"><span>Memories</span> <span className="text-gray-400">{memories.length}</span></div>
-            <div className="flex justify-between gap-8"><span>Connections</span> <span className="text-gray-400">{trails.length + links.length}</span></div>
+        <div className="absolute top-4 left-4 md:top-6 md:left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-3 md:p-4 text-xs text-gray-500">
+          <h2 className="text-gray-300 text-sm md:text-base font-serif mb-2 md:mb-3">Boswell Connectome</h2>
+          <div className="space-y-1 md:space-y-2">
+            <div className="flex justify-between gap-4 md:gap-8"><span>Branches</span> <span className="text-gray-400">{branchCount}</span></div>
+            <div className="flex justify-between gap-4 md:gap-8"><span>Memories</span> <span className="text-gray-400">{memories.length}</span></div>
+            <div className="flex justify-between gap-4 md:gap-8"><span>Connections</span> <span className="text-gray-400">{trails.length + links.length}</span></div>
           </div>
         </div>
 
-        {/* Legend */}
-        <div className="absolute bottom-6 left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-4 text-xs hidden md:block">
+        {/* Legend - hidden on mobile */}
+        <div className="absolute bottom-6 left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-4 text-xs hidden lg:block">
           <div className="text-gray-600 uppercase tracking-wider text-[10px] mb-2">Branches</div>
-          {Object.entries(BRANCHES).map(([id, cfg]) => (
+          {Object.entries(branches).map(([id, cfg]) => (
             <div key={id} className="flex items-center gap-2 text-gray-500 my-1">
               <div className="w-2 h-2 rounded-full" style={{ background: cfg.color }} />
               {cfg.label}
@@ -441,16 +494,25 @@ export default function Mindstate() {
           ))}
         </div>
 
+        {/* Mobile toggle button */}
+        <button
+          onClick={() => setShowMobilePanel(!showMobilePanel)}
+          className="md:hidden absolute bottom-4 right-4 bg-[#14141c] border border-gray-700/30 rounded-full p-3 text-gray-400"
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={showMobilePanel ? "M6 18L18 6M6 6l12 12" : "M4 6h16M4 12h16M4 18h16"} />
+          </svg>
+        </button>
+
         {/* Thought Bubble */}
         {thoughtBubble && (
           <div
-            className="absolute bg-[#14141c]/95 backdrop-blur-md border border-gray-600/40 rounded-xl p-4 shadow-2xl z-50 max-w-sm"
+            className="absolute bg-[#14141c]/95 backdrop-blur-md border border-gray-600/40 rounded-xl p-4 shadow-2xl z-50 max-w-[90vw] md:max-w-sm"
             style={{
-              left: Math.min(Math.max(thoughtBubble.x + 20, 20), window.innerWidth - 400),
+              left: Math.min(Math.max(thoughtBubble.x + 20, 20), window.innerWidth - 320),
               top: Math.min(Math.max(thoughtBubble.y - 100, 20), window.innerHeight - 350),
             }}
           >
-            {/* Header */}
             <div className="flex justify-between items-start mb-3">
               <div>
                 <div className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded inline-block mb-1"
@@ -464,13 +526,12 @@ export default function Mindstate() {
               </div>
               <button
                 onClick={() => setThoughtBubble(null)}
-                className="text-gray-500 hover:text-gray-300 text-lg leading-none ml-2"
+                className="text-gray-500 hover:text-gray-300 text-lg leading-none ml-2 p-1"
               >
                 ×
               </button>
             </div>
 
-            {/* Connections */}
             {thoughtBubble.connections.length > 0 ? (
               <div>
                 <div className="text-gray-500 text-[10px] uppercase tracking-wider mb-2 border-t border-gray-700/30 pt-2">
@@ -522,10 +583,21 @@ export default function Mindstate() {
         )}
       </div>
 
-      {/* Memory Panel */}
-      <div className="w-96 bg-[#0f0f14] border-l border-gray-700/20 flex flex-col">
+      {/* Memory Panel - slides up on mobile */}
+      <div className={`
+        ${showMobilePanel ? 'translate-y-0' : 'translate-y-full md:translate-y-0'}
+        fixed md:relative bottom-0 left-0 right-0 md:bottom-auto
+        w-full md:w-96 h-[70vh] md:h-auto
+        bg-[#0f0f14] border-t md:border-t-0 md:border-l border-gray-700/20 
+        flex flex-col transition-transform duration-300 ease-in-out z-40
+      `}>
+        {/* Mobile drag handle */}
+        <div className="md:hidden flex justify-center py-2">
+          <div className="w-12 h-1 bg-gray-600 rounded-full" />
+        </div>
+
         {/* Header */}
-        <div className="p-5 border-b border-gray-700/20">
+        <div className="p-4 md:p-5 border-b border-gray-700/20">
           <h3 className="text-gray-400 font-serif mb-3">Memory Timeline</h3>
           <div className="flex flex-wrap gap-1">
             <button
@@ -538,7 +610,7 @@ export default function Mindstate() {
             >
               all
             </button>
-            {Object.entries(BRANCHES).map(([id, cfg]) => (
+            {Object.entries(branches).map(([id, cfg]) => (
               <button
                 key={id}
                 onClick={() => setCurrentBranch(id)}
@@ -556,7 +628,7 @@ export default function Mindstate() {
         </div>
 
         {/* Search */}
-        <div className="px-5 py-3 border-b border-gray-700/20">
+        <div className="px-4 md:px-5 py-3 border-b border-gray-700/20">
           <input
             type="text"
             placeholder="Search memories..."
@@ -573,7 +645,7 @@ export default function Mindstate() {
               key={m.id}
               onClick={() => setSelectedMemory(m)}
               className={`grid grid-cols-[40px_1fr] px-4 py-3 cursor-pointer transition-colors ${
-                selectedMemory?.id === m.id ? 'bg-blue-500/10' : 'hover:bg-gray-500/5'
+                selectedMemory?.id === m.id ? 'bg-blue-500/10' : 'hover:bg-gray-500/5 active:bg-gray-500/10'
               }`}
             >
               <div className="flex flex-col items-center relative">
@@ -590,7 +662,7 @@ export default function Mindstate() {
                 </div>
                 <div className="text-[9px] text-gray-600 flex gap-3">
                   <span className="font-mono text-blue-400/60">{m.id}</span>
-                  <span className="text-green-400/50">{BRANCHES[m.branch].label}</span>
+                  <span className="text-green-400/50">{branches[m.branch]?.label || m.branch}</span>
                 </div>
               </div>
             </div>
@@ -600,12 +672,12 @@ export default function Mindstate() {
         {/* Detail drawer */}
         {selectedMemory && (
           <div className="border-t border-gray-700/20 bg-[#08080c] max-h-72 overflow-hidden">
-            <div className="px-5 py-3 flex justify-between items-center border-b border-gray-700/10">
+            <div className="px-4 md:px-5 py-3 flex justify-between items-center border-b border-gray-700/10">
               <h4 className="text-gray-500 font-serif text-sm">Memory Content</h4>
-              <button onClick={() => setSelectedMemory(null)} className="text-gray-600 hover:text-gray-400">×</button>
+              <button onClick={() => setSelectedMemory(null)} className="text-gray-600 hover:text-gray-400 p-1">×</button>
             </div>
             <div className="p-4 overflow-y-auto max-h-52">
-              <pre className="bg-[#101016] border border-gray-700/10 rounded p-3 text-[10px] text-gray-500 whitespace-pre-wrap">
+              <pre className="bg-[#101016] border border-gray-700/10 rounded p-3 text-[10px] text-gray-500 whitespace-pre-wrap break-words">
                 {selectedMemory.content}
               </pre>
             </div>
@@ -613,7 +685,7 @@ export default function Mindstate() {
         )}
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-gray-700/20 text-[9px] text-gray-600 flex justify-between">
+        <div className="px-4 md:px-5 py-3 border-t border-gray-700/20 text-[9px] text-gray-600 flex justify-between">
           <span>{filteredMemories.length} memories</span>
           <span>{trails.length + links.length} connections</span>
         </div>
