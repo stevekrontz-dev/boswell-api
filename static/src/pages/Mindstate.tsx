@@ -83,7 +83,6 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
   try {
     data = JSON.parse(preview);
   } catch {
-    // Try wrapping in braces if it looks like JSON without them
     if (preview.includes('"type"') || preview.includes('"title"')) {
       try {
         data = JSON.parse(`{${preview}}`);
@@ -91,110 +90,82 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
     }
   }
 
-  if (data) {
-    const type = data.type || '';
+  if (!data) {
+    // Not JSON at all - return cleaned preview
+    const clean = preview.replace(/[{}"]/g, '').trim();
+    return { narrative: clean.substring(0, 100) + (clean.length > 100 ? '...' : '') };
+  }
 
-    // Lesson learned
-    if (type.includes('lesson') || data.principle || data.mistake) {
-      const lesson = data.principle || data.insight || data.root_cause || '';
-      const context = data.context || data.mistake || '';
-      if (lesson && context) {
-        return {
-          narrative: `I learned something: ${context.toLowerCase().startsWith('i ') ? context : context}. ${lesson}`,
-          emotion: data.emotional_note
-        };
-      }
-      if (lesson) return { narrative: `I realized: ${lesson}`, emotion: data.emotional_note };
-    }
+  const type = (data.type || '').toLowerCase();
 
-    // Decision
-    if (type.includes('decision') || data.decision) {
-      const decision = data.decision || data.choice || data.title || '';
-      const why = data.rationale || data.reasoning || data.why || '';
-      if (decision && why) {
-        return { narrative: `I decided to ${decision.toLowerCase()}. ${why}` };
-      }
-      if (decision) return { narrative: `I decided: ${decision}` };
-    }
+  // Content fields in priority order (what the memory is ABOUT)
+  const contentFields = [
+    'achievement', 'title', 'decision', 'insight', 'principle', 'lesson',
+    'problem', 'solution', 'commitment', 'vision', 'definition', 'spec',
+    'action', 'milestone', 'summary', 'message', 'description', 'what',
+    'change', 'feature', 'component', 'service', 'finding', 'outcome'
+  ];
 
-    // Vision / Core belief
-    if (type.includes('vision') || type.includes('core') || data.definition) {
-      const vision = data.title || data.definition || data.insight || '';
-      const meaning = data.key_distinction || data.meaning || '';
-      if (vision) {
-        return { narrative: meaning ? `${vision} — ${meaning}` : vision };
-      }
-    }
+  // Metadata fields to skip when looking for content
+  const metadataFields = [
+    'type', 'date', 'timestamp', 'created_at', 'claimed_at', 'updated_at',
+    'id', 'task_id', 'worker_id', 'instance_id', 'branch', 'tenant_id',
+    'blob_hash', 'commit_hash', 'version'
+  ];
 
-    // Commitment / Promise
-    if (type.includes('commitment') || data.commitment || data.active_commitments) {
-      const commitment = data.commitment || data.title || '';
-      if (commitment) return { narrative: `I committed to: ${commitment}` };
-    }
+  // Find the best content field
+  let mainContent = '';
+  let secondaryContent = '';
 
-    // Bug fix / Incident
-    if (type.includes('fix') || type.includes('bug') || type.includes('incident')) {
-      const problem = data.problem || data.bug || data.incident || data.title || '';
-      const solution = data.solution || data.fix || data.resolution || '';
-      if (problem && solution) {
-        return { narrative: `Fixed an issue: ${problem}. Solution: ${solution}` };
-      }
-      if (problem) return { narrative: `Dealt with: ${problem}` };
-    }
-
-    // Deployment / Milestone
-    if (type.includes('deployment') || type.includes('milestone') || type.includes('complete')) {
-      const what = data.achievement || data.title || data.service || data.milestone || '';
-      if (what) {
-        return { narrative: `Shipped: ${what}` };
-      }
-    }
-
-    // Spec / Architecture
-    if (type.includes('spec') || type.includes('architecture') || type.includes('infrastructure')) {
-      const title = data.title || data.spec || data.insight || '';
-      if (title) return { narrative: title };
-    }
-
-    // Swarm / Role claims
-    if (type.includes('swarm') || type.includes('role') || data.worker_id) {
-      const role = data.role || data.claimed_role || '';
-      const worker = data.worker_id || data.instance_id || '';
-      if (role && worker) return { narrative: `${worker} claimed ${role} role` };
-      if (role) return { narrative: `Role claimed: ${role}` };
-    }
-
-    // Test / Verification
-    if (type.includes('test') || type.includes('verification')) {
-      const test = data.test || data.title || data.description || '';
-      if (test) return { narrative: `Test: ${test}` };
-    }
-
-    // Progress / Status update
-    if (type.includes('progress') || type.includes('status') || data.task_id) {
-      const task = data.task_id || data.task || '';
-      if (task) return { narrative: `Progress on task ${task.substring(0, 8)}...` };
-    }
-
-    // Generic: try common fields
-    const title = data.title || data.message || data.summary || '';
-    const context = data.context || data.description || data.rationale || '';
-    if (title) {
-      return { narrative: context ? `${title}. ${context}` : title };
+  for (const field of contentFields) {
+    if (data[field] && typeof data[field] === 'string' && data[field].length > 3) {
+      if (!mainContent) mainContent = data[field];
+      else if (!secondaryContent) secondaryContent = data[field];
+      else break;
     }
   }
 
-  // Fallback: extract from commit message format "TYPE: message"
-  const colonMatch = preview.match(/^([A-Z_]+):\s*(.+?)(?:\.|{|$)/);
-  if (colonMatch) {
-    const [, msgType, content] = colonMatch;
-    const typeWord = msgType.toLowerCase().replace(/_/g, ' ');
-    return { narrative: `${typeWord}: ${content.trim()}` };
+  // If no content fields found, get first non-metadata string field
+  if (!mainContent) {
+    for (const [key, value] of Object.entries(data)) {
+      if (!metadataFields.includes(key) && typeof value === 'string' && value.length > 3) {
+        mainContent = value;
+        break;
+      }
+    }
   }
 
-  // Last resort: clean up and show first chunk
-  const clean = preview.replace(/[{}"]/g, '').replace(/,\s*/g, '. ').trim();
-  return { narrative: clean.substring(0, 120) + (clean.length > 120 ? '...' : '') };
+  // Generate prefix based on type
+  let prefix = '';
+  if (type.includes('lesson') || type.includes('learned')) prefix = 'Learned: ';
+  else if (type.includes('decision')) prefix = 'Decided: ';
+  else if (type.includes('deploy') || type.includes('ship')) prefix = 'Shipped: ';
+  else if (type.includes('milestone') || type.includes('complete')) prefix = 'Milestone: ';
+  else if (type.includes('fix') || type.includes('bug')) prefix = 'Fixed: ';
+  else if (type.includes('incident') || type.includes('error')) prefix = 'Resolved: ';
+  else if (type.includes('commit') || type.includes('promise')) prefix = 'Committed: ';
+  else if (type.includes('vision') || type.includes('core')) prefix = '';
+  else if (type.includes('spec') || type.includes('design')) prefix = 'Designed: ';
+  else if (type.includes('config') || type.includes('setup')) prefix = 'Configured: ';
+  else if (type.includes('test') || type.includes('verif')) prefix = 'Tested: ';
+  else if (type.includes('swarm') || type.includes('role')) {
+    const role = data.role || data.claimed_role || '';
+    const worker = data.worker_id || '';
+    if (role && worker) return { narrative: `${worker} claimed ${role} role` };
+  }
+  else if (type.includes('progress') || type.includes('update')) prefix = 'Progress: ';
+  else if (type.includes('foundation') || type.includes('init')) prefix = 'Started: ';
+  else if (type.includes('debt') || type.includes('todo')) prefix = 'Noted: ';
+
+  // Build narrative
+  if (mainContent) {
+    const narrative = prefix + mainContent + (secondaryContent ? `. ${secondaryContent}` : '');
+    return { narrative: narrative.substring(0, 150), emotion: data.emotional_note };
+  }
+
+  // Ultimate fallback - format the type nicely
+  const typeLabel = type.replace(/_/g, ' ');
+  return { narrative: typeLabel || 'A memory' };
 }
 
 // Format timestamp as relative human time
