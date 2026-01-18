@@ -144,10 +144,9 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
 
     // Deployment / Milestone
     if (type.includes('deployment') || type.includes('milestone') || type.includes('complete')) {
-      const what = data.title || data.service || data.milestone || '';
-      const fixes = data.fixes_deployed || data.changes || [];
+      const what = data.achievement || data.title || data.service || data.milestone || '';
       if (what) {
-        return { narrative: `Shipped: ${what}${Array.isArray(fixes) && fixes.length ? `. ${fixes.slice(0, 2).join(', ')}` : ''}` };
+        return { narrative: `Shipped: ${what}` };
       }
     }
 
