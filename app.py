@@ -1530,7 +1530,7 @@ def _analyze_connectome_impl():
                 continue
 
             if distance < similarity_threshold:
-                weight = 1 / (distance + 0.1)
+                weight = min(1 / (distance + 0.1), 5.0)  # Cap at 5.0 to prevent visual dominance
                 if weight >= min_weight:
                     # Get branches for both blobs
                     source_branch = get_blob_branch(cur, blob_a['hash'], DEFAULT_TENANT)
@@ -1675,6 +1675,49 @@ def _analyze_connectome_impl():
         'links_preview': proposed_links[:50],  # Preview first 50
         'tags_preview': proposed_tags[:20] if propagate_tags else [],
         'cross_branch_insights': cross_branch_insights,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+
+@app.route('/v2/links/cleanup', methods=['POST'])
+def cleanup_links():
+    """
+    Delete links with 'unknown' branches created by analyzer bug.
+
+    Request body (JSON):
+    - dry_run: bool (default True) - if True, preview what would be deleted
+    """
+    data = request.get_json() or {}
+    dry_run = data.get('dry_run', True)
+
+    db = get_db()
+    cur = get_cursor()
+
+    # Count links to delete
+    cur.execute('''
+        SELECT COUNT(*) as count FROM cross_references
+        WHERE (source_branch = 'unknown' OR target_branch = 'unknown')
+        AND tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+    count = cur.fetchone()['count']
+
+    deleted = 0
+    if not dry_run and count > 0:
+        cur.execute('''
+            DELETE FROM cross_references
+            WHERE (source_branch = 'unknown' OR target_branch = 'unknown')
+            AND tenant_id = %s
+        ''', (DEFAULT_TENANT,))
+        deleted = cur.rowcount
+        db.commit()
+
+    cur.close()
+
+    return jsonify({
+        'status': 'executed' if not dry_run else 'preview',
+        'dry_run': dry_run,
+        'unknown_links_found': count,
+        'deleted': deleted,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
 
