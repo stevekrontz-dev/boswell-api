@@ -1431,6 +1431,17 @@ def analyze_connectome():
     - tags_preview: proposed tag propagations (if propagate_tags=True)
     - cross_branch_insights: summary of cross-branch connections
     """
+    try:
+        return _analyze_connectome_impl()
+    except Exception as e:
+        import traceback
+        print(f"[ANALYZE] Error: {e}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+def _analyze_connectome_impl():
+    """Internal implementation of analyze_connectome."""
     data = request.get_json() or {}
     similarity_threshold = data.get('similarity_threshold', 0.25)
     min_weight = data.get('min_weight', 0.5)
