@@ -23,10 +23,10 @@ export default function Layout() {
     <div className="min-h-screen bg-ink-950">
       {/* Navigation */}
       <nav className="bg-ink-950/80 backdrop-blur-xl border-b border-parchment-200/5 sticky top-0 z-50">
-        <div className="max-w-4xl mx-auto px-4 md:px-6">
+        <div className="max-w-6xl mx-auto px-4 md:px-6">
           <div className="flex items-center justify-between h-14 md:h-16">
             {/* Logo */}
-            <Link to="/dashboard" className="flex items-center gap-2 md:gap-3">
+            <Link to="/dashboard" className="flex items-center gap-2 md:gap-3 flex-shrink-0">
               <img src="/boswell-logo-dark.svg" alt="Boswell" className="h-7 w-7 md:h-8 md:w-8" />
               <span className="font-display text-base md:text-lg text-parchment-50">
                 Boswell
@@ -34,7 +34,7 @@ export default function Layout() {
             </Link>
 
             {/* Desktop Nav Links */}
-            <div className="hidden md:flex items-center gap-1 bg-ink-900/50 rounded-full p-1 border border-parchment-200/10">
+            <div className="hidden md:flex items-center gap-1 bg-ink-900/50 rounded-full p-1 border border-parchment-200/10 ml-8">
               {navLinks.map((link) => (
                 <Link
                   key={link.to}
