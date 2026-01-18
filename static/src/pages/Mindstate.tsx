@@ -279,9 +279,9 @@ export default function Mindstate() {
         // Helper to detect branch from content
         function getBranch(preview: string): string {
           const p = (preview || '').toLowerCase();
-          // Check for explicit branch mentions first
+          // Check for explicit branch mentions first (case-insensitive)
           for (const branchName of Object.keys(branches)) {
-            if (p.includes(branchName)) return branchName;
+            if (p.includes(branchName.toLowerCase())) return branchName;
           }
           // Fallback heuristics
           if (p.includes('square') || p.includes('payment') || p.includes('crm')) return 'tint-atlanta';
@@ -289,7 +289,7 @@ export default function Mindstate() {
           if (p.includes('franchise') || p.includes('empire')) return 'tint-empire';
           if (p.includes('family') || p.includes('diego') || p.includes('music') || p.includes('personal')) return 'family';
           if (p.includes('mining') || p.includes('crypto') || p.includes('hashrate') || p.includes('xmr')) return 'crypto-mining';
-          if (p.includes('infrastructure') || p.includes('thalamus') || p.includes('mcp') || p.includes('fix') || p.includes('swarm')) return 'command-center';
+          if (p.includes('infrastructure') || p.includes('mcp') || p.includes('fix') || p.includes('swarm')) return 'command-center';
           return 'boswell';
         }
 
