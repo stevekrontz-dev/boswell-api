@@ -337,32 +337,40 @@ def list_branches():
 
     try:
         cur = get_cursor()
-        # Get branches with commit counts
-        cur.execute('''
-            SELECT b.*, COALESCE(c.commit_count, 0) as commits,
-                   COALESCE(c.last_commit, b.created_at) as last_activity
-            FROM branches b
-            LEFT JOIN (
-                SELECT branch, COUNT(*) as commit_count, MAX(created_at) as last_commit
-                FROM commits
-                WHERE tenant_id = %s
-                GROUP BY branch
-            ) c ON b.name = c.branch
-            WHERE b.tenant_id = %s
-            ORDER BY b.name
-        ''', (tenant_id, tenant_id))
+        # Get branches
+        cur.execute('SELECT * FROM branches WHERE tenant_id = %s ORDER BY name', (tenant_id,))
         branches = []
         for row in cur.fetchall():
             branch = dict(row)
+            branch_name = branch.get('name')
             # Convert UUID and datetime to strings for JSON serialization
             if branch.get('tenant_id'):
                 branch['tenant_id'] = str(branch['tenant_id'])
             if branch.get('created_at'):
                 branch['created_at'] = str(branch['created_at'])
-            if branch.get('last_activity'):
-                branch['last_activity'] = str(branch['last_activity'])
-            else:
-                branch['last_activity'] = ''
+
+            # Count commits by walking the chain from head_commit
+            commit_count = 0
+            head = branch.get('head_commit')
+            if head and head != 'GENESIS':
+                # Walk commit chain to count
+                cur.execute('''
+                    WITH RECURSIVE commit_chain AS (
+                        SELECT commit_hash, parent_hash, 1 as depth
+                        FROM commits WHERE commit_hash = %s AND tenant_id = %s
+                        UNION ALL
+                        SELECT c.commit_hash, c.parent_hash, cc.depth + 1
+                        FROM commits c
+                        JOIN commit_chain cc ON c.commit_hash = cc.parent_hash
+                        WHERE c.tenant_id = %s AND cc.depth < 10000
+                    )
+                    SELECT COUNT(*) as cnt, MAX(depth) as max_depth FROM commit_chain
+                ''', (head, tenant_id, tenant_id))
+                count_row = cur.fetchone()
+                commit_count = count_row['cnt'] if count_row else 0
+
+            branch['commits'] = commit_count
+            branch['last_activity'] = str(branch.get('updated_at') or branch.get('created_at') or '')
             branches.append(branch)
         cur.close()
         return jsonify({'branches': branches, 'count': len(branches)})
