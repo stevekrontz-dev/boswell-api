@@ -1171,15 +1171,20 @@ def get_graph():
         '''
         cur.execute(nodes_sql, (DEFAULT_TENANT, limit))
 
+    rows = cur.fetchall()
+
+    # Batch lookup branches for all blobs (O(1) queries instead of O(N))
+    blob_hashes = [row['blob_hash'] for row in rows]
+    branch_map = get_blob_branches_batch(cur, blob_hashes, DEFAULT_TENANT)
+
     nodes = []
-    for row in cur.fetchall():
-        blob_branch = get_blob_branch(cur, row['blob_hash'], DEFAULT_TENANT)
+    for row in rows:
         nodes.append({
             'id': row['blob_hash'],
             'type': row['content_type'],
             'created_at': str(row['created_at']) if row['created_at'] else None,
             'preview': row['preview'],
-            'branch': blob_branch
+            'branch': branch_map.get(row['blob_hash'], 'unknown')
         })
 
     if branch:
@@ -1434,6 +1439,54 @@ def get_blob_branch(cur, blob_hash: str, tenant_id: str) -> str:
 
     row = cur.fetchone()
     return row['branch_name'] if row else 'unknown'
+
+
+def get_blob_branches_batch(cur, blob_hashes: list, tenant_id: str) -> dict:
+    """Get branches for multiple blobs in one query. Returns {blob_hash: branch_name}."""
+    if not blob_hashes:
+        return {}
+
+    result = {}
+
+    # Build commit chain CTE once, then join all blobs
+    # This is O(1) queries instead of O(N)
+    cur.execute('''
+        WITH RECURSIVE commit_chain AS (
+            SELECT br.name as branch_name, c.commit_hash, c.parent_hash, 1 as depth
+            FROM branches br
+            JOIN commits c ON br.head_commit = c.commit_hash AND br.tenant_id = c.tenant_id
+            WHERE br.tenant_id = %s AND br.head_commit != 'GENESIS'
+            UNION ALL
+            SELECT cc.branch_name, c.commit_hash, c.parent_hash, cc.depth + 1
+            FROM commit_chain cc
+            JOIN commits c ON cc.parent_hash = c.commit_hash
+            WHERE c.tenant_id = %s AND cc.depth < 500
+        )
+        SELECT DISTINCT t.blob_hash, cc.branch_name
+        FROM tree_entries t
+        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+        JOIN commit_chain cc ON c.commit_hash = cc.commit_hash
+        WHERE t.blob_hash = ANY(%s) AND t.tenant_id = %s
+    ''', (tenant_id, tenant_id, blob_hashes, tenant_id))
+
+    for row in cur.fetchall():
+        result[row['blob_hash']] = row['branch_name']
+
+    # Handle orphaned blobs (no tree_entries) with content-based fallback
+    missing = [h for h in blob_hashes if h not in result]
+    if missing:
+        cur.execute('''
+            SELECT blob_hash, content FROM blobs
+            WHERE blob_hash = ANY(%s) AND tenant_id = %s
+        ''', (missing, tenant_id))
+        for row in cur.fetchall():
+            content_lower = (row['content'] or '').lower()
+            if any(p in content_lower for p in ['institution', 'faculty', 'neuroscience', 'professor', 'research']):
+                result[row['blob_hash']] = 'iris'
+            else:
+                result[row['blob_hash']] = 'unknown'
+
+    return result
 
 
 @app.route('/v2/analyze', methods=['POST'])
