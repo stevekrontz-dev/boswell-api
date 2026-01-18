@@ -1533,8 +1533,8 @@ def _analyze_connectome_impl():
                         'target': blob_b['hash'],
                         'source_branch': source_branch,
                         'target_branch': target_branch,
-                        'distance': round(distance, 4),
-                        'weight': round(weight, 2),
+                        'distance': float(round(distance, 4)),
+                        'weight': float(round(weight, 2)),
                         'reasoning': reasoning,
                         'cross_branch': source_branch != target_branch
                     })
@@ -1593,7 +1593,7 @@ def _analyze_connectome_impl():
                         proposed_tags.append({
                             'tag': tag,
                             'blob_hash': untagged['hash'],
-                            'distance': round(distance, 4),
+                            'distance': float(round(distance, 4)),
                             'reason': f"Similar to {tagged['hash'][:8]}..."
                         })
                         break  # One match is enough
@@ -1641,7 +1641,7 @@ def _analyze_connectome_impl():
         {
             'branches': list(key),
             'link_count': stats['count'],
-            'avg_weight': round(stats['total_weight'] / stats['count'], 2)
+            'avg_weight': float(round(stats['total_weight'] / stats['count'], 2))
         }
         for key, stats in sorted(cross_branch_stats.items(), key=lambda x: x[1]['count'], reverse=True)
     ]
