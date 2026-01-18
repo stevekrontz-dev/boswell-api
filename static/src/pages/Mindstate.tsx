@@ -156,6 +156,26 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
       if (title) return { narrative: title };
     }
 
+    // Swarm / Role claims
+    if (type.includes('swarm') || type.includes('role') || data.worker_id) {
+      const role = data.role || data.claimed_role || '';
+      const worker = data.worker_id || data.instance_id || '';
+      if (role && worker) return { narrative: `${worker} claimed ${role} role` };
+      if (role) return { narrative: `Role claimed: ${role}` };
+    }
+
+    // Test / Verification
+    if (type.includes('test') || type.includes('verification')) {
+      const test = data.test || data.title || data.description || '';
+      if (test) return { narrative: `Test: ${test}` };
+    }
+
+    // Progress / Status update
+    if (type.includes('progress') || type.includes('status') || data.task_id) {
+      const task = data.task_id || data.task || '';
+      if (task) return { narrative: `Progress on task ${task.substring(0, 8)}...` };
+    }
+
     // Generic: try common fields
     const title = data.title || data.message || data.summary || '';
     const context = data.context || data.description || data.rationale || '';
