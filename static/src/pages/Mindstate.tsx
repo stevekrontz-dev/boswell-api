@@ -73,30 +73,100 @@ function getTypeClass(type: string): string {
   return 'task';
 }
 
-// Extract human-readable title from memory preview/content
-function extractTitle(preview: string): string {
-  if (!preview) return 'Memory';
-  // Try to find a title or message field in JSON
-  const titleMatch = preview.match(/"(?:title|message|commitment|decision)":\s*"([^"]+)"/);
-  if (titleMatch) return titleMatch[1];
-  // Try commit message format "TYPE: message"
-  const colonMatch = preview.match(/^[A-Z_]+:\s*(.+?)(?:\.|{|$)/);
-  if (colonMatch) return colonMatch[1].trim();
-  // Fallback: first meaningful chunk
-  const clean = preview.replace(/[{}"]/g, '').trim();
-  return clean.substring(0, 80) + (clean.length > 80 ? '...' : '');
-}
+// Generate a human-feeling narrative from memory content
+function narrateMemory(preview: string): { narrative: string; emotion?: string } {
+  if (!preview) return { narrative: 'A moment I wanted to remember.' };
 
-// Extract the WHY/meaning from memory content
-function extractMeaning(preview: string): string {
-  if (!preview) return '';
-  // Look for rationale, reasoning, context, or why fields
-  const meaningMatch = preview.match(/"(?:rationale|reasoning|context|why|insight|principle)":\s*"([^"]+)"/);
-  if (meaningMatch) return meaningMatch[1];
-  // Look for description
-  const descMatch = preview.match(/"description":\s*"([^"]+)"/);
-  if (descMatch) return descMatch[1];
-  return '';
+  try {
+    // Try to parse as JSON
+    const data = JSON.parse(preview);
+    const type = data.type || '';
+
+    // Lesson learned
+    if (type.includes('lesson') || data.principle || data.mistake) {
+      const lesson = data.principle || data.insight || data.root_cause || '';
+      const context = data.context || data.mistake || '';
+      if (lesson && context) {
+        return {
+          narrative: `I learned something: ${context.toLowerCase().startsWith('i ') ? context : context}. ${lesson}`,
+          emotion: data.emotional_note
+        };
+      }
+      if (lesson) return { narrative: `I realized: ${lesson}`, emotion: data.emotional_note };
+    }
+
+    // Decision
+    if (type.includes('decision') || data.decision) {
+      const decision = data.decision || data.choice || data.title || '';
+      const why = data.rationale || data.reasoning || data.why || '';
+      if (decision && why) {
+        return { narrative: `I decided to ${decision.toLowerCase()}. ${why}` };
+      }
+      if (decision) return { narrative: `I decided: ${decision}` };
+    }
+
+    // Vision / Core belief
+    if (type.includes('vision') || type.includes('core') || data.definition) {
+      const vision = data.title || data.definition || data.insight || '';
+      const meaning = data.key_distinction || data.meaning || '';
+      if (vision) {
+        return { narrative: meaning ? `${vision} — ${meaning}` : vision };
+      }
+    }
+
+    // Commitment / Promise
+    if (type.includes('commitment') || data.commitment || data.active_commitments) {
+      const commitment = data.commitment || data.title || '';
+      if (commitment) return { narrative: `I committed to: ${commitment}` };
+    }
+
+    // Bug fix / Incident
+    if (type.includes('fix') || type.includes('bug') || type.includes('incident')) {
+      const problem = data.problem || data.bug || data.incident || data.title || '';
+      const solution = data.solution || data.fix || data.resolution || '';
+      if (problem && solution) {
+        return { narrative: `Fixed an issue: ${problem}. Solution: ${solution}` };
+      }
+      if (problem) return { narrative: `Dealt with: ${problem}` };
+    }
+
+    // Deployment / Milestone
+    if (type.includes('deployment') || type.includes('milestone') || type.includes('complete')) {
+      const what = data.title || data.service || data.milestone || '';
+      const fixes = data.fixes_deployed || data.changes || [];
+      if (what) {
+        return { narrative: `Shipped: ${what}${Array.isArray(fixes) && fixes.length ? `. ${fixes.slice(0, 2).join(', ')}` : ''}` };
+      }
+    }
+
+    // Spec / Architecture
+    if (type.includes('spec') || type.includes('architecture') || type.includes('infrastructure')) {
+      const title = data.title || data.spec || data.insight || '';
+      if (title) return { narrative: title };
+    }
+
+    // Generic: try common fields
+    const title = data.title || data.message || data.summary || '';
+    const context = data.context || data.description || data.rationale || '';
+    if (title) {
+      return { narrative: context ? `${title}. ${context}` : title };
+    }
+
+  } catch {
+    // Not JSON - try to extract from plain text
+  }
+
+  // Fallback: extract from commit message format "TYPE: message"
+  const colonMatch = preview.match(/^([A-Z_]+):\s*(.+?)(?:\.|{|$)/);
+  if (colonMatch) {
+    const [, msgType, content] = colonMatch;
+    const typeWord = msgType.toLowerCase().replace(/_/g, ' ');
+    return { narrative: `${typeWord}: ${content.trim()}` };
+  }
+
+  // Last resort: clean up and show first chunk
+  const clean = preview.replace(/[{}"]/g, '').replace(/,\s*/g, '. ').trim();
+  return { narrative: clean.substring(0, 120) + (clean.length > 120 ? '...' : '') };
 }
 
 // Format timestamp as relative human time
@@ -567,15 +637,24 @@ export default function Mindstate() {
             </button>
             
             <div className="pr-6">
-              <div className="text-gray-200 text-base font-medium leading-snug mb-2">
-                {extractTitle(thoughtBubble.memory.preview)}
-              </div>
-              <div className="text-gray-400 text-sm leading-relaxed">
-                {extractMeaning(thoughtBubble.memory.preview)}
-              </div>
-              <div className="text-gray-600 text-xs mt-3">
-                {formatRelativeTime(thoughtBubble.memory.createdAt)}
-              </div>
+              {(() => {
+                const { narrative, emotion } = narrateMemory(thoughtBubble.memory.preview);
+                return (
+                  <>
+                    <div className="text-gray-200 text-sm leading-relaxed mb-2 font-light">
+                      {narrative}
+                    </div>
+                    {emotion && (
+                      <div className="text-gray-500 text-xs italic mb-2">
+                        "{emotion}"
+                      </div>
+                    )}
+                    <div className="text-gray-600 text-xs">
+                      {formatRelativeTime(thoughtBubble.memory.createdAt)}
+                    </div>
+                  </>
+                );
+              })()}
             </div>
           </div>
         )}
