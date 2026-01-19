@@ -2847,7 +2847,8 @@ def claim_task(task_id):
                 WHERE table_name = 'halt_state'
             )
         ''')
-        if cur.fetchone()[0]:
+        row = cur.fetchone()
+        if row and row.get('exists', False):
             cur.execute('SELECT halted, reason FROM halt_state WHERE tenant_id = %s', (DEFAULT_TENANT,))
             halt_row = cur.fetchone()
             if halt_row and halt_row['halted']:
