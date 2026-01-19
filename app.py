@@ -3215,7 +3215,15 @@ def backfill_tasks_to_memory():
             
             try:
                 branch = task['branch'] or 'command-center'
-                created_at = task['created_at'].isoformat() + 'Z' if task['created_at'] else datetime.utcnow().isoformat() + 'Z'
+                # Handle timestamp - avoid double timezone suffix
+                if task['created_at']:
+                    ts = task['created_at']
+                    if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                        created_at = ts.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+                    else:
+                        created_at = ts.isoformat() + 'Z'
+                else:
+                    created_at = datetime.utcnow().isoformat() + 'Z'
                 
                 # Build memory content
                 metadata = task['metadata'] if task['metadata'] else {}
