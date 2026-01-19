@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add fingerprint dispatch handler to app.py"""
+"""Add fingerprint dispatch to app.py"""
 
 with open('app.py', 'r') as f:
     content = f.read()
@@ -28,4 +28,4 @@ content = content.replace(old, new)
 with open('app.py', 'w') as f:
     f.write(content)
 
-print('Added boswell_validate_routing dispatch handler')
+print('Added boswell_validate_routing dispatch')

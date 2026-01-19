@@ -1,12 +1,11 @@
 {
   "instance_id": "CW-OPUS",
   "task_id": "a4a48d2e-8b1f-4fc7-854e-83bbd8180d08",
-  "progress": "Phase 3 in progress. Created migration file and runner. Found insertion point after trails section (~line 3973). About to write fingerprint endpoints.",
-  "next_step": "Write fingerprint endpoints: POST /v2/fingerprints/bootstrap, GET /v2/fingerprints, POST /v2/commit/validate-routing",
+  "progress": "Phase 3 COMPLETE. Fingerprints bootstrapped (9 branches). Routing validation working. Correctly identifies thalamus content being committed to command-center.",
+  "next_step": "Phase 4: Wire validation into /v2/commit to warn on mismatch. Phase 5: Surface warnings in MCP tool.",
   "context_snapshot": {
-    "migration_file": "db/migrations/012_branch_fingerprints.sql",
-    "runner_file": "run_012_branch_fingerprints_migration.py",
-    "insert_after_line": 3973,
-    "phase": "3_fingerprints"
+    "phase_3_complete": true,
+    "fingerprints_computed": 9,
+    "test_result": "thalamus content correctly flagged when targeting command-center"
   }
 }
