@@ -739,6 +739,21 @@ def cherry_pick_commit():
         return jsonify({'error': f'Cherry-pick failed: {str(e)}'}), 500
 
 
+def ensure_deprecated_commits_table():
+    """Create deprecated_commits table if it doesn't exist."""
+    cur = get_cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS deprecated_commits (
+            commit_hash VARCHAR(64) PRIMARY KEY,
+            tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+            reason TEXT,
+            deprecated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    ''')
+    get_db().commit()
+    cur.close()
+
+
 @app.route('/v2/commit/<commit_hash>/deprecate', methods=['POST'])
 def deprecate_commit(commit_hash):
     """Soft-mark a commit as deprecated.
@@ -802,37 +817,42 @@ def get_log():
     branch = request.args.get('branch', 'command-center')
     limit = request.args.get('limit', 20, type=int)
 
-    cur = get_cursor()
-    cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
-    branch_row = cur.fetchone()
+    try:
+        ensure_deprecated_commits_table()
+        cur = get_cursor()
+        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        branch_row = cur.fetchone()
 
-    if not branch_row:
+        if not branch_row:
+            cur.close()
+            return jsonify({'branch': branch, 'commits': [], 'count': 0})
+
+        head_commit = branch_row['head_commit']
+        if head_commit == 'GENESIS':
+            cur.close()
+            return jsonify({'branch': branch, 'head': 'GENESIS', 'commits': [], 'count': 0})
+
+        commits = []
+        current_hash = head_commit
+
+        while current_hash and len(commits) < limit:
+            cur.execute('SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s', (current_hash, DEFAULT_TENANT))
+            commit = cur.fetchone()
+            if not commit:
+                break
+            
+            # Check if deprecated
+            cur.execute('SELECT 1 FROM deprecated_commits WHERE commit_hash = %s', (current_hash,))
+            if not cur.fetchone():
+                commits.append(dict(commit))
+            
+            current_hash = commit['parent_hash']
+
         cur.close()
-        return jsonify({'branch': branch, 'commits': [], 'count': 0})
-
-    head_commit = branch_row['head_commit']
-    if head_commit == 'GENESIS':
-        cur.close()
-        return jsonify({'branch': branch, 'head': 'GENESIS', 'commits': [], 'count': 0})
-
-    commits = []
-    current_hash = head_commit
-
-    while current_hash and len(commits) < limit:
-        cur.execute('SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s', (current_hash, DEFAULT_TENANT))
-        commit = cur.fetchone()
-        if not commit:
-            break
-        
-        # Check if deprecated
-        cur.execute('SELECT 1 FROM deprecated_commits WHERE commit_hash = %s', (current_hash,))
-        if not cur.fetchone():
-            commits.append(dict(commit))
-        
-        current_hash = commit['parent_hash']
-
-    cur.close()
-    return jsonify({'branch': branch, 'commits': commits, 'count': len(commits)})
+        return jsonify({'branch': branch, 'commits': commits, 'count': len(commits)})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 @app.route('/v2/search', methods=['GET'])
 def search_memories():
@@ -844,6 +864,7 @@ def search_memories():
     if not query:
         return jsonify({'error': 'Search query required'}), 400
 
+    ensure_deprecated_commits_table()
     cur = get_cursor()
 
     sql = '''
@@ -905,6 +926,7 @@ def semantic_search():
     if not query_embedding:
         return jsonify({'error': 'Failed to generate query embedding'}), 500
 
+    ensure_deprecated_commits_table()
     cur = get_cursor()
 
     # Vector cosine search using pgvector (excluding deprecated commits)
