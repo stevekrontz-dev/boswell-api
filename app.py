@@ -633,6 +633,169 @@ def create_commit():
         cur.close()
         return jsonify({'error': f'Commit failed: {str(e)}'}), 500
 
+
+@app.route('/v2/commit/cherry-pick', methods=['POST'])
+def cherry_pick_commit():
+    """Copy a commit's content to a new commit on a different branch.
+    
+    Does NOT delete the original - use deprecate endpoint separately.
+    """
+    data = request.get_json() or {}
+    source_hash = data.get('source_hash')
+    target_branch = data.get('target_branch')
+    
+    if not source_hash:
+        return jsonify({'error': 'source_hash required'}), 400
+    if not target_branch:
+        return jsonify({'error': 'target_branch required'}), 400
+    
+    db = get_db()
+    cur = get_cursor()
+    now = datetime.utcnow().isoformat() + 'Z'
+    
+    try:
+        # 1. Get the source commit
+        cur.execute(
+            'SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s',
+            (source_hash, DEFAULT_TENANT)
+        )
+        source_commit = cur.fetchone()
+        
+        if not source_commit:
+            cur.close()
+            return jsonify({'error': 'Source commit not found'}), 404
+        
+        # 2. Get the blob via tree_entry
+        cur.execute(
+            'SELECT blob_hash, name, mode FROM tree_entries WHERE tree_hash = %s AND tenant_id = %s',
+            (source_commit['tree_hash'], DEFAULT_TENANT)
+        )
+        tree_entry = cur.fetchone()
+        
+        if not tree_entry:
+            cur.close()
+            return jsonify({'error': 'Source commit has no tree entry'}), 404
+        
+        blob_hash = tree_entry['blob_hash']
+        original_message = tree_entry['name']  # commit message stored here
+        memory_type = tree_entry['mode']
+        
+        # 3. Create new tree entry for target branch
+        new_tree_hash = compute_hash(f"{target_branch}:{blob_hash}:{now}")
+        cur.execute(
+            '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
+               VALUES (%s, %s, %s, %s, %s)''',
+            (DEFAULT_TENANT, new_tree_hash, f"[cherry-pick] {original_message}", blob_hash, memory_type)
+        )
+        
+        # 4. Get or create target branch
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', 
+                    (target_branch, DEFAULT_TENANT))
+        branch_row = cur.fetchone()
+        
+        if branch_row:
+            target_branch = branch_row['name']  # canonical casing
+            parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
+        else:
+            # Auto-create branch
+            cur.execute(
+                '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
+                   VALUES (%s, %s, %s, %s)''',
+                (DEFAULT_TENANT, target_branch, 'GENESIS', now)
+            )
+            parent_hash = None
+        
+        # 5. Create new commit
+        cherry_pick_message = f"[cherry-pick from {source_hash[:8]}] {original_message}"
+        commit_data = f"{new_tree_hash}:{parent_hash}:{cherry_pick_message}:{now}"
+        new_commit_hash = compute_hash(commit_data)
+        
+        cur.execute(
+            '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+            (new_commit_hash, DEFAULT_TENANT, new_tree_hash, parent_hash, 'claude', cherry_pick_message, now)
+        )
+        
+        # 6. Update target branch head
+        cur.execute(
+            'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
+            (new_commit_hash, target_branch, DEFAULT_TENANT)
+        )
+        
+        db.commit()
+        cur.close()
+        
+        return jsonify({
+            'status': 'cherry_picked',
+            'source_hash': source_hash,
+            'new_commit_hash': new_commit_hash,
+            'target_branch': target_branch,
+            'blob_hash': blob_hash
+        }), 201
+        
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Cherry-pick failed: {str(e)}'}), 500
+
+
+@app.route('/v2/commit/<commit_hash>/deprecate', methods=['POST'])
+def deprecate_commit(commit_hash):
+    """Soft-mark a commit as deprecated.
+    
+    Deprecated commits are excluded from search, log, and reflect.
+    Use after cherry-picking to mark the misplaced original.
+    """
+    data = request.get_json() or {}
+    reason = data.get('reason', 'deprecated')
+    
+    db = get_db()
+    cur = get_cursor()
+    
+    try:
+        # Verify commit exists
+        cur.execute(
+            'SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s',
+            (commit_hash, DEFAULT_TENANT)
+        )
+        commit = cur.fetchone()
+        
+        if not commit:
+            cur.close()
+            return jsonify({'error': 'Commit not found'}), 404
+        
+        # Store deprecation in a separate table (cleaner than altering commits)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS deprecated_commits (
+                commit_hash VARCHAR(64) PRIMARY KEY,
+                tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+                reason TEXT,
+                deprecated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        
+        cur.execute(
+            '''INSERT INTO deprecated_commits (commit_hash, tenant_id, reason)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (commit_hash) DO UPDATE SET reason = %s, deprecated_at = NOW()''',
+            (commit_hash, DEFAULT_TENANT, reason, reason)
+        )
+        
+        db.commit()
+        cur.close()
+        
+        return jsonify({
+            'status': 'deprecated',
+            'commit_hash': commit_hash,
+            'reason': reason
+        })
+        
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Deprecate failed: {str(e)}'}), 500
+
+
 @app.route('/v2/log', methods=['GET'])
 def get_log():
     """Get commit history for a branch."""
@@ -660,7 +823,12 @@ def get_log():
         commit = cur.fetchone()
         if not commit:
             break
-        commits.append(dict(commit))
+        
+        # Check if deprecated
+        cur.execute('SELECT 1 FROM deprecated_commits WHERE commit_hash = %s', (current_hash,))
+        if not cur.fetchone():
+            commits.append(dict(commit))
+        
         current_hash = commit['parent_hash']
 
     cur.close()
@@ -684,7 +852,8 @@ def search_memories():
         FROM blobs b
         JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
         JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        WHERE b.content LIKE %s AND b.tenant_id = %s
+        LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+        WHERE b.content LIKE %s AND b.tenant_id = %s AND dc.commit_hash IS NULL
     '''
     params = [f'%{query}%', DEFAULT_TENANT]
 
@@ -738,7 +907,7 @@ def semantic_search():
 
     cur = get_cursor()
 
-    # Vector cosine search using pgvector
+    # Vector cosine search using pgvector (excluding deprecated commits)
     cur.execute("""
         SELECT b.blob_hash, b.content, b.content_type, b.created_at,
                c.commit_hash, c.message, c.author,
@@ -746,7 +915,8 @@ def semantic_search():
         FROM blobs b
         JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
         JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+        LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
         ORDER BY distance
         LIMIT %s
     """, (query_embedding, DEFAULT_TENANT, limit))
