@@ -5710,7 +5710,7 @@ def debug_routing():
     
     scores = []
     for row in cur.fetchall():
-        if row['centroid']:
+        if row['centroid'] is not None:
             similarity = cosine_similarity(embedding, row['centroid'])
             scores.append({
                 'branch': row['branch_name'],
