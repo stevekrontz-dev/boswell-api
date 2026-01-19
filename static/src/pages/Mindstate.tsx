@@ -658,7 +658,29 @@ export default function Mindstate() {
         </div>
 
         {/* Legend - hidden on mobile */}
-        <div className="absolute bottom-6 left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-4 text-xs hidden lg:block">
+        <div className="absolute bottom-6 left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-4 text-xs hidden lg:block max-w-[200px]">
+          {/* Key */}
+          <div className="text-gray-600 uppercase tracking-wider text-[10px] mb-2">Key</div>
+          <div className="space-y-2 mb-3 pb-3 border-b border-gray-700/30">
+            <div className="flex items-center gap-2 text-gray-500">
+              <div className="w-6 h-6 rounded-full bg-gray-600/50 border border-gray-500" />
+              <span>Hub (branch center)</span>
+            </div>
+            <div className="flex items-center gap-2 text-gray-500">
+              <div className="w-3 h-3 rounded-full bg-gray-500/50 border border-gray-400" />
+              <span>Memory (commit)</span>
+            </div>
+            <div className="flex items-center gap-2 text-gray-500">
+              <div className="w-4 h-4 rounded-full bg-yellow-500/30 border-2 border-yellow-500/50" />
+              <span>Hot (frequently accessed)</span>
+            </div>
+            <div className="flex items-center gap-2 text-gray-500">
+              <div className="w-6 h-0.5 bg-gray-500" />
+              <span>Connection</span>
+            </div>
+          </div>
+
+          {/* Branches */}
           <div className="text-gray-600 uppercase tracking-wider text-[10px] mb-2">Branches</div>
           {Object.entries(branches).map(([id, cfg]) => (
             <div key={id} className="flex items-center gap-2 text-gray-500 my-1">
