@@ -192,6 +192,7 @@ export default function Mindstate() {
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
   const nodesRef = useRef<any[]>([]);
+  const simulationRef = useRef<d3.Simulation<any, any> | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [memories, setMemories] = useState<Memory[]>([]);
   const [trails, setTrails] = useState<Trail[]>([]);
@@ -443,6 +444,9 @@ export default function Mindstate() {
       .force('center', d3.forceCenter(width / 2, height / 2))
       .force('collision', d3.forceCollide().radius((d: any) => d.radius + 8));
 
+    // Store simulation ref for viewMode changes
+    simulationRef.current = simulation;
+
     // Draw links
     const link = g.append('g').selectAll('line').data(graphLinks).join('line')
       .attr('stroke', (d: any) => d.type === 'backbone' ? '#2a3a4a' : d.type === 'hierarchy' ? '#1a2530' : d.type === 'link' ? '#5a4a6a' : '#4a6a5a')
@@ -591,10 +595,11 @@ export default function Mindstate() {
 
   // Handle view mode toggle (graph vs timeline)
   useEffect(() => {
-    if (!svgRef.current || !zoomRef.current || !gRef.current || nodesRef.current.length === 0) return;
+    if (!svgRef.current || !zoomRef.current || !gRef.current || nodesRef.current.length === 0 || !simulationRef.current) return;
 
     const svg = d3.select(svgRef.current);
     const zoom = zoomRef.current;
+    const simulation = simulationRef.current;
     const width = svgRef.current.clientWidth;
     const height = svgRef.current.clientHeight;
 
@@ -606,34 +611,61 @@ export default function Mindstate() {
 
       if (memoryNodes.length === 0) return;
 
-      // Calculate timeline positions - centered around origin
-      const spacing = 40;
-      const totalWidth = (memoryNodes.length - 1) * spacing;
+      // Disable forces that would fight against fixed positions
+      simulation.force('center', null);
+      simulation.force('charge', null);
+      simulation.force('collision', null);
+      simulation.force('link', null);
+
+      // Calculate timeline positions - spread across viewport width
+      const padding = 50;
+      const availableWidth = width - 2 * padding;
+      const spacing = Math.max(availableWidth / Math.max(memoryNodes.length - 1, 1), 15);
 
       memoryNodes.forEach((node: any, i: number) => {
-        node.fx = -totalWidth / 2 + i * spacing;
-        node.fy = Math.sin(i * 0.3) * 30; // Slight wave for visual interest
+        node.fx = padding + i * spacing;
+        node.fy = height / 2 + Math.sin(i * 0.2) * 40; // Slight wave for visual interest
+        node.x = node.fx;
+        node.y = node.fy;
       });
 
-      // Hide hub nodes
+      // Hide hub nodes off-screen
       nodesRef.current.filter((n: any) => n.type === 'hub').forEach((node: any) => {
         node.fx = -5000;
         node.fy = -5000;
+        node.x = -5000;
+        node.y = -5000;
       });
 
-      // Zoom to fit timeline - translate to center of viewport
-      const scale = Math.min(width / (totalWidth + 200), height / 200, 1) * 0.85;
+      // Restart simulation to apply positions
+      simulation.alpha(1).restart();
+
+      // Zoom to fit all timeline nodes
+      const minX = padding - 20;
+      const maxX = padding + (memoryNodes.length - 1) * spacing + 20;
+      const timelineWidth = maxX - minX;
+      const scale = Math.min(width / timelineWidth, 1) * 0.95;
+      const centerX = (minX + maxX) / 2;
+
       const transform = d3.zoomIdentity
-        .translate(width / 2, height / 2)
+        .translate(width / 2 - centerX * scale, 0)
         .scale(scale);
 
       svg.transition().duration(750).call(zoom.transform, transform);
     } else {
-      // Reset to force-directed layout
+      // Re-enable forces for graph view
+      simulation.force('center', d3.forceCenter(width / 2, height / 2));
+      simulation.force('charge', d3.forceManyBody().strength((d: any) => d.type === 'hub' ? -350 : -40));
+      simulation.force('collision', d3.forceCollide().radius((d: any) => d.radius + 8));
+
+      // Reset to force-directed layout - clear all fixed positions
       nodesRef.current.forEach((node: any) => {
         node.fx = null;
         node.fy = null;
       });
+
+      // Restart simulation to let forces take over
+      simulation.alpha(1).restart();
 
       // Reset zoom
       const transform = d3.zoomIdentity.translate(0, 0).scale(1);
