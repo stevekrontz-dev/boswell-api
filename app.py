@@ -576,9 +576,10 @@ def create_commit():
             (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, memory_type)
         )
 
-        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
         branch_row = cur.fetchone()
         if branch_row:
+            branch = branch_row['name']  # Use canonical casing
             parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
         else:
             # Auto-create branch on first commit
@@ -2597,10 +2598,11 @@ def create_task():
             (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'task')
         )
 
-        # Get parent commit
-        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        # Get parent commit (case-insensitive branch lookup)
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
         branch_row = cur.fetchone()
         if branch_row:
+            branch = branch_row['name']  # Use canonical casing
             parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
         else:
             # Auto-create branch
@@ -3266,11 +3268,12 @@ def backfill_tasks_to_memory():
                     VALUES (%s, %s, %s, %s, %s)
                 ''', (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'task'))
                 
-                # Get branch head
-                cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+                # Get branch head (case-insensitive)
+                cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
                 branch_row = cur.fetchone()
                 
                 if branch_row:
+                    branch = branch_row['name']  # Use canonical casing
                     parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
                 else:
                     cur.execute('''
