@@ -615,7 +615,7 @@ def create_commit():
                 
                 scores = []
                 for row in fp_cur.fetchall():
-                    if row['centroid']:
+                    if row['centroid'] is not None:
                         similarity = cosine_similarity(embedding, row['centroid'])
                         scores.append({
                             'branch': row['branch_name'],
