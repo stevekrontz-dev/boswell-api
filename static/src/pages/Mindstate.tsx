@@ -595,7 +595,20 @@ export default function Mindstate() {
 
   // Handle view mode toggle (graph vs timeline)
   useEffect(() => {
-    if (!svgRef.current || !zoomRef.current || !gRef.current || !simulationRef.current) return;
+    console.log('[Timeline] Effect triggered, viewMode:', viewMode);
+    console.log('[Timeline] Guards:', {
+      svg: !!svgRef.current,
+      zoom: !!zoomRef.current,
+      g: !!gRef.current,
+      sim: !!simulationRef.current,
+      memoriesCount: memories.length,
+      memoriesWithDate: memories.filter(m => m.createdAt).length
+    });
+
+    if (!svgRef.current || !zoomRef.current || !gRef.current || !simulationRef.current) {
+      console.log('[Timeline] Early return - missing refs');
+      return;
+    }
 
     const svg = d3.select(svgRef.current);
     const zoom = zoomRef.current;
@@ -608,6 +621,7 @@ export default function Mindstate() {
     g.selectAll('.timeline-group').remove();
 
     if (viewMode === 'timeline') {
+      console.log('[Timeline] Creating timeline view...');
       // Stop simulation and hide graph elements
       simulation.stop();
       g.selectAll('line').style('opacity', 0);
