@@ -1,3 +1,4 @@
+// Build: 2026-01-18-v3 - timeline removed, legend added
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { fetchWithAuth, getCurrentUser, type UserProfile } from '../lib/api';
