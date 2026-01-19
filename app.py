@@ -4023,7 +4023,7 @@ def compute_branch_centroid(branch_name: str, tenant_id: str = None) -> tuple:
     
     embeddings = []
     for row in cur.fetchall():
-        if row['embedding']:
+        if row['embedding'] is not None:
             embeddings.append(row['embedding'])
     
     cur.close()
