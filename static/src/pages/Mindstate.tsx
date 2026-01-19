@@ -595,83 +595,133 @@ export default function Mindstate() {
 
   // Handle view mode toggle (graph vs timeline)
   useEffect(() => {
-    if (!svgRef.current || !zoomRef.current || !gRef.current || nodesRef.current.length === 0 || !simulationRef.current) return;
+    if (!svgRef.current || !zoomRef.current || !gRef.current || !simulationRef.current) return;
 
     const svg = d3.select(svgRef.current);
     const zoom = zoomRef.current;
+    const g = gRef.current;
     const simulation = simulationRef.current;
     const width = svgRef.current.clientWidth;
     const height = svgRef.current.clientHeight;
 
+    // Remove any existing timeline elements
+    g.selectAll('.timeline-group').remove();
+
     if (viewMode === 'timeline') {
-      // Sort memory nodes by creation date, exclude hubs
-      const memoryNodes = nodesRef.current
-        .filter((n: any) => n.type === 'memory' && n.createdAt)
-        .sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      // Stop simulation and hide graph elements
+      simulation.stop();
+      g.selectAll('line').style('opacity', 0);
+      g.selectAll('g').filter(':not(.timeline-group)').style('opacity', 0);
 
-      if (memoryNodes.length === 0) return;
+      // Get sorted memories with dates
+      const timelineData = memories
+        .filter(m => m.createdAt)
+        .sort((a, b) => new Date(a.createdAt!).getTime() - new Date(b.createdAt!).getTime());
 
-      // Disable forces that would fight against fixed positions
-      simulation.force('center', null);
-      simulation.force('charge', null);
-      simulation.force('collision', null);
-      simulation.force('link', null);
+      if (timelineData.length === 0) return;
 
-      // Calculate timeline positions - spread across viewport width
-      const padding = 50;
-      const availableWidth = width - 2 * padding;
-      const spacing = Math.max(availableWidth / Math.max(memoryNodes.length - 1, 1), 15);
+      // Timeline dimensions
+      const timelineY = height / 2;
+      const padding = 80;
+      const nodeSpacing = Math.max((width - 2 * padding) / Math.max(timelineData.length - 1, 1), 60);
+      const totalWidth = Math.max((timelineData.length - 1) * nodeSpacing + 2 * padding, width);
 
-      memoryNodes.forEach((node: any, i: number) => {
-        node.fx = padding + i * spacing;
-        node.fy = height / 2 + Math.sin(i * 0.2) * 40; // Slight wave for visual interest
-        node.x = node.fx;
-        node.y = node.fy;
+      // Create timeline group
+      const timelineGroup = g.append('g').attr('class', 'timeline-group');
+
+      // Main horizontal line
+      timelineGroup.append('line')
+        .attr('x1', 0)
+        .attr('y1', timelineY)
+        .attr('x2', totalWidth)
+        .attr('y2', timelineY)
+        .attr('stroke', '#3a4a5a')
+        .attr('stroke-width', 2);
+
+      // Draw each event
+      timelineData.forEach((memory, i) => {
+        const x = padding + i * nodeSpacing;
+        const isAbove = i % 2 === 0;
+        const verticalOffset = isAbove ? -60 : 60;
+        const labelOffset = isAbove ? -80 : 95;
+        const dateOffset = isAbove ? -100 : 115;
+
+        // Vertical connector line
+        timelineGroup.append('line')
+          .attr('x1', x)
+          .attr('y1', timelineY)
+          .attr('x2', x)
+          .attr('y2', timelineY + verticalOffset)
+          .attr('stroke', '#3a4a5a')
+          .attr('stroke-width', 1);
+
+        // Outer circle (ring)
+        timelineGroup.append('circle')
+          .attr('cx', x)
+          .attr('cy', timelineY + verticalOffset)
+          .attr('r', 12)
+          .attr('fill', 'none')
+          .attr('stroke', memory.color)
+          .attr('stroke-width', 2);
+
+        // Inner circle (filled)
+        timelineGroup.append('circle')
+          .attr('cx', x)
+          .attr('cy', timelineY + verticalOffset)
+          .attr('r', 7)
+          .attr('fill', memory.color)
+          .attr('cursor', 'pointer')
+          .on('click', () => {
+            setSelectedMemory(memory as any);
+            setThoughtBubble({
+              memory: memory as any,
+              x: x,
+              y: timelineY + verticalOffset,
+              connections: []
+            });
+          });
+
+        // Date label
+        const date = new Date(memory.createdAt!);
+        const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        timelineGroup.append('text')
+          .attr('x', x)
+          .attr('y', timelineY + dateOffset)
+          .attr('text-anchor', 'middle')
+          .attr('fill', '#8a9aaa')
+          .attr('font-size', '11px')
+          .attr('font-weight', '600')
+          .text(dateStr);
+
+        // Memory label (truncated)
+        const label = (memory.preview || '').replace(/[{}"]/g, '').substring(0, 30);
+        timelineGroup.append('text')
+          .attr('x', x)
+          .attr('y', timelineY + labelOffset)
+          .attr('text-anchor', 'middle')
+          .attr('fill', '#6a7a8a')
+          .attr('font-size', '9px')
+          .text(label + (label.length >= 30 ? '...' : ''));
       });
 
-      // Hide hub nodes off-screen
-      nodesRef.current.filter((n: any) => n.type === 'hub').forEach((node: any) => {
-        node.fx = -5000;
-        node.fy = -5000;
-        node.x = -5000;
-        node.y = -5000;
-      });
-
-      // Restart simulation to apply positions
-      simulation.alpha(1).restart();
-
-      // Zoom to fit all timeline nodes
-      const minX = padding - 20;
-      const maxX = padding + (memoryNodes.length - 1) * spacing + 20;
-      const timelineWidth = maxX - minX;
-      const scale = Math.min(width / timelineWidth, 1) * 0.95;
-      const centerX = (minX + maxX) / 2;
-
+      // Zoom to fit timeline
+      const scale = Math.min(width / totalWidth, 1) * 0.9;
       const transform = d3.zoomIdentity
-        .translate(width / 2 - centerX * scale, 0)
+        .translate((width - totalWidth * scale) / 2, 0)
         .scale(scale);
+      svg.transition().duration(500).call(zoom.transform, transform);
 
-      svg.transition().duration(750).call(zoom.transform, transform);
     } else {
-      // Re-enable forces for graph view
-      simulation.force('center', d3.forceCenter(width / 2, height / 2));
-      simulation.force('charge', d3.forceManyBody().strength((d: any) => d.type === 'hub' ? -350 : -40));
-      simulation.force('collision', d3.forceCollide().radius((d: any) => d.radius + 8));
-
-      // Reset to force-directed layout - clear all fixed positions
-      nodesRef.current.forEach((node: any) => {
-        node.fx = null;
-        node.fy = null;
-      });
-
-      // Restart simulation to let forces take over
-      simulation.alpha(1).restart();
+      // Show graph elements and restart simulation
+      g.selectAll('line').style('opacity', 1);
+      g.selectAll('g').filter(':not(.timeline-group)').style('opacity', 1);
+      simulation.alpha(0.3).restart();
 
       // Reset zoom
       const transform = d3.zoomIdentity.translate(0, 0).scale(1);
-      svg.transition().duration(750).call(zoom.transform, transform);
+      svg.transition().duration(500).call(zoom.transform, transform);
     }
-  }, [viewMode]);
+  }, [viewMode, memories, branches]);
 
   const filteredMemories = memories.filter(m => {
     const matchBranch = currentBranch === 'all' || m.branch === currentBranch;
