@@ -1599,6 +1599,10 @@ def _analyze_connectome_impl():
                     source_branch = get_blob_branch(cur, blob_a['hash'], DEFAULT_TENANT)
                     target_branch = get_blob_branch(cur, blob_b['hash'], DEFAULT_TENANT)
 
+                    # Skip orphan blobs (not in any commit chain)
+                    if source_branch == 'unknown' or target_branch == 'unknown':
+                        continue
+
                     reasoning = generate_link_reasoning(
                         blob_a['content'][:1000],
                         blob_b['content'][:1000],
