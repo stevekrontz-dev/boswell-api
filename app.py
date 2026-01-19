@@ -2916,9 +2916,10 @@ def claim_task(task_id):
         })
 
     except Exception as e:
+        import traceback
         db.rollback()
         cur.close()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e), 'type': type(e).__name__, 'traceback': traceback.format_exc()}), 500
 
 
 @app.route('/v2/tasks/<task_id>/release', methods=['POST'])
