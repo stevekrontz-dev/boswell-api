@@ -192,7 +192,6 @@ export default function Mindstate() {
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
   const nodesRef = useRef<any[]>([]);
-  const simulationRef = useRef<d3.Simulation<any, any> | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [memories, setMemories] = useState<Memory[]>([]);
   const [trails, setTrails] = useState<Trail[]>([]);
@@ -203,7 +202,6 @@ export default function Mindstate() {
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
   const [currentBranch, setCurrentBranch] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
-  const [viewMode, setViewMode] = useState<'graph' | 'timeline'>('graph');
   const [showMobilePanel, setShowMobilePanel] = useState(false);
   const [thoughtBubble, setThoughtBubble] = useState<{
     memory: Memory;
@@ -444,8 +442,6 @@ export default function Mindstate() {
       .force('center', d3.forceCenter(width / 2, height / 2))
       .force('collision', d3.forceCollide().radius((d: any) => d.radius + 8));
 
-    // Store simulation ref for viewMode changes
-    simulationRef.current = simulation;
 
     // Draw links
     const link = g.append('g').selectAll('line').data(graphLinks).join('line')
@@ -593,7 +589,6 @@ export default function Mindstate() {
     svg.transition().duration(750).call(zoom.transform, transform);
   }, [currentBranch]);
 
-  // Timeline is now rendered as a React component, no D3 manipulation needed
 
   const filteredMemories = memories.filter(m => {
     const matchBranch = currentBranch === 'all' || m.branch === currentBranch;
@@ -650,71 +645,7 @@ export default function Mindstate() {
     <div className="flex flex-col md:flex-row h-[calc(100vh-3.5rem)] md:h-[calc(100vh-4rem)] bg-[#0c0c10] overflow-hidden">
       {/* Graph Panel */}
       <div className="flex-1 relative min-h-[50vh] md:min-h-0">
-        {/* Graph View */}
-        <svg ref={svgRef} className={`w-full h-full touch-none ${viewMode === 'timeline' ? 'hidden' : ''}`} />
-
-        {/* Timeline View */}
-        {viewMode === 'timeline' && (
-          <div className="w-full h-full overflow-x-auto overflow-y-hidden bg-[#0a0a0e]">
-            <div className="relative min-w-max h-full flex items-center px-20">
-              {/* Horizontal line */}
-              <div className="absolute left-0 right-0 h-0.5 bg-gray-700" style={{ top: '50%' }} />
-
-              {/* Timeline nodes */}
-              {memories
-                .filter(m => m.createdAt)
-                .sort((a, b) => new Date(a.createdAt!).getTime() - new Date(b.createdAt!).getTime())
-                .map((memory, i) => {
-                  const isAbove = i % 2 === 0;
-                  return (
-                    <div
-                      key={memory.id}
-                      className="relative flex flex-col items-center mx-4"
-                      style={{ minWidth: '80px' }}
-                    >
-                      {/* Content above/below line */}
-                      <div className={`flex flex-col items-center ${isAbove ? 'order-1' : 'order-3'}`}>
-                        {/* Date */}
-                        <span className="text-[10px] text-gray-500 font-semibold mb-1">
-                          {new Date(memory.createdAt!).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                        </span>
-                        {/* Label */}
-                        <span className="text-[9px] text-gray-600 text-center max-w-[70px] truncate">
-                          {memory.memoryType}
-                        </span>
-                      </div>
-
-                      {/* Vertical connector */}
-                      <div
-                        className={`w-px bg-gray-600 order-2 ${isAbove ? 'h-10' : 'h-10'}`}
-                      />
-
-                      {/* Circle on the line */}
-                      <div
-                        className="order-2 w-4 h-4 rounded-full border-2 cursor-pointer hover:scale-125 transition-transform"
-                        style={{
-                          backgroundColor: memory.color,
-                          borderColor: memory.color,
-                        }}
-                        onClick={() => {
-                          setSelectedMemory(memory as any);
-                          setThoughtBubble({
-                            memory: memory as any,
-                            x: 400,
-                            y: 300,
-                            connections: []
-                          });
-                        }}
-                      />
-
-                      {/* Spacer for opposite side */}
-                      <div className={`h-16 ${isAbove ? 'order-3' : 'order-1'}`} />
-                    </div>
-                  );
-                })}
-            </div>
-          </div>
-        )}
+        <svg ref={svgRef} className="w-full h-full touch-none" />
 
         {/* Stats overlay */}
         <div className="absolute top-4 left-4 md:top-6 md:left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-3 md:p-4 text-xs text-gray-500">
@@ -723,25 +654,6 @@ export default function Mindstate() {
             <div className="flex justify-between gap-4 md:gap-8"><span>Branches</span> <span className="text-gray-400">{branchCount}</span></div>
             <div className="flex justify-between gap-4 md:gap-8"><span>Memories</span> <span className="text-gray-400">{memories.length}</span></div>
             <div className="flex justify-between gap-4 md:gap-8"><span>Connections</span> <span className="text-gray-400">{trails.length + links.length}</span></div>
-          </div>
-          {/* View toggle */}
-          <div className="flex gap-1 mt-3 pt-3 border-t border-gray-700/30">
-            <button
-              onClick={() => setViewMode('graph')}
-              className={`px-2 py-1 rounded text-[10px] transition-all ${
-                viewMode === 'graph' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30' : 'text-gray-500 hover:text-gray-400'
-              }`}
-            >
-              Graph
-            </button>
-            <button
-              onClick={() => setViewMode('timeline')}
-              className={`px-2 py-1 rounded text-[10px] transition-all ${
-                viewMode === 'timeline' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30' : 'text-gray-500 hover:text-gray-400'
-              }`}
-            >
-              Timeline
-            </button>
           </div>
         </div>
 
