@@ -5678,6 +5678,58 @@ def mcp_handler():
         return jsonify(mcp_error_response(req_id, -32601, f"Method not found: {method}")), 400
 
 
+# Debug endpoint for routing similarity scores
+@app.route('/v2/routing/debug', methods=['POST'])
+def debug_routing():
+    """Debug routing similarity - shows what scores the content gets against each branch."""
+    data = request.get_json() or {}
+    content = data.get('content', {})
+    message = data.get('message', '')
+    
+    # Generate embedding
+    text_for_embedding = f"{message}\n{json.dumps(content, default=str)}"
+    embedding = None
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text_for_embedding
+        )
+        embedding = response.data[0].embedding
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate embedding: {e}"}), 500
+    
+    # Compare against all fingerprints
+    cur = get_cursor()
+    cur.execute("""
+        SELECT branch_name, centroid, commit_count
+        FROM branch_fingerprints
+        WHERE tenant_id = %s AND centroid IS NOT NULL
+    """, (DEFAULT_TENANT,))
+    
+    scores = []
+    for row in cur.fetchall():
+        if row['centroid']:
+            similarity = cosine_similarity(embedding, row['centroid'])
+            scores.append({
+                'branch': row['branch_name'],
+                'similarity': round(similarity, 4),
+                'commit_count': row['commit_count']
+            })
+    cur.close()
+    
+    scores.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    return jsonify({
+        "scores": scores,
+        "best_match": scores[0] if scores else None,
+        "threshold": 0.15,
+        "would_trigger_warning": scores[0]['similarity'] > 0.15 if scores else False,
+        "text_embedded": text_for_embedding[:200] + "..."
+    })
+
+
 # Convenience endpoint for MCP health check
 @app.route('/v2/mcp/health', methods=['GET'])
 def mcp_health():
