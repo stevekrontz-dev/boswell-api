@@ -99,9 +99,9 @@ export default function Branches() {
         </div>
         <button
           onClick={() => setShowCreateModal(true)}
-          className="px-4 py-2 bg-ember-500 hover:bg-ember-400 text-ink-950 font-medium rounded-lg transition-colors"
+          className="px-5 py-2.5 bg-orange-500 hover:bg-orange-400 text-white font-medium rounded-xl transition-colors"
         >
-          New Branch
+          + New Branch
         </button>
       </div>
 
@@ -139,7 +139,7 @@ export default function Branches() {
                       <button
                         onClick={() => handleDeleteBranch(branch.name)}
                         disabled={deletingBranch === branch.name}
-                        className="text-red-400 hover:text-red-300 text-sm disabled:opacity-50"
+                        className="px-3 py-1.5 bg-red-600/20 hover:bg-red-600/30 border border-red-500/30 text-red-400 hover:text-red-300 text-sm font-medium rounded-lg disabled:opacity-50 transition-colors"
                       >
                         {deletingBranch === branch.name ? 'Deleting...' : 'Delete'}
                       </button>
@@ -170,14 +170,14 @@ export default function Branches() {
                 type="button"
                 onClick={() => setShowCreateModal(false)}
                 disabled={creating}
-                className="px-4 py-2 text-parchment-200/60 hover:text-parchment-100 disabled:opacity-50"
+                className="px-4 py-2.5 bg-gray-700 hover:bg-gray-600 text-gray-200 font-medium rounded-xl disabled:opacity-50 transition-colors"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={creating || !newBranchName.trim()}
-                className="px-4 py-2 bg-ember-500 hover:bg-ember-400 text-ink-950 font-medium rounded-lg disabled:opacity-50"
+                className="px-5 py-2.5 bg-orange-500 hover:bg-orange-400 text-white font-medium rounded-xl disabled:opacity-50 transition-colors"
               >
                 {creating ? 'Creating...' : 'Create'}
               </button>

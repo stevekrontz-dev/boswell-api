@@ -77,7 +77,7 @@ export default function Connect() {
                 </code>
                 <button
                   onClick={() => copyToClipboard(newKey)}
-                  className="px-3 py-2 bg-ink-700 hover:bg-ink-800 rounded text-xs text-parchment-200"
+                  className="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm text-white font-medium transition-colors"
                 >
                   {copied ? 'Copied!' : 'Copy'}
                 </button>
@@ -99,7 +99,7 @@ export default function Connect() {
         <button
           onClick={handleCreateKey}
           disabled={loading}
-          className="mt-4 px-4 py-2 bg-ember-500 hover:bg-ember-400 disabled:bg-ink-700 text-ink-950 font-medium rounded-lg transition-colors"
+          className="mt-4 px-5 py-2.5 bg-orange-500 hover:bg-orange-400 disabled:bg-gray-700 disabled:text-gray-400 text-white font-medium rounded-xl transition-colors"
         >
           {loading ? 'Generating...' : 'Generate New API Key'}
         </button>
@@ -138,7 +138,7 @@ export default function Connect() {
             <button
               onClick={handleDownloadExtension}
               disabled={!newKey}
-              className="px-6 py-3 bg-ember-500 hover:bg-ember-400 disabled:bg-ink-700 disabled:cursor-not-allowed text-ink-950 font-medium rounded-lg transition-colors"
+              className="px-6 py-3 bg-orange-500 hover:bg-orange-400 disabled:bg-gray-700 disabled:text-gray-400 disabled:cursor-not-allowed text-white font-medium rounded-xl transition-colors"
             >
               {newKey ? 'Download Extension (.mcpb)' : 'Generate API Key First'}
             </button>
@@ -153,7 +153,7 @@ export default function Connect() {
               <code className="break-all">{mcpCommand}</code>
               <button
                 onClick={() => copyToClipboard(mcpCommand)}
-                className="ml-4 px-3 py-1 bg-ink-700 hover:bg-ink-800 rounded text-xs text-parchment-200 shrink-0"
+                className="ml-4 px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm text-white font-medium shrink-0 transition-colors"
               >
                 {copied ? 'Copied!' : 'Copy'}
               </button>

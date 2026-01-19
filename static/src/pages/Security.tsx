@@ -208,7 +208,7 @@ export default function Security() {
           </div>
         </div>
 
-        <button className="text-ember-500 hover:text-ember-400 text-sm font-medium transition-colors">
+        <button className="px-4 py-2.5 bg-gray-700 hover:bg-gray-600 text-gray-200 text-sm font-medium rounded-xl transition-colors">
           Change password →
         </button>
       </div>
