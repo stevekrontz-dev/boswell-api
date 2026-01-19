@@ -2941,6 +2941,17 @@ def update_task(task_id):
             cur.close()
             return jsonify({'error': 'Task not found'}), 404
 
+        # Auto-clear checkpoint when task is marked done
+        if updates.get('status') == 'done':
+            try:
+                cur.execute(
+                    'DELETE FROM session_checkpoints WHERE task_id = %s AND tenant_id = %s',
+                    (task_id, DEFAULT_TENANT)
+                )
+            except Exception as e:
+                # Table may not exist yet - non-fatal
+                print(f"[CHECKPOINT] Auto-clear skipped: {e}", file=sys.stderr)
+
         db.commit()
 
         task = dict(row)
@@ -3540,6 +3551,202 @@ def backfill_tasks_to_memory():
         
     except Exception as e:
         db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== SESSION CHECKPOINTS (Crash Recovery) ====================
+
+@app.route('/v2/session/checkpoint', methods=['POST'])
+def create_checkpoint():
+    """Create or update a session checkpoint for crash recovery.
+
+    Ephemeral state layer - captures WHERE the instance WAS, not WHAT happened (that's commits).
+    UPSERT semantics: one checkpoint per task.
+    """
+    data = request.get_json() or {}
+    task_id = data.get('task_id')
+    instance_id = data.get('instance_id')
+    progress = data.get('progress')
+    next_step = data.get('next_step')
+    context_snapshot = data.get('context_snapshot', {})
+    expires_at = data.get('expires_at')  # Optional TTL
+
+    if not task_id:
+        return jsonify({'error': 'task_id required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Verify task exists
+        cur.execute('SELECT id FROM tasks WHERE id = %s AND tenant_id = %s', (task_id, DEFAULT_TENANT))
+        if not cur.fetchone():
+            cur.close()
+            return jsonify({'error': f'Task {task_id} not found'}), 404
+
+        # UPSERT checkpoint
+        cur.execute('''
+            INSERT INTO session_checkpoints (task_id, tenant_id, instance_id, progress, next_step, context_snapshot, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (task_id) DO UPDATE SET
+                instance_id = EXCLUDED.instance_id,
+                progress = EXCLUDED.progress,
+                next_step = EXCLUDED.next_step,
+                context_snapshot = EXCLUDED.context_snapshot,
+                expires_at = EXCLUDED.expires_at
+            RETURNING checkpoint_at
+        ''', (task_id, DEFAULT_TENANT, instance_id, progress, next_step, json.dumps(context_snapshot), expires_at))
+
+        row = cur.fetchone()
+        checkpoint_at = str(row['checkpoint_at'])
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'checkpointed',
+            'task_id': task_id,
+            'instance_id': instance_id,
+            'progress': progress,
+            'next_step': next_step,
+            'checkpoint_at': checkpoint_at
+        }), 200
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/session/resume', methods=['GET'])
+def get_checkpoint():
+    """Get a checkpoint for a task if one exists.
+
+    Used to resume work after a crash or context loss.
+    """
+    task_id = request.args.get('task_id')
+
+    if not task_id:
+        return jsonify({'error': 'task_id required'}), 400
+
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT sc.*, t.description as task_description, t.status as task_status, t.branch
+            FROM session_checkpoints sc
+            JOIN tasks t ON sc.task_id = t.id
+            WHERE sc.task_id = %s AND sc.tenant_id = %s
+        ''', (task_id, DEFAULT_TENANT))
+
+        row = cur.fetchone()
+        cur.close()
+
+        if not row:
+            return jsonify({'checkpoint': None, 'message': 'No checkpoint found for this task'}), 200
+
+        checkpoint = {
+            'task_id': str(row['task_id']),
+            'instance_id': row['instance_id'],
+            'progress': row['progress'],
+            'next_step': row['next_step'],
+            'context_snapshot': row['context_snapshot'] if row['context_snapshot'] else {},
+            'checkpoint_at': str(row['checkpoint_at']),
+            'expires_at': str(row['expires_at']) if row['expires_at'] else None,
+            'task_description': row['task_description'],
+            'task_status': row['task_status'],
+            'branch': row['branch']
+        }
+
+        return jsonify({'checkpoint': checkpoint}), 200
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/session/checkpoint', methods=['DELETE'])
+def delete_checkpoint():
+    """Delete a checkpoint for a task.
+
+    Called when task is completed or checkpoint is no longer needed.
+    """
+    task_id = request.args.get('task_id')
+
+    if not task_id:
+        return jsonify({'error': 'task_id required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            DELETE FROM session_checkpoints
+            WHERE task_id = %s AND tenant_id = %s
+            RETURNING task_id
+        ''', (task_id, DEFAULT_TENANT))
+
+        deleted = cur.fetchone()
+        db.commit()
+        cur.close()
+
+        if deleted:
+            return jsonify({'status': 'deleted', 'task_id': task_id}), 200
+        else:
+            return jsonify({'status': 'not_found', 'message': f'No checkpoint for task {task_id}'}), 200
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/session/orphaned', methods=['GET'])
+def list_orphaned_checkpoints():
+    """List orphaned checkpoints - instances that may have crashed.
+
+    Orphaned = checkpoint_at > 2 hours ago AND task.status != done/deleted
+    Shows potential crashed instances for dashboard monitoring.
+    """
+    hours = request.args.get('hours', 2, type=int)
+
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT sc.*, t.description as task_description, t.status as task_status, t.branch
+            FROM session_checkpoints sc
+            JOIN tasks t ON sc.task_id = t.id
+            WHERE sc.tenant_id = %s
+            AND sc.checkpoint_at < NOW() - INTERVAL '%s hours'
+            AND t.status NOT IN ('done', 'deleted')
+            ORDER BY sc.checkpoint_at ASC
+        ''', (DEFAULT_TENANT, hours))
+
+        orphaned = []
+        for row in cur.fetchall():
+            orphaned.append({
+                'task_id': str(row['task_id']),
+                'instance_id': row['instance_id'],
+                'progress': row['progress'],
+                'next_step': row['next_step'],
+                'checkpoint_at': str(row['checkpoint_at']),
+                'task_description': row['task_description'],
+                'task_status': row['task_status'],
+                'branch': row['branch'],
+                'context_snapshot': row['context_snapshot'] if row['context_snapshot'] else {}
+            })
+
+        cur.close()
+
+        return jsonify({
+            'orphaned': orphaned,
+            'count': len(orphaned),
+            'threshold_hours': hours
+        }), 200
+
+    except Exception as e:
         cur.close()
         return jsonify({'error': str(e)}), 500
 
@@ -4829,6 +5036,33 @@ MCP_TOOLS = [
             "required": ["blob"]
         }
     },
+    # Session Checkpoint Tools
+    {
+        "name": "boswell_checkpoint",
+        "description": "Save a session checkpoint for crash recovery. Captures WHERE you are in a task (progress, next step, context). UPSERT semantics - one checkpoint per task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Task ID to checkpoint"},
+                "instance_id": {"type": "string", "description": "Your instance identifier (e.g., 'CC1', 'CW-Opus')"},
+                "progress": {"type": "string", "description": "Human-readable progress description"},
+                "next_step": {"type": "string", "description": "What to do next on resume"},
+                "context_snapshot": {"type": "object", "description": "Arbitrary context data to preserve"}
+            },
+            "required": ["task_id"]
+        }
+    },
+    {
+        "name": "boswell_resume",
+        "description": "Get a checkpoint for a task if one exists. Use to resume work after crash or context loss.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Task ID to resume"}
+            },
+            "required": ["task_id"]
+        }
+    },
 ]
 
 def mcp_error_response(req_id, code, message):
@@ -5043,7 +5277,22 @@ def dispatch_mcp_tool(tool_name, args):
             path=f'/v2/trails/to/{blob}',
             view_args={"target_blob": blob}
         )
-    
+
+    # ===== SESSION CHECKPOINT TOOLS =====
+
+    elif tool_name == "boswell_checkpoint":
+        json_data = {
+            "task_id": args["task_id"],
+            "instance_id": args.get("instance_id"),
+            "progress": args.get("progress"),
+            "next_step": args.get("next_step"),
+            "context_snapshot": args.get("context_snapshot", {})
+        }
+        return invoke_view(create_checkpoint, method='POST', json_data=json_data)
+
+    elif tool_name == "boswell_resume":
+        return invoke_view(get_checkpoint, query_string={"task_id": args["task_id"]})
+
     else:
         return {"error": f"Unknown tool: {tool_name}"}, 400
 
