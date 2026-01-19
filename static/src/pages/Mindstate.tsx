@@ -606,26 +606,26 @@ export default function Mindstate() {
 
       if (memoryNodes.length === 0) return;
 
-      // Calculate timeline positions
-      const padding = 100;
-      const timelineWidth = Math.max(memoryNodes.length * 40, width * 2);
-      const centerY = height / 2;
+      // Calculate timeline positions - centered around origin
+      const spacing = 40;
+      const totalWidth = (memoryNodes.length - 1) * spacing;
 
       memoryNodes.forEach((node: any, i: number) => {
-        node.fx = padding + (i * (timelineWidth - 2 * padding) / Math.max(memoryNodes.length - 1, 1));
-        node.fy = centerY + (Math.sin(i * 0.3) * 30); // Slight wave for visual interest
+        node.fx = -totalWidth / 2 + i * spacing;
+        node.fy = Math.sin(i * 0.3) * 30; // Slight wave for visual interest
       });
 
       // Hide hub nodes
       nodesRef.current.filter((n: any) => n.type === 'hub').forEach((node: any) => {
-        node.fx = -1000;
-        node.fy = -1000;
+        node.fx = -5000;
+        node.fy = -5000;
       });
 
-      // Zoom to fit timeline
+      // Zoom to fit timeline - translate to center of viewport
+      const scale = Math.min(width / (totalWidth + 200), height / 200, 1) * 0.85;
       const transform = d3.zoomIdentity
-        .translate(0, 0)
-        .scale(Math.min(width / timelineWidth, 1) * 0.9);
+        .translate(width / 2, height / 2)
+        .scale(scale);
 
       svg.transition().duration(750).call(zoom.transform, transform);
     } else {
