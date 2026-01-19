@@ -3169,6 +3169,145 @@ def halt_status():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/tasks/backfill-memory', methods=['POST'])
+def backfill_tasks_to_memory():
+    """Backfill existing tasks into memory system for semantic search.
+    
+    Tasks created before dual-write are orphaned from semantic search.
+    This creates memory commits for all tasks missing the task:{id} tag.
+    """
+    db = get_db()
+    cur = get_cursor()
+    
+    backfilled = 0
+    skipped = 0
+    errors = []
+    
+    try:
+        # Get all tasks
+        cur.execute('''
+            SELECT id, description, branch, assigned_to, status, priority, metadata, created_at
+            FROM tasks
+            WHERE tenant_id = %s
+            ORDER BY created_at ASC
+        ''', (DEFAULT_TENANT,))
+        
+        tasks = cur.fetchall()
+        
+        for task in tasks:
+            task_id = str(task['id'])
+            
+            # Check if already has memory
+            cur.execute('''
+                SELECT 1 FROM tags 
+                WHERE tenant_id = %s AND tag = %s
+                LIMIT 1
+            ''', (DEFAULT_TENANT, f"task:{task_id}"))
+            
+            if cur.fetchone():
+                skipped += 1
+                continue
+            
+            try:
+                branch = task['branch'] or 'command-center'
+                created_at = task['created_at'].isoformat() + 'Z' if task['created_at'] else datetime.utcnow().isoformat() + 'Z'
+                
+                # Build memory content
+                metadata = task['metadata'] if task['metadata'] else {}
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                    
+                memory_content = {
+                    'type': 'task_created',
+                    'task_id': task_id,
+                    'description': task['description'],
+                    'branch': branch,
+                    'priority': task['priority'],
+                    'assigned_to': task['assigned_to'],
+                    'status': task['status'],
+                    'metadata': metadata
+                }
+                content_str = json.dumps(memory_content)
+                blob_hash = compute_hash(content_str)
+                
+                # Insert blob
+                cur.execute('''
+                    INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (blob_hash) DO NOTHING
+                ''', (blob_hash, DEFAULT_TENANT, content_str, 'task', created_at, len(content_str)))
+                
+                # Generate and store embedding
+                embedding = generate_embedding(content_str)
+                if embedding:
+                    cur.execute('''
+                        UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s
+                    ''', (embedding, blob_hash, DEFAULT_TENANT))
+                
+                # Create tree entry
+                tree_hash = compute_hash(f"{branch}:{blob_hash}:{created_at}")
+                message = f"TASK: {task['description'][:80]}{'...' if len(task['description']) > 80 else ''}"
+                
+                cur.execute('''
+                    INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
+                    VALUES (%s, %s, %s, %s, %s)
+                ''', (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'task'))
+                
+                # Get branch head
+                cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+                branch_row = cur.fetchone()
+                
+                if branch_row:
+                    parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
+                else:
+                    cur.execute('''
+                        INSERT INTO branches (tenant_id, name, head_commit, created_at)
+                        VALUES (%s, %s, %s, %s)
+                    ''', (DEFAULT_TENANT, branch, 'GENESIS', created_at))
+                    parent_hash = None
+                
+                # Create commit
+                commit_data = f"{tree_hash}:{parent_hash}:{message}:{created_at}"
+                commit_hash = compute_hash(commit_data)
+                
+                cur.execute('''
+                    INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ''', (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'backfill', message, created_at))
+                
+                # Update branch head
+                cur.execute('''
+                    UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s
+                ''', (commit_hash, branch, DEFAULT_TENANT))
+                
+                # Add tag
+                cur.execute('''
+                    INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+                    VALUES (%s, %s, %s, %s)
+                ''', (DEFAULT_TENANT, blob_hash, f"task:{task_id}", created_at))
+                
+                backfilled += 1
+                
+            except Exception as e:
+                errors.append({'task_id': task_id, 'error': str(e)})
+        
+        db.commit()
+        cur.close()
+        
+        return jsonify({
+            'status': 'complete',
+            'backfilled': backfilled,
+            'skipped': skipped,
+            'errors': errors,
+            'total_tasks': len(tasks)
+        })
+        
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 # ==================== TRAILS (Memory Path Tracking) ====================
 
 def ensure_trails_table():
