@@ -6,7 +6,7 @@ Phase 3 Migration: Add audit logging to Boswell
 3. Test audit logging
 
 Run with:
-  DATABASE_URL='postgresql://...' python run_phase3_migration.py
+  DATABASE_URL='***REMOVED***python run_phase3_migration.py
 """
 
 import os
@@ -17,8 +17,7 @@ import psycopg2
 POSTGRES_URL = os.environ.get('DATABASE_URL')
 if not POSTGRES_URL:
     print("ERROR: DATABASE_URL environment variable not set!")
-    print("Set it with: export DATABASE_URL='postgresql://...'")
-    sys.exit(1)
+    print("Set it with: export DATABASE_URL='***REMOVED***    sys.exit(1)
 
 DEFAULT_TENANT = '00000000-0000-0000-0000-000000000001'
 

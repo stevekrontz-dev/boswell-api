@@ -26,8 +26,7 @@ from encryption_service import (
 POSTGRES_URL = os.environ.get('DATABASE_URL')
 if not POSTGRES_URL:
     print("ERROR: DATABASE_URL environment variable not set!")
-    print("Set it with: export DATABASE_URL='postgresql://...'")
-    sys.exit(1)
+    print("Set it with: export DATABASE_URL='***REMOVED***    sys.exit(1)
 DEFAULT_TENANT = '00000000-0000-0000-0000-000000000001'
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), 'service-account-key.json')
 
