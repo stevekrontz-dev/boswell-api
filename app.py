@@ -421,10 +421,15 @@ def create_branch():
     db = get_db()
     cur = get_cursor()
 
-    cur.execute('SELECT name FROM branches WHERE name = %s AND tenant_id = %s', (name, tenant_id))
-    if cur.fetchone():
+    cur.execute('SELECT name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (name, tenant_id))
+    existing = cur.fetchone()
+    if existing:
         cur.close()
-        return jsonify({'error': f'Branch {name} already exists'}), 409
+        existing_name = existing['name']
+        if existing_name == name:
+            return jsonify({'error': f'Branch {name} already exists'}), 409
+        else:
+            return jsonify({'error': f'Branch name conflicts with existing branch \'{existing_name}\' (case-insensitive match)'}), 409
 
     cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (from_branch, tenant_id))
     source = cur.fetchone()
