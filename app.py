@@ -3720,7 +3720,7 @@ def list_orphaned_checkpoints():
             JOIN tasks t ON sc.task_id = t.id
             WHERE sc.tenant_id = %s
             AND sc.checkpoint_at < NOW() - INTERVAL '%s hours'
-            AND t.status NOT IN ('done', 'deleted')
+            AND t.status != 'done'
             ORDER BY sc.checkpoint_at ASC
         ''', (DEFAULT_TENANT, hours))
 
