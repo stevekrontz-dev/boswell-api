@@ -2520,10 +2520,13 @@ def admin_alerts():
 
 @app.route('/v2/tasks', methods=['POST'])
 def create_task():
-    """Create a new task for agent coordination."""
+    """Create a new task for agent coordination.
+    
+    Also creates a memory commit to make the task discoverable via semantic search.
+    """
     data = request.get_json() or {}
     description = data.get('description')
-    branch = data.get('branch')
+    branch = data.get('branch', 'command-center')
     assigned_to = data.get('assigned_to')
     priority = data.get('priority', 5)
     deadline = data.get('deadline')
@@ -2534,8 +2537,10 @@ def create_task():
 
     db = get_db()
     cur = get_cursor()
+    now = datetime.utcnow().isoformat() + 'Z'
 
     try:
+        # 1. Insert task into task queue
         cur.execute(
             '''INSERT INTO tasks (tenant_id, description, branch, assigned_to, status, priority, deadline, metadata)
                VALUES (%s, %s, %s, %s, 'open', %s, %s, %s)
@@ -2545,12 +2550,93 @@ def create_task():
         row = cur.fetchone()
         task_id = str(row['id'])
         created_at = str(row['created_at'])
+
+        # 2. Create memory commit for discoverability
+        memory_content = {
+            'type': 'task_created',
+            'task_id': task_id,
+            'description': description,
+            'branch': branch,
+            'priority': priority,
+            'assigned_to': assigned_to,
+            'metadata': metadata
+        }
+        content_str = json.dumps(memory_content)
+        blob_hash = compute_hash(content_str)
+
+        # Insert blob
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, DEFAULT_TENANT, content_str, 'task', now, len(content_str))
+        )
+
+        # Generate embedding for semantic search
+        embedding = generate_embedding(content_str)
+        if embedding:
+            try:
+                cur.execute(
+                    '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
+                    (embedding, blob_hash, DEFAULT_TENANT)
+                )
+            except Exception as e:
+                print(f"[TASK] Failed to store embedding: {e}", file=sys.stderr)
+
+        # Create tree entry
+        tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
+        message = f"TASK: {description[:80]}{'...' if len(description) > 80 else ''}"
+        cur.execute(
+            '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
+               VALUES (%s, %s, %s, %s, %s)''',
+            (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'task')
+        )
+
+        # Get parent commit
+        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        branch_row = cur.fetchone()
+        if branch_row:
+            parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
+        else:
+            # Auto-create branch
+            cur.execute(
+                '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
+                   VALUES (%s, %s, %s, %s)''',
+                (DEFAULT_TENANT, branch, 'GENESIS', now)
+            )
+            parent_hash = None
+
+        # Create commit
+        commit_data = f"{tree_hash}:{parent_hash}:{message}:{now}"
+        commit_hash = compute_hash(commit_data)
+
+        cur.execute(
+            '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+            (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'task-system', message, now)
+        )
+
+        # Update branch head
+        cur.execute(
+            'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
+            (commit_hash, branch, DEFAULT_TENANT)
+        )
+
+        # Add task_id tag for easy lookup
+        cur.execute(
+            '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+               VALUES (%s, %s, %s, %s)''',
+            (DEFAULT_TENANT, blob_hash, f"task:{task_id}", now)
+        )
+
         db.commit()
         cur.close()
 
         return jsonify({
             'status': 'created',
             'task_id': task_id,
+            'commit_hash': commit_hash,
+            'blob_hash': blob_hash,
             'description': description,
             'branch': branch,
             'assigned_to': assigned_to,
