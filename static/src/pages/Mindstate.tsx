@@ -593,149 +593,7 @@ export default function Mindstate() {
     svg.transition().duration(750).call(zoom.transform, transform);
   }, [currentBranch]);
 
-  // Handle view mode toggle (graph vs timeline)
-  useEffect(() => {
-    console.log('[Timeline] Effect triggered, viewMode:', viewMode);
-    console.log('[Timeline] Guards:', {
-      svg: !!svgRef.current,
-      zoom: !!zoomRef.current,
-      g: !!gRef.current,
-      sim: !!simulationRef.current,
-      memoriesCount: memories.length,
-      memoriesWithDate: memories.filter(m => m.createdAt).length
-    });
-
-    if (!svgRef.current || !zoomRef.current || !gRef.current || !simulationRef.current) {
-      console.log('[Timeline] Early return - missing refs');
-      return;
-    }
-
-    const svg = d3.select(svgRef.current);
-    const zoom = zoomRef.current;
-    const g = gRef.current;
-    const simulation = simulationRef.current;
-    const width = svgRef.current.clientWidth;
-    const height = svgRef.current.clientHeight;
-
-    // Remove any existing timeline elements
-    g.selectAll('.timeline-group').remove();
-
-    if (viewMode === 'timeline') {
-      console.log('[Timeline] Creating timeline view...');
-      // Stop simulation and hide graph elements
-      simulation.stop();
-      g.selectAll('line').style('opacity', 0);
-      g.selectAll('g').filter(':not(.timeline-group)').style('opacity', 0);
-
-      // Get sorted memories with dates
-      const timelineData = memories
-        .filter(m => m.createdAt)
-        .sort((a, b) => new Date(a.createdAt!).getTime() - new Date(b.createdAt!).getTime());
-
-      if (timelineData.length === 0) return;
-
-      // Timeline dimensions
-      const timelineY = height / 2;
-      const padding = 80;
-      const nodeSpacing = Math.max((width - 2 * padding) / Math.max(timelineData.length - 1, 1), 60);
-      const totalWidth = Math.max((timelineData.length - 1) * nodeSpacing + 2 * padding, width);
-
-      // Create timeline group
-      const timelineGroup = g.append('g').attr('class', 'timeline-group');
-
-      // Main horizontal line
-      timelineGroup.append('line')
-        .attr('x1', 0)
-        .attr('y1', timelineY)
-        .attr('x2', totalWidth)
-        .attr('y2', timelineY)
-        .attr('stroke', '#3a4a5a')
-        .attr('stroke-width', 2);
-
-      // Draw each event
-      timelineData.forEach((memory, i) => {
-        const x = padding + i * nodeSpacing;
-        const isAbove = i % 2 === 0;
-        const verticalOffset = isAbove ? -60 : 60;
-        const labelOffset = isAbove ? -80 : 95;
-        const dateOffset = isAbove ? -100 : 115;
-
-        // Vertical connector line
-        timelineGroup.append('line')
-          .attr('x1', x)
-          .attr('y1', timelineY)
-          .attr('x2', x)
-          .attr('y2', timelineY + verticalOffset)
-          .attr('stroke', '#3a4a5a')
-          .attr('stroke-width', 1);
-
-        // Outer circle (ring)
-        timelineGroup.append('circle')
-          .attr('cx', x)
-          .attr('cy', timelineY + verticalOffset)
-          .attr('r', 12)
-          .attr('fill', 'none')
-          .attr('stroke', memory.color)
-          .attr('stroke-width', 2);
-
-        // Inner circle (filled)
-        timelineGroup.append('circle')
-          .attr('cx', x)
-          .attr('cy', timelineY + verticalOffset)
-          .attr('r', 7)
-          .attr('fill', memory.color)
-          .attr('cursor', 'pointer')
-          .on('click', () => {
-            setSelectedMemory(memory as any);
-            setThoughtBubble({
-              memory: memory as any,
-              x: x,
-              y: timelineY + verticalOffset,
-              connections: []
-            });
-          });
-
-        // Date label
-        const date = new Date(memory.createdAt!);
-        const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        timelineGroup.append('text')
-          .attr('x', x)
-          .attr('y', timelineY + dateOffset)
-          .attr('text-anchor', 'middle')
-          .attr('fill', '#8a9aaa')
-          .attr('font-size', '11px')
-          .attr('font-weight', '600')
-          .text(dateStr);
-
-        // Memory label (truncated)
-        const label = (memory.preview || '').replace(/[{}"]/g, '').substring(0, 30);
-        timelineGroup.append('text')
-          .attr('x', x)
-          .attr('y', timelineY + labelOffset)
-          .attr('text-anchor', 'middle')
-          .attr('fill', '#6a7a8a')
-          .attr('font-size', '9px')
-          .text(label + (label.length >= 30 ? '...' : ''));
-      });
-
-      // Zoom to fit timeline
-      const scale = Math.min(width / totalWidth, 1) * 0.9;
-      const transform = d3.zoomIdentity
-        .translate((width - totalWidth * scale) / 2, 0)
-        .scale(scale);
-      svg.transition().duration(500).call(zoom.transform, transform);
-
-    } else {
-      // Show graph elements and restart simulation
-      g.selectAll('line').style('opacity', 1);
-      g.selectAll('g').filter(':not(.timeline-group)').style('opacity', 1);
-      simulation.alpha(0.3).restart();
-
-      // Reset zoom
-      const transform = d3.zoomIdentity.translate(0, 0).scale(1);
-      svg.transition().duration(500).call(zoom.transform, transform);
-    }
-  }, [viewMode, memories, branches]);
+  // Timeline is now rendered as a React component, no D3 manipulation needed
 
   const filteredMemories = memories.filter(m => {
     const matchBranch = currentBranch === 'all' || m.branch === currentBranch;
@@ -792,7 +650,71 @@ export default function Mindstate() {
     <div className="flex flex-col md:flex-row h-[calc(100vh-3.5rem)] md:h-[calc(100vh-4rem)] bg-[#0c0c10] overflow-hidden">
       {/* Graph Panel */}
       <div className="flex-1 relative min-h-[50vh] md:min-h-0">
-        <svg ref={svgRef} className="w-full h-full touch-none" />
+        {/* Graph View */}
+        <svg ref={svgRef} className={`w-full h-full touch-none ${viewMode === 'timeline' ? 'hidden' : ''}`} />
+
+        {/* Timeline View */}
+        {viewMode === 'timeline' && (
+          <div className="w-full h-full overflow-x-auto overflow-y-hidden bg-[#0a0a0e]">
+            <div className="relative min-w-max h-full flex items-center px-20">
+              {/* Horizontal line */}
+              <div className="absolute left-0 right-0 h-0.5 bg-gray-700" style={{ top: '50%' }} />
+
+              {/* Timeline nodes */}
+              {memories
+                .filter(m => m.createdAt)
+                .sort((a, b) => new Date(a.createdAt!).getTime() - new Date(b.createdAt!).getTime())
+                .map((memory, i) => {
+                  const isAbove = i % 2 === 0;
+                  return (
+                    <div
+                      key={memory.id}
+                      className="relative flex flex-col items-center mx-4"
+                      style={{ minWidth: '80px' }}
+                    >
+                      {/* Content above/below line */}
+                      <div className={`flex flex-col items-center ${isAbove ? 'order-1' : 'order-3'}`}>
+                        {/* Date */}
+                        <span className="text-[10px] text-gray-500 font-semibold mb-1">
+                          {new Date(memory.createdAt!).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                        </span>
+                        {/* Label */}
+                        <span className="text-[9px] text-gray-600 text-center max-w-[70px] truncate">
+                          {memory.memoryType}
+                        </span>
+                      </div>
+
+                      {/* Vertical connector */}
+                      <div
+                        className={`w-px bg-gray-600 order-2 ${isAbove ? 'h-10' : 'h-10'}`}
+                      />
+
+                      {/* Circle on the line */}
+                      <div
+                        className="order-2 w-4 h-4 rounded-full border-2 cursor-pointer hover:scale-125 transition-transform"
+                        style={{
+                          backgroundColor: memory.color,
+                          borderColor: memory.color,
+                        }}
+                        onClick={() => {
+                          setSelectedMemory(memory as any);
+                          setThoughtBubble({
+                            memory: memory as any,
+                            x: 400,
+                            y: 300,
+                            connections: []
+                          });
+                        }}
+                      />
+
+                      {/* Spacer for opposite side */}
+                      <div className={`h-16 ${isAbove ? 'order-3' : 'order-1'}`} />
+                    </div>
+                  );
+                })}
+            </div>
+          </div>
+        )}
 
         {/* Stats overlay */}
         <div className="absolute top-4 left-4 md:top-6 md:left-6 bg-[#0c0c10]/90 backdrop-blur-sm border border-gray-700/30 rounded-lg p-3 md:p-4 text-xs text-gray-500">
