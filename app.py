@@ -3292,11 +3292,12 @@ def backfill_tasks_to_memory():
                 ''', (DEFAULT_TENANT, blob_hash, f"task:{task_id}", created_at))
                 
                 backfilled += 1
+                db.commit()  # Commit each successful task
                 
             except Exception as e:
+                db.rollback()  # Rollback failed task
                 errors.append({'task_id': task_id, 'error': str(e)})
         
-        db.commit()
         cur.close()
         
         return jsonify({
