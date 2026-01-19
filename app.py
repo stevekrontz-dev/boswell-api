@@ -2804,9 +2804,32 @@ def delete_task(task_id):
         return jsonify({'error': str(e)}), 500
 
 
+def ensure_task_claims_table():
+    """Create task_claims table if it doesn't exist."""
+    cur = get_cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS task_claims (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+            task_id UUID NOT NULL,
+            instance_id VARCHAR(100) NOT NULL,
+            claimed_at TIMESTAMPTZ DEFAULT NOW(),
+            released_at TIMESTAMPTZ,
+            release_reason VARCHAR(50),
+            UNIQUE(tenant_id, task_id, instance_id, claimed_at)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_task_claims_instance ON task_claims(instance_id)')
+    get_db().commit()
+    cur.close()
+
+
 @app.route('/v2/tasks/<task_id>/claim', methods=['POST'])
 def claim_task(task_id):
     """Claim a task for an agent instance. Includes collision detection."""
+    ensure_task_claims_table()
+    
     data = request.get_json() or {}
     instance_id = data.get('instance_id')
 
@@ -2901,6 +2924,8 @@ def claim_task(task_id):
 @app.route('/v2/tasks/<task_id>/release', methods=['POST'])
 def release_task(task_id):
     """Release a task claim."""
+    ensure_task_claims_table()
+    
     data = request.get_json() or {}
     instance_id = data.get('instance_id')
     reason = data.get('reason', 'manual')  # completed, blocked, timeout, manual
