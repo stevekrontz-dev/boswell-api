@@ -554,7 +554,24 @@ def get_subscription():
     cur = get_cursor()
 
     try:
-        # Get subscription record (may not exist if table not created)
+        # First check users table (source of truth for plan from Stripe webhooks)
+        plan_id = None
+        try:
+            cur.execute("""
+                SELECT plan FROM users
+                WHERE tenant_id = %s AND status = 'active'
+                LIMIT 1
+            """, (tenant_id,))
+            user_row = cur.fetchone()
+            if user_row and user_row.get('plan'):
+                plan_id = user_row['plan']
+        except Exception as e:
+            print(f"[BILLING] Users table query error: {e}", flush=True)
+
+        # Get subscription record for period dates (may not exist)
+        stripe_sub_id = None
+        period_start = None
+        period_end = None
         try:
             cur.execute("""
                 SELECT plan_id, status, stripe_subscription_id,
@@ -562,23 +579,20 @@ def get_subscription():
                 FROM subscriptions WHERE tenant_id = %s
             """, (tenant_id,))
             row = cur.fetchone()
+            if row:
+                stripe_sub_id = row['stripe_subscription_id']
+                period_start = row['current_period_start']
+                period_end = row['current_period_end']
+                # Use subscriptions plan_id only if users table didn't have one
+                if not plan_id:
+                    plan_id = row['plan_id']
         except Exception as e:
             print(f"[BILLING] Subscription table query error: {e}", flush=True)
-            row = None
 
-        if row:
-            plan_id = row['plan_id']
-            status = row['status']
-            stripe_sub_id = row['stripe_subscription_id']
-            period_start = row['current_period_start']
-            period_end = row['current_period_end']
-        else:
-            # No subscription record = free tier
+        # Default to free if no plan found anywhere
+        if not plan_id:
             plan_id = 'free'
-            status = 'active'
-            stripe_sub_id = None
-            period_start = None
-            period_end = None
+        status = 'active'
 
         plan = PLANS.get(plan_id, PLANS['free'])
         limits = get_plan_limits(plan_id)
