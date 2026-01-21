@@ -3408,7 +3408,8 @@ def resume_tasks():
                 WHERE table_name = 'halt_state'
             )
         ''')
-        if not cur.fetchone()[0]:
+        row = cur.fetchone()
+        if not (row and row.get('exists', False)):
             cur.close()
             return jsonify({'status': 'not_halted', 'message': 'System was not halted'})
 
@@ -3451,7 +3452,8 @@ def halt_status():
                 WHERE table_name = 'halt_state'
             )
         ''')
-        if not cur.fetchone()[0]:
+        row = cur.fetchone()
+        if not (row and row.get('exists', False)):
             cur.close()
             return jsonify({'halted': False})
 
