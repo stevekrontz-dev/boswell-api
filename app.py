@@ -60,6 +60,10 @@ CORS(app)
 ENCRYPTION_ENABLED = os.environ.get('ENCRYPTION_ENABLED', 'false').lower() == 'true'
 CREDENTIALS_PATH = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'service-account-key.json')
 
+# Auth0 OAuth 2.1 Configuration
+AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', '')
+AUTH0_AUDIENCE = os.environ.get('AUTH0_AUDIENCE', 'https://delightful-imagination-production-f6a1.up.railway.app')
+
 _encryption_service = None
 _active_dek = None  # (key_id, wrapped_dek)
 
@@ -154,8 +158,14 @@ AUDIT_ENABLED = os.environ.get('AUDIT_ENABLED', 'true').lower() == 'true'
 
 @app.before_request
 def before_request():
-    """Start timing for audit logging."""
+    """Start timing for audit logging + MCP auth check."""
     g.audit_start = time.time()
+
+    # MCP Auth check (OAuth 2.1 / internal / API key)
+    from auth import check_mcp_auth
+    result = check_mcp_auth(get_cursor)
+    if result:
+        return result
 
 @app.after_request
 def after_request(response):
@@ -258,6 +268,24 @@ def health_check():
             'status': 'error',
             'error': str(e)
         }), 500
+
+# ==================== OAUTH DISCOVERY ====================
+
+@app.route('/.well-known/oauth-protected-resource', methods=['GET'])
+def oauth_protected_resource():
+    """RFC 9728 - Protected Resource Metadata for MCP Connectors."""
+    if not AUTH0_DOMAIN:
+        return jsonify({
+            'error': 'auth_not_configured',
+            'message': 'AUTH0_DOMAIN not set'
+        }), 503
+
+    return jsonify({
+        'resource': AUTH0_AUDIENCE,
+        'authorization_servers': [f'https://{AUTH0_DOMAIN}'],
+        'scopes_supported': ['boswell:read', 'boswell:write', 'boswell:admin'],
+        'bearer_methods_supported': ['header']
+    })
 
 @app.route('/v2/head', methods=['GET'])
 def get_head():

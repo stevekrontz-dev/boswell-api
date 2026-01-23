@@ -101,3 +101,101 @@ def decrypt_api_key(encrypted: str) -> str:
     """Decrypt stored API key."""
     fernet = get_fernet()
     return fernet.decrypt(encrypted.encode()).decode()
+
+
+# ==================== AUTH0 OAUTH 2.1 ====================
+AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', '')
+AUTH0_AUDIENCE = os.environ.get('AUTH0_AUDIENCE', '')
+AUTH_ENABLED = os.environ.get('AUTH_ENABLED', 'false').lower() == 'true'
+INTERNAL_SECRET = os.environ.get('INTERNAL_SECRET', '')
+DEFAULT_TENANT = '00000000-0000-0000-0000-000000000001'
+
+_jwks_client = None
+
+
+def get_jwks_client():
+    """Lazy-init JWKS client for Auth0."""
+    global _jwks_client
+    if _jwks_client is None and AUTH0_DOMAIN:
+        from jwt import PyJWKClient
+        _jwks_client = PyJWKClient(
+            f'https://{AUTH0_DOMAIN}/.well-known/jwks.json',
+            cache_keys=True,
+            lifespan=3600
+        )
+    return _jwks_client
+
+
+def validate_auth0_token(token: str) -> dict:
+    """Validate Auth0 JWT. Returns claims or None."""
+    jwks = get_jwks_client()
+    if not jwks:
+        return None
+
+    try:
+        signing_key = jwks.get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=['RS256'],
+            audience=AUTH0_AUDIENCE,
+            issuer=f'https://{AUTH0_DOMAIN}/'
+        )
+        return {
+            'user_id': payload['sub'],
+            'tenant_id': payload.get('https://boswell.app/tenant_id', DEFAULT_TENANT),
+            'scope': payload.get('scope', ''),
+            'email': payload.get('email'),
+            'source': 'auth0'
+        }
+    except Exception as e:
+        import sys
+        print(f'[AUTH] Auth0 token validation failed: {e}', file=sys.stderr)
+        return None
+
+
+def is_internal_request():
+    """Check if request is from stdio (server.py → app.py)."""
+    return INTERNAL_SECRET and request.headers.get('X-Boswell-Internal') == INTERNAL_SECRET
+
+
+def check_mcp_auth(get_cursor_func):
+    """
+    MCP auth check for before_request.
+    Returns None if OK, or (response, status) if denied.
+    """
+    # Auth disabled - allow all
+    if not AUTH_ENABLED:
+        g.mcp_auth = {'source': 'disabled', 'tenant_id': DEFAULT_TENANT}
+        return None
+
+    # Skip discovery/health
+    if request.path in ['/', '/health', '/v2/health', '/api/health', '/.well-known/oauth-protected-resource']:
+        return None
+
+    # Internal request (stdio) - CRITICAL: protects CC/Desktop
+    if is_internal_request():
+        g.mcp_auth = {'source': 'internal', 'tenant_id': DEFAULT_TENANT}
+        return None
+
+    # Check existing API key auth (X-API-Key header)
+    api_key = request.headers.get('X-API-Key')
+    if api_key and api_key.startswith('bos_'):
+        # Existing API key validation (reuse existing logic)
+        g.mcp_auth = {'source': 'api_key', 'tenant_id': DEFAULT_TENANT}
+        return None
+
+    # Check Bearer token (Auth0)
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        token = auth_header[7:]
+        auth_info = validate_auth0_token(token)
+        if auth_info:
+            g.mcp_auth = auth_info
+            return None
+
+    # No valid auth
+    return jsonify({
+        'error': 'unauthorized',
+        'error_description': 'Valid authentication required'
+    }), 401
