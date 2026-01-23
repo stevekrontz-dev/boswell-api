@@ -19,6 +19,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 import time
+import math
 import numpy as np
 
 # OpenAI for embeddings (v3)
@@ -1559,6 +1560,90 @@ def semantic_startup():
                     'distance': float(row['distance'])
                 })
 
+    # Boost semantic scores by trail strength (hot paths surface higher)
+    hot_memories = []
+    try:
+        # Get trail strength for each blob in relevant_memories
+        if relevant_memories:
+            blob_hashes = [m['blob_hash'] for m in relevant_memories]
+            placeholders = ','.join(['%s'] * len(blob_hashes))
+            cur.execute(f"""
+                SELECT blob_hash, SUM(strength) as total_strength
+                FROM (
+                    SELECT source_blob as blob_hash, strength FROM trails
+                    WHERE tenant_id = %s AND source_blob IN ({placeholders})
+                    UNION ALL
+                    SELECT target_blob as blob_hash, strength FROM trails
+                    WHERE tenant_id = %s AND target_blob IN ({placeholders})
+                ) t
+                GROUP BY blob_hash
+            """, (DEFAULT_TENANT, *blob_hashes, DEFAULT_TENANT, *blob_hashes))
+
+            trail_strengths = {row['blob_hash']: float(row['total_strength']) for row in cur.fetchall()}
+
+            # Boost scores: lower distance = higher relevance
+            # Formula: adjusted = distance * (1 / (1 + log(1 + strength)))
+            for mem in relevant_memories:
+                strength = trail_strengths.get(mem['blob_hash'], 0)
+                if strength > 0:
+                    boost_factor = 1 / (1 + math.log(1 + strength))
+                    mem['original_distance'] = mem['distance']
+                    mem['distance'] = mem['distance'] * boost_factor
+                    mem['trail_strength'] = strength
+                    mem['boosted'] = True
+
+            # Re-sort by adjusted distance
+            relevant_memories.sort(key=lambda m: m['distance'])
+
+        # Get hot memories (most traversed, independent of semantic search)
+        cur.execute("""
+            SELECT blob_hash, SUM(strength) as total_strength, SUM(traversal_count) as total_traversals
+            FROM (
+                SELECT source_blob as blob_hash, strength, traversal_count FROM trails WHERE tenant_id = %s
+                UNION ALL
+                SELECT target_blob as blob_hash, strength, traversal_count FROM trails WHERE tenant_id = %s
+            ) t
+            GROUP BY blob_hash
+            ORDER BY total_strength DESC
+            LIMIT 5
+        """, (DEFAULT_TENANT, DEFAULT_TENANT))
+
+        hot_blob_hashes = []
+        hot_strengths = {}
+        for row in cur.fetchall():
+            hot_blob_hashes.append(row['blob_hash'])
+            hot_strengths[row['blob_hash']] = {
+                'strength': float(row['total_strength']),
+                'traversals': int(row['total_traversals'])
+            }
+
+        # Fetch memory details for hot blobs
+        if hot_blob_hashes:
+            placeholders = ','.join(['%s'] * len(hot_blob_hashes))
+            cur.execute(f"""
+                SELECT b.blob_hash, substring(b.content, 1, 300) as preview, c.message
+                FROM blobs b
+                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                WHERE b.tenant_id = %s AND b.blob_hash IN ({placeholders})
+            """, (DEFAULT_TENANT, *hot_blob_hashes))
+
+            blob_details = {row['blob_hash']: row for row in cur.fetchall()}
+
+            for blob_hash in hot_blob_hashes:
+                if blob_hash in blob_details:
+                    row = blob_details[blob_hash]
+                    hot_memories.append({
+                        'blob_hash': blob_hash,
+                        'preview': row['preview'],
+                        'message': row['message'],
+                        'trail_strength': hot_strengths[blob_hash]['strength'],
+                        'traversal_count': hot_strengths[blob_hash]['traversals']
+                    })
+    except Exception as e:
+        # trails table might not exist - that's ok
+        pass
+
     # Get open tasks (priority 1-3 = high, show first)
     # If agent_id provided, show: their assigned tasks + unassigned tasks
     # If no agent_id, show all open tasks
@@ -1630,6 +1715,7 @@ def semantic_startup():
         'sacred_manifest': sacred_manifest,
         'tool_registry': tool_registry,
         'relevant_memories': relevant_memories,
+        'hot_memories': hot_memories,
         'open_tasks': open_tasks,
         'context_used': context,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
