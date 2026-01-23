@@ -868,7 +868,6 @@ export default function Mindstate() {
                   {narrateMemory(m.preview).narrative.substring(0, 70)}
                 </div>
                 <div className="text-[9px] text-gray-600 flex gap-3">
-                  <span className="font-mono text-blue-400/60">{m.id}</span>
                   <span className="text-green-400/50">{branches[m.branch]?.label || m.branch}</span>
                   {m.createdAt && <span className="text-gray-600">{formatRelativeTime(m.createdAt)}</span>}
                 </div>
@@ -877,20 +876,132 @@ export default function Mindstate() {
           ))}
         </div>
 
-        {/* Detail drawer */}
-        {selectedMemory && (
-          <div className="border-t border-gray-700/20 bg-[#08080c] max-h-72 overflow-hidden">
-            <div className="px-4 md:px-5 py-3 flex justify-between items-center border-b border-gray-700/10">
-              <h4 className="text-gray-500 font-serif text-sm">Memory Content</h4>
-              <button onClick={() => setSelectedMemory(null)} className="text-gray-600 hover:text-gray-400 p-1">×</button>
+        {/* Detail drawer - semantic view */}
+        {selectedMemory && (() => {
+          const { narrative } = narrateMemory(selectedMemory.preview);
+
+          // Parse content for structured display
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(selectedMemory.content);
+          } catch {
+            try {
+              if (selectedMemory.content.includes('"type"')) {
+                parsed = JSON.parse(`{${selectedMemory.content}}`);
+              }
+            } catch { /* not JSON */ }
+          }
+
+          // Extract meaningful fields
+          const why = parsed?.why || parsed?.reasoning || parsed?.rationale || parsed?.purpose;
+          const context = parsed?.context || parsed?.background;
+          const outcome = parsed?.outcome || parsed?.result || parsed?.achievement;
+          const decision = parsed?.decision || parsed?.choice;
+          const lesson = parsed?.lesson || parsed?.insight || parsed?.learning;
+          const action = parsed?.action || parsed?.next_step || parsed?.todo;
+
+          // Find connected memories
+          const connections: Array<{ memory: Memory; type: string; reasoning?: string }> = [];
+          const memoryMap = new Map(memories.map(m => [m.id, m]));
+          links.forEach(l => {
+            if (l.source === selectedMemory.id && memoryMap.has(l.target)) {
+              connections.push({ memory: memoryMap.get(l.target)!, type: l.type, reasoning: l.reasoning });
+            } else if (l.target === selectedMemory.id && memoryMap.has(l.source)) {
+              connections.push({ memory: memoryMap.get(l.source)!, type: l.type, reasoning: l.reasoning });
+            }
+          });
+
+          return (
+            <div className="border-t border-gray-700/20 bg-[#08080c] max-h-80 overflow-hidden">
+              <div className="px-4 md:px-5 py-3 flex justify-between items-center border-b border-gray-700/10">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full" style={{ background: selectedMemory.color }} />
+                  <h4 className="text-gray-400 font-serif text-sm">{branches[selectedMemory.branch]?.label || selectedMemory.branch}</h4>
+                </div>
+                <button onClick={() => setSelectedMemory(null)} className="text-gray-600 hover:text-gray-400 p-1">×</button>
+              </div>
+              <div className="p-4 overflow-y-auto max-h-60 space-y-3">
+                {/* Main narrative */}
+                <div className="text-gray-300 text-sm leading-relaxed">
+                  {narrative}
+                </div>
+
+                {/* Why/Reasoning - the most important context */}
+                {why && (
+                  <div className="bg-[#12121a] rounded-lg p-3 border-l-2 border-blue-500/50">
+                    <div className="text-[10px] text-blue-400/70 uppercase tracking-wider mb-1">Why</div>
+                    <div className="text-gray-400 text-xs leading-relaxed">{why}</div>
+                  </div>
+                )}
+
+                {/* Decision */}
+                {decision && (
+                  <div className="bg-[#12121a] rounded-lg p-3 border-l-2 border-purple-500/50">
+                    <div className="text-[10px] text-purple-400/70 uppercase tracking-wider mb-1">Decision</div>
+                    <div className="text-gray-400 text-xs leading-relaxed">{decision}</div>
+                  </div>
+                )}
+
+                {/* Lesson/Insight */}
+                {lesson && (
+                  <div className="bg-[#12121a] rounded-lg p-3 border-l-2 border-yellow-500/50">
+                    <div className="text-[10px] text-yellow-400/70 uppercase tracking-wider mb-1">Insight</div>
+                    <div className="text-gray-400 text-xs leading-relaxed">{lesson}</div>
+                  </div>
+                )}
+
+                {/* Context */}
+                {context && (
+                  <div className="bg-[#12121a] rounded-lg p-3 border-l-2 border-gray-500/50">
+                    <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Context</div>
+                    <div className="text-gray-400 text-xs leading-relaxed">{context}</div>
+                  </div>
+                )}
+
+                {/* Outcome */}
+                {outcome && (
+                  <div className="bg-[#12121a] rounded-lg p-3 border-l-2 border-green-500/50">
+                    <div className="text-[10px] text-green-400/70 uppercase tracking-wider mb-1">Outcome</div>
+                    <div className="text-gray-400 text-xs leading-relaxed">{outcome}</div>
+                  </div>
+                )}
+
+                {/* Action/Next step */}
+                {action && (
+                  <div className="bg-[#12121a] rounded-lg p-3 border-l-2 border-orange-500/50">
+                    <div className="text-[10px] text-orange-400/70 uppercase tracking-wider mb-1">Action</div>
+                    <div className="text-gray-400 text-xs leading-relaxed">{action}</div>
+                  </div>
+                )}
+
+                {/* Connected memories */}
+                {connections.length > 0 && (
+                  <div className="pt-2 border-t border-gray-700/20">
+                    <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">Connected Memories</div>
+                    <div className="space-y-1">
+                      {connections.slice(0, 4).map((conn, i) => (
+                        <div
+                          key={i}
+                          className="text-xs text-gray-500 flex items-center gap-2 cursor-pointer hover:text-gray-400"
+                          onClick={() => setSelectedMemory(conn.memory)}
+                        >
+                          <div className="w-1.5 h-1.5 rounded-full" style={{ background: conn.memory.color }} />
+                          <span className="text-gray-600 text-[9px]">{conn.type}</span>
+                          <span className="truncate">{narrateMemory(conn.memory.preview).narrative.substring(0, 50)}...</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Timestamp */}
+                <div className="text-[10px] text-gray-600 pt-2">
+                  {selectedMemory.createdAt && formatRelativeTime(selectedMemory.createdAt)}
+                </div>
+              </div>
             </div>
-            <div className="p-4 overflow-y-auto max-h-52">
-              <pre className="bg-[#101016] border border-gray-700/10 rounded p-3 text-[10px] text-gray-500 whitespace-pre-wrap break-words">
-                {selectedMemory.content}
-              </pre>
-            </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* Footer */}
         <div className="px-4 md:px-5 py-3 border-t border-gray-700/20 text-[9px] text-gray-600 flex justify-between">
