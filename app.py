@@ -5703,6 +5703,12 @@ def mcp_handler():
         
         return jsonify(mcp_success_response(req_id, result))
     
+    # ===== NOTIFICATIONS (no response required per MCP spec) =====
+    elif method and method.startswith("notifications/"):
+        # MCP notifications are fire-and-forget, return empty 200
+        print(f"[MCP] notification acknowledged: {method}", file=sys.stderr)
+        return "", 200
+    
     # ===== UNKNOWN METHOD =====
     else:
         return jsonify(mcp_error_response(req_id, -32601, f"Method not found: {method}")), 400

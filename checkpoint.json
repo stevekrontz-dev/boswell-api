@@ -1,11 +1,11 @@
 {
   "instance_id": "CW-OPUS",
   "task_id": "a4a48d2e-8b1f-4fc7-854e-83bbd8180d08",
-  "progress": "Phase 3 COMPLETE. Fingerprints bootstrapped (9 branches). Routing validation working. Correctly identifies thalamus content being committed to command-center.",
-  "next_step": "Phase 4: Wire validation into /v2/commit to warn on mismatch. Phase 5: Surface warnings in MCP tool.",
+  "progress": "Phase 4 DONE (deployed to Railway). Phase 5 IN PROGRESS - added routing warning to server.py handler, need to add force_branch to tool definition, then commit/push.",
+  "next_step": "1) Add force_branch property to boswell_commit tool definition in server.py around line 185. 2) Commit and push boswell-mcp. 3) Test full flow. 4) Mark task done.",
   "context_snapshot": {
-    "phase_3_complete": true,
-    "fingerprints_computed": 9,
-    "test_result": "thalamus content correctly flagged when targeting command-center"
+    "boswell_api_commit": "7b00eda - Phase 4 routing validation",
+    "boswell_mcp_changes": "server.py lines 493-504 added routing warning logic",
+    "remaining": "add force_branch to tool inputSchema, commit, push, test"
   }
 }

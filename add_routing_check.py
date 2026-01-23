@@ -4,48 +4,50 @@
 with open('app.py', 'r') as f:
     content = f.read()
 
-# Find the insertion point - after the initial validation
-old = '''    if not content:
-        return jsonify({'error': 'Content required'}), 400
+old = '''            except Exception as e:
+                print(f"[EMBEDDING] Failed to store embedding: {e}", file=sys.stderr)
 
-    # W2P4: Check commit limit before creating'''
+        tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")'''
 
-new = '''    if not content:
-        return jsonify({'error': 'Content required'}), 400
+new = '''            except Exception as e:
+                print(f"[EMBEDDING] Failed to store embedding: {e}", file=sys.stderr)
 
-    # Phase 4: Check routing suggestion (warn but don't block)
-    force_branch = data.get('force_branch', False)
-    routing_warning = None
-    try:
-        content_str_check = json.dumps(content) if isinstance(content, dict) else str(content)
-        embedding_check = generate_embedding(content_str_check)
-        if embedding_check:
-            check_cur = get_cursor()
-            check_cur.execute("""
-                SELECT branch_name, centroid, commit_count
-                FROM branch_fingerprints
-                WHERE tenant_id = %s AND centroid IS NOT NULL
-            """, (DEFAULT_TENANT,))
-            scores = []
-            for row in check_cur.fetchall():
-                if row['centroid'] is not None:
-                    sim = cosine_similarity(embedding_check, row['centroid'])
-                    scores.append({'branch': row['branch_name'], 'similarity': sim})
-            check_cur.close()
-            if scores:
-                scores.sort(key=lambda x: x['similarity'], reverse=True)
-                best = scores[0]
-                if best['branch'].lower() != branch.lower() and best['similarity'] > 0.4:
-                    routing_warning = {
-                        'suggested_branch': best['branch'],
-                        'requested_branch': branch,
-                        'confidence': round(best['similarity'], 4),
-                        'message': f"Content may belong on '{best['branch']}' (confidence: {best['similarity']:.1%})"
-                    }
-    except Exception as e:
-        print(f"[ROUTING CHECK] Non-fatal error: {e}", file=sys.stderr)
+        # Phase 4: Check routing against branch fingerprints
+        routing_suggestion = None
+        force_branch = data.get('force_branch', False)
+        if embedding and not force_branch:
+            try:
+                fp_cur = get_cursor()
+                fp_cur.execute("""
+                    SELECT branch_name, centroid, commit_count
+                    FROM branch_fingerprints
+                    WHERE tenant_id = %s AND centroid IS NOT NULL
+                """, (DEFAULT_TENANT,))
+                
+                scores = []
+                for row in fp_cur.fetchall():
+                    if row['centroid']:
+                        similarity = cosine_similarity(embedding, row['centroid'])
+                        scores.append({
+                            'branch': row['branch_name'],
+                            'similarity': round(similarity, 4)
+                        })
+                fp_cur.close()
+                
+                if scores:
+                    scores.sort(key=lambda x: x['similarity'], reverse=True)
+                    best_match = scores[0]
+                    if best_match['branch'].lower() != branch.lower() and best_match['similarity'] > 0.15:
+                        routing_suggestion = {
+                            'suggested_branch': best_match['branch'],
+                            'confidence': best_match['similarity'],
+                            'requested_branch': branch,
+                            'message': f"Content looks like it belongs on '{best_match['branch']}' (confidence: {best_match['similarity']:.0%})"
+                        }
+            except Exception as e:
+                print(f"[ROUTING] Failed to check routing: {e}", file=sys.stderr)
 
-    # W2P4: Check commit limit before creating'''
+        tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")'''
 
 content = content.replace(old, new)
 
