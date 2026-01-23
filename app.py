@@ -173,7 +173,7 @@ def after_request(response):
     if not AUDIT_ENABLED:
         return response
     # Skip health checks and static
-    if request.path in ('/', '/health', '/favicon.ico', '/v2/'):
+    if request.path in ('/', '/health', '/favicon.ico', '/v2/', '/v2/health', '/v2/health/daemon'):
         return response
     try:
         from audit_service import log_audit, parse_request_action
@@ -268,6 +268,301 @@ def health_check():
             'status': 'error',
             'error': str(e)
         }), 500
+
+
+# ==================== HEALTH DAEMON ====================
+
+import psutil
+
+def check_postgres():
+    """Check PostgreSQL connectivity and measure latency."""
+    start = time.time()
+    try:
+        cur = get_cursor()
+        cur.execute('SELECT 1')
+        cur.fetchone()
+        cur.close()
+        latency_ms = (time.time() - start) * 1000
+
+        if latency_ms < 500:
+            status = 'pass'
+            message = 'Connection OK'
+        elif latency_ms < 2000:
+            status = 'degraded'
+            message = f'Slow connection ({latency_ms:.0f}ms)'
+        else:
+            status = 'fail'
+            message = f'Very slow connection ({latency_ms:.0f}ms)'
+
+        return {
+            'check': 'postgres',
+            'status': status,
+            'latency_ms': round(latency_ms, 1),
+            'message': message
+        }
+    except Exception as e:
+        return {
+            'check': 'postgres',
+            'status': 'fail',
+            'latency_ms': round((time.time() - start) * 1000, 1),
+            'message': f'Connection failed: {str(e)}'
+        }
+
+
+def check_mcp():
+    """Check MCP endpoint health via internal call."""
+    start = time.time()
+    try:
+        # Internal call to mcp_health view function (no HTTP overhead)
+        with app.test_request_context():
+            response = mcp_health()
+            latency_ms = (time.time() - start) * 1000
+
+            if hasattr(response, 'json'):
+                data = response.json
+            else:
+                data = response.get_json() if hasattr(response, 'get_json') else {}
+
+            if data.get('status') == 'ok':
+                return {
+                    'check': 'mcp',
+                    'status': 'pass',
+                    'latency_ms': round(latency_ms, 1),
+                    'message': 'MCP endpoint OK'
+                }
+            else:
+                return {
+                    'check': 'mcp',
+                    'status': 'fail',
+                    'latency_ms': round(latency_ms, 1),
+                    'message': f'MCP returned status: {data.get("status", "unknown")}'
+                }
+    except Exception as e:
+        return {
+            'check': 'mcp',
+            'status': 'fail',
+            'latency_ms': round((time.time() - start) * 1000, 1),
+            'message': f'MCP check failed: {str(e)}'
+        }
+
+
+def check_system_resources():
+    """Check system resources using psutil."""
+    start = time.time()
+    try:
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        cpu = psutil.cpu_percent(interval=0.1)
+
+        latency_ms = (time.time() - start) * 1000
+
+        return {
+            'check': 'system',
+            'status': 'pass',
+            'latency_ms': round(latency_ms, 1),
+            'details': {
+                'memory_percent': round(memory.percent, 1),
+                'memory_available_mb': round(memory.available / (1024 * 1024), 1),
+                'disk_percent': round(disk.percent, 1),
+                'disk_free_gb': round(disk.free / (1024 * 1024 * 1024), 2),
+                'cpu_percent': round(cpu, 1)
+            }
+        }
+    except Exception as e:
+        return {
+            'check': 'system',
+            'status': 'fail',
+            'latency_ms': round((time.time() - start) * 1000, 1),
+            'message': f'System check failed: {str(e)}'
+        }
+
+
+def check_openai():
+    """Check if OpenAI API key is configured (no API call)."""
+    start = time.time()
+    api_key = os.environ.get('OPENAI_API_KEY')
+    latency_ms = (time.time() - start) * 1000
+
+    if api_key:
+        return {
+            'check': 'openai',
+            'status': 'pass',
+            'latency_ms': round(latency_ms, 1),
+            'message': 'API key configured'
+        }
+    else:
+        return {
+            'check': 'openai',
+            'status': 'fail',
+            'latency_ms': round(latency_ms, 1),
+            'message': 'OPENAI_API_KEY not set'
+        }
+
+
+def get_current_alerts_internal():
+    """Get current alerts via internal call to admin_alerts."""
+    try:
+        with app.test_request_context():
+            response = admin_alerts()
+            if hasattr(response, 'json'):
+                return response.json
+            elif isinstance(response, tuple):
+                return response[0].get_json() if hasattr(response[0], 'get_json') else {}
+            else:
+                return response.get_json() if hasattr(response, 'get_json') else {}
+    except Exception as e:
+        return {'alerts': [], 'count': 0, 'critical_count': 0, 'warning_count': 0, 'error': str(e)}
+
+
+def commit_health_snapshot(snapshot):
+    """Commit health snapshot to health-status branch (best-effort)."""
+    try:
+        db = get_db()
+        cur = get_cursor()
+        now = datetime.utcnow().isoformat() + 'Z'
+        branch = 'health-status'
+
+        content_str = json.dumps(snapshot)
+        blob_hash = compute_hash(content_str)
+
+        # Insert blob
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, DEFAULT_TENANT, content_str, 'health_snapshot', now, len(content_str))
+        )
+
+        # Create tree entry
+        tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
+        status = snapshot.get('overall_status', 'unknown')
+        passed = snapshot.get('summary', {}).get('checks_passed', 0)
+        total = snapshot.get('summary', {}).get('checks_total', 0)
+        message = f"Health snapshot: {status} - {passed}/{total} checks passed"
+
+        cur.execute(
+            '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
+               VALUES (%s, %s, %s, %s, %s)''',
+            (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'health_snapshot')
+        )
+
+        # Check if branch exists
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        branch_row = cur.fetchone()
+        if branch_row:
+            parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
+        else:
+            # Auto-create branch
+            cur.execute(
+                '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
+                   VALUES (%s, %s, %s, %s)''',
+                (DEFAULT_TENANT, branch, 'GENESIS', now)
+            )
+            parent_hash = None
+
+        # Create commit
+        commit_data = f"{tree_hash}:{parent_hash}:{message}:{now}"
+        commit_hash = compute_hash(commit_data)
+
+        cur.execute(
+            '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+            (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'health-daemon', message, now)
+        )
+
+        # Update branch head
+        cur.execute(
+            'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
+            (commit_hash, branch, DEFAULT_TENANT)
+        )
+
+        db.commit()
+        cur.close()
+
+        return {'committed': True, 'blob_hash': blob_hash, 'commit_hash': commit_hash}
+    except Exception as e:
+        print(f"[HEALTH] Failed to commit snapshot: {e}", file=sys.stderr)
+        return {'committed': False, 'error': str(e)}
+
+
+@app.route('/v2/health/daemon', methods=['GET'])
+def health_daemon():
+    """Comprehensive health check endpoint for monitoring daemon."""
+    timestamp = datetime.utcnow().isoformat() + 'Z'
+
+    # Run all health checks (isolated, continue on failure)
+    checks = []
+    for check_fn in [check_postgres, check_mcp, check_system_resources, check_openai]:
+        try:
+            checks.append(check_fn())
+        except Exception as e:
+            checks.append({
+                'check': check_fn.__name__.replace('check_', ''),
+                'status': 'fail',
+                'latency_ms': 0,
+                'message': f'Check threw exception: {str(e)}'
+            })
+
+    # Fetch alerts internally
+    alerts_data = get_current_alerts_internal()
+
+    # Compute overall status
+    checks_failed = sum(1 for c in checks if c['status'] == 'fail')
+    checks_degraded = sum(1 for c in checks if c['status'] == 'degraded')
+    critical_alerts = alerts_data.get('critical_count', 0)
+    warning_alerts = alerts_data.get('warning_count', 0)
+
+    if checks_failed > 0 or critical_alerts > 0:
+        overall_status = 'unhealthy'
+    elif checks_degraded > 0 or warning_alerts > 0:
+        overall_status = 'degraded'
+    else:
+        overall_status = 'healthy'
+
+    # Build summary
+    summary = {
+        'checks_total': len(checks),
+        'checks_passed': sum(1 for c in checks if c['status'] == 'pass'),
+        'checks_degraded': checks_degraded,
+        'checks_failed': checks_failed,
+        'alerts_critical': critical_alerts,
+        'alerts_warning': warning_alerts
+    }
+
+    # Build snapshot for commit
+    snapshot = {
+        'type': 'health_snapshot',
+        'timestamp': timestamp,
+        'overall_status': overall_status,
+        'checks': checks,
+        'alerts': alerts_data.get('alerts', []),
+        'summary': summary
+    }
+
+    # Commit to health-status branch (best-effort)
+    commit_result = commit_health_snapshot(snapshot)
+
+    # Build response
+    response = {
+        'status': overall_status,
+        'checks': checks,
+        'alerts': {
+            'items': alerts_data.get('alerts', []),
+            'count': alerts_data.get('count', 0),
+            'critical_count': critical_alerts,
+            'warning_count': warning_alerts
+        },
+        'summary': summary,
+        'commit': commit_result,
+        'timestamp': timestamp
+    }
+
+    # Return appropriate HTTP status
+    if overall_status == 'unhealthy':
+        return jsonify(response), 503
+    else:
+        return jsonify(response), 200
+
 
 # ==================== OAUTH DISCOVERY ====================
 
