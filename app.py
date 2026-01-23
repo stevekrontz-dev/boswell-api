@@ -4235,7 +4235,7 @@ def list_orphaned_checkpoints():
 # ==================== TRAILS (Memory Path Tracking) ====================
 
 def ensure_trails_table():
-    """Create trails table if it doesn't exist."""
+    """Create trails table if it doesn't exist, with lifecycle columns."""
     cur = get_cursor()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS trails (
@@ -4246,13 +4246,30 @@ def ensure_trails_table():
             traversal_count INTEGER DEFAULT 1,
             last_traversed TIMESTAMP DEFAULT NOW(),
             strength FLOAT DEFAULT 1.0,
+            state VARCHAR(20) DEFAULT 'active',
+            archived_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(tenant_id, source_blob, target_blob)
         )
     ''')
+    # Add lifecycle columns if table already exists without them
+    cur.execute('''
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'trails' AND column_name = 'state') THEN
+                ALTER TABLE trails ADD COLUMN state VARCHAR(20) DEFAULT 'active';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'trails' AND column_name = 'archived_at') THEN
+                ALTER TABLE trails ADD COLUMN archived_at TIMESTAMP;
+            END IF;
+        END $$;
+    ''')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_strength ON trails(strength DESC)')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_source ON trails(source_blob)')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_target ON trails(target_blob)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_state ON trails(state)')
     get_db().commit()
     cur.close()
 
@@ -4414,36 +4431,86 @@ def get_trails_to(target_blob):
 
 @app.route('/v2/trails/decay', methods=['POST'])
 def decay_trails():
-    """Decay all trails by 10% and prune dead ones. Call via Railway cron daily."""
+    """Apply Physarum-inspired decay to trails based on idle time.
+
+    Formula: strength = base_strength * (0.95 ^ days_idle)
+
+    State transitions based on strength:
+    - ACTIVE: strength >= 1.0 (frequently used)
+    - FADING: 0.3 <= strength < 1.0 (cooling off)
+    - DORMANT: 0.1 <= strength < 0.3 (rarely accessed)
+    - ARCHIVED: strength < 0.1 (preserved but inactive)
+
+    Call via Railway cron daily.
+    """
     ensure_trails_table()
 
     db = get_db()
     cur = get_cursor()
+    decay_rate = 0.95  # Per-day decay factor
 
     try:
+        # Apply time-based decay: strength = strength * (0.95 ^ days_since_last_traversal)
+        # PostgreSQL: EXTRACT(EPOCH FROM (NOW() - last_traversed)) / 86400 = days idle
         cur.execute('''
-            UPDATE trails SET strength = strength * 0.9
-            WHERE tenant_id = %s
-        ''', (DEFAULT_TENANT,))
+            UPDATE trails
+            SET strength = strength * POWER(%s, EXTRACT(EPOCH FROM (NOW() - last_traversed)) / 86400)
+            WHERE tenant_id = %s AND state != 'archived'
+        ''', (decay_rate, DEFAULT_TENANT))
         decayed_count = cur.rowcount
 
+        # Update states based on new strength values
+        # ACTIVE: strength >= 1.0
         cur.execute('''
-            DELETE FROM trails
-            WHERE tenant_id = %s AND strength < 0.01
-            RETURNING id
+            UPDATE trails SET state = 'active'
+            WHERE tenant_id = %s AND strength >= 1.0 AND state != 'active'
         ''', (DEFAULT_TENANT,))
-        pruned = [str(row['id']) for row in cur.fetchall()]
+        became_active = cur.rowcount
+
+        # FADING: 0.3 <= strength < 1.0
+        cur.execute('''
+            UPDATE trails SET state = 'fading'
+            WHERE tenant_id = %s AND strength >= 0.3 AND strength < 1.0 AND state != 'fading'
+        ''', (DEFAULT_TENANT,))
+        became_fading = cur.rowcount
+
+        # DORMANT: 0.1 <= strength < 0.3
+        cur.execute('''
+            UPDATE trails SET state = 'dormant'
+            WHERE tenant_id = %s AND strength >= 0.1 AND strength < 0.3 AND state != 'dormant'
+        ''', (DEFAULT_TENANT,))
+        became_dormant = cur.rowcount
+
+        # ARCHIVED: strength < 0.1 (preserve, don't delete)
+        cur.execute('''
+            UPDATE trails SET state = 'archived', archived_at = NOW()
+            WHERE tenant_id = %s AND strength < 0.1 AND state != 'archived'
+        ''', (DEFAULT_TENANT,))
+        became_archived = cur.rowcount
+
+        # Get current state distribution
+        cur.execute('''
+            SELECT state, COUNT(*) as count, AVG(strength) as avg_strength
+            FROM trails WHERE tenant_id = %s
+            GROUP BY state
+        ''', (DEFAULT_TENANT,))
+        state_stats = {row['state']: {'count': row['count'], 'avg_strength': float(row['avg_strength'] or 0)}
+                      for row in cur.fetchall()}
 
         db.commit()
         cur.close()
 
         return jsonify({
             'status': 'decayed',
-            'trails_decayed': decayed_count,
-            'trails_pruned': len(pruned),
-            'pruned_ids': pruned,
-            'decay_factor': 0.9,
-            'prune_threshold': 0.01,
+            'decay_rate': decay_rate,
+            'trails_processed': decayed_count,
+            'state_transitions': {
+                'became_active': became_active,
+                'became_fading': became_fading,
+                'became_dormant': became_dormant,
+                'became_archived': became_archived
+            },
+            'state_distribution': state_stats,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         })
 
@@ -4453,6 +4520,266 @@ def decay_trails():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/trails/health', methods=['GET'])
+def trail_health():
+    """Get trail system health overview - state distribution, decay rates, activity."""
+    ensure_trails_table()
+    cur = get_cursor()
+
+    try:
+        # State distribution
+        cur.execute('''
+            SELECT state, COUNT(*) as count,
+                   AVG(strength) as avg_strength,
+                   MIN(strength) as min_strength,
+                   MAX(strength) as max_strength,
+                   AVG(traversal_count) as avg_traversals
+            FROM trails WHERE tenant_id = %s
+            GROUP BY state
+        ''', (DEFAULT_TENANT,))
+        states = {}
+        total_trails = 0
+        for row in cur.fetchall():
+            states[row['state'] or 'active'] = {
+                'count': row['count'],
+                'avg_strength': round(float(row['avg_strength'] or 0), 3),
+                'min_strength': round(float(row['min_strength'] or 0), 3),
+                'max_strength': round(float(row['max_strength'] or 0), 3),
+                'avg_traversals': round(float(row['avg_traversals'] or 0), 1)
+            }
+            total_trails += row['count']
+
+        # Recent activity (last 24h, 7d, 30d)
+        cur.execute('''
+            SELECT
+                COUNT(*) FILTER (WHERE last_traversed > NOW() - INTERVAL '24 hours') as last_24h,
+                COUNT(*) FILTER (WHERE last_traversed > NOW() - INTERVAL '7 days') as last_7d,
+                COUNT(*) FILTER (WHERE last_traversed > NOW() - INTERVAL '30 days') as last_30d
+            FROM trails WHERE tenant_id = %s
+        ''', (DEFAULT_TENANT,))
+        activity = cur.fetchone()
+
+        # Top 5 strongest trails
+        cur.execute('''
+            SELECT source_blob, target_blob, strength, traversal_count, state,
+                   last_traversed
+            FROM trails WHERE tenant_id = %s
+            ORDER BY strength DESC LIMIT 5
+        ''', (DEFAULT_TENANT,))
+        hottest = [{
+            'source': row['source_blob'][:12] + '...',
+            'target': row['target_blob'][:12] + '...',
+            'strength': round(float(row['strength']), 2),
+            'traversals': row['traversal_count'],
+            'state': row['state'] or 'active'
+        } for row in cur.fetchall()]
+
+        cur.close()
+
+        return jsonify({
+            'total_trails': total_trails,
+            'state_distribution': states,
+            'activity': {
+                'last_24h': activity['last_24h'],
+                'last_7d': activity['last_7d'],
+                'last_30d': activity['last_30d']
+            },
+            'hottest_trails': hottest,
+            'decay_rate': 0.95,
+            'state_thresholds': {
+                'active': '>= 1.0',
+                'fading': '0.3 - 1.0',
+                'dormant': '0.1 - 0.3',
+                'archived': '< 0.1'
+            },
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/buried', methods=['GET'])
+def buried_memories():
+    """Find dormant and archived trails - memories fading from recall."""
+    ensure_trails_table()
+    cur = get_cursor()
+
+    limit = request.args.get('limit', 20, type=int)
+    include_archived = request.args.get('include_archived', 'true').lower() == 'true'
+
+    try:
+        states = ['dormant']
+        if include_archived:
+            states.append('archived')
+
+        placeholders = ','.join(['%s'] * len(states))
+        cur.execute(f'''
+            SELECT t.id, t.source_blob, t.target_blob, t.strength,
+                   t.traversal_count, t.state, t.last_traversed, t.archived_at,
+                   t.created_at
+            FROM trails t
+            WHERE t.tenant_id = %s AND t.state IN ({placeholders})
+            ORDER BY t.strength ASC
+            LIMIT %s
+        ''', (DEFAULT_TENANT, *states, limit))
+
+        buried = []
+        for row in cur.fetchall():
+            days_dormant = (datetime.utcnow() - row['last_traversed']).days if row['last_traversed'] else 0
+            buried.append({
+                'id': str(row['id']),
+                'source_blob': row['source_blob'],
+                'target_blob': row['target_blob'],
+                'strength': round(float(row['strength']), 4),
+                'traversal_count': row['traversal_count'],
+                'state': row['state'],
+                'days_dormant': days_dormant,
+                'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
+                'archived_at': row['archived_at'].isoformat() if row['archived_at'] else None
+            })
+
+        cur.close()
+
+        return jsonify({
+            'buried_trails': buried,
+            'count': len(buried),
+            'include_archived': include_archived,
+            'message': 'These memory paths are fading. Traverse them to resurrect.',
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/forecast', methods=['GET'])
+def decay_forecast():
+    """Predict when trails will transition states based on decay rate."""
+    ensure_trails_table()
+    cur = get_cursor()
+
+    decay_rate = 0.95
+
+    try:
+        cur.execute('''
+            SELECT id, source_blob, target_blob, strength, state, last_traversed
+            FROM trails
+            WHERE tenant_id = %s AND state IN ('active', 'fading')
+            ORDER BY strength DESC
+            LIMIT 20
+        ''', (DEFAULT_TENANT,))
+
+        forecasts = []
+        for row in cur.fetchall():
+            strength = float(row['strength'])
+            current_state = row['state'] or 'active'
+
+            # Calculate days until state transitions
+            # strength * (0.95 ^ days) = threshold
+            # days = log(threshold/strength) / log(0.95)
+            days_to_fading = None
+            days_to_dormant = None
+            days_to_archived = None
+
+            if strength > 1.0:
+                days_to_fading = max(0, int(math.log(1.0 / strength) / math.log(decay_rate)))
+            if strength > 0.3:
+                days_to_dormant = max(0, int(math.log(0.3 / strength) / math.log(decay_rate)))
+            if strength > 0.1:
+                days_to_archived = max(0, int(math.log(0.1 / strength) / math.log(decay_rate)))
+
+            forecasts.append({
+                'source_blob': row['source_blob'][:16] + '...',
+                'target_blob': row['target_blob'][:16] + '...',
+                'current_strength': round(strength, 3),
+                'current_state': current_state,
+                'days_to_fading': days_to_fading,
+                'days_to_dormant': days_to_dormant,
+                'days_to_archived': days_to_archived
+            })
+
+        cur.close()
+
+        return jsonify({
+            'forecasts': forecasts,
+            'decay_rate': decay_rate,
+            'interpretation': 'Days until trail transitions to each state if not traversed',
+            'remedy': 'Traverse the trail (boswell_record_trail) to reset decay timer and boost strength',
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/trails/resurrect', methods=['POST'])
+def resurrect_trail():
+    """Resurrect a dormant or archived trail by traversing it."""
+    ensure_trails_table()
+
+    data = request.get_json() or {}
+    trail_id = data.get('trail_id')
+    source_blob = data.get('source_blob')
+    target_blob = data.get('target_blob')
+
+    if not trail_id and not (source_blob and target_blob):
+        return jsonify({'error': 'Provide trail_id or (source_blob, target_blob)'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        if trail_id:
+            cur.execute('''
+                UPDATE trails
+                SET strength = GREATEST(strength * 2, 1.0),
+                    state = 'active',
+                    last_traversed = NOW(),
+                    traversal_count = traversal_count + 1,
+                    archived_at = NULL
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id, source_blob, target_blob, strength, state, traversal_count
+            ''', (trail_id, DEFAULT_TENANT))
+        else:
+            cur.execute('''
+                UPDATE trails
+                SET strength = GREATEST(strength * 2, 1.0),
+                    state = 'active',
+                    last_traversed = NOW(),
+                    traversal_count = traversal_count + 1,
+                    archived_at = NULL
+                WHERE source_blob = %s AND target_blob = %s AND tenant_id = %s
+                RETURNING id, source_blob, target_blob, strength, state, traversal_count
+            ''', (source_blob, target_blob, DEFAULT_TENANT))
+
+        row = cur.fetchone()
+        db.commit()
+        cur.close()
+
+        if row:
+            return jsonify({
+                'status': 'resurrected',
+                'trail': {
+                    'id': str(row['id']),
+                    'source_blob': row['source_blob'],
+                    'target_blob': row['target_blob'],
+                    'new_strength': round(float(row['strength']), 3),
+                    'state': row['state'],
+                    'traversal_count': row['traversal_count']
+                },
+                'message': 'Trail resurrected to active state'
+            })
+        else:
+            return jsonify({'error': 'Trail not found'}), 404
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
 
 
 # ==================== BRANCH FINGERPRINTS (Intelligent Routing) ====================
@@ -5732,6 +6059,46 @@ MCP_TOOLS = [
             "required": ["blob"]
         }
     },
+    # Trail Lifecycle Tools (Physarum-inspired decay)
+    {
+        "name": "boswell_trail_health",
+        "description": "Get trail system health overview - state distribution (ACTIVE/FADING/DORMANT/ARCHIVED), activity metrics, and hottest trails.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "boswell_buried_memories",
+        "description": "Find dormant and archived trails - memory paths fading from recall. These can be resurrected by traversing them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max trails to return (default: 20)"},
+                "include_archived": {"type": "boolean", "description": "Include archived trails (default: true)"}
+            }
+        }
+    },
+    {
+        "name": "boswell_decay_forecast",
+        "description": "Predict when active/fading trails will transition to dormant/archived states if not traversed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "boswell_resurrect",
+        "description": "Resurrect a dormant or archived trail by traversing it. Doubles strength (min 1.0) and resets to ACTIVE state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "trail_id": {"type": "string", "description": "Trail ID to resurrect"},
+                "source_blob": {"type": "string", "description": "Or: source blob hash"},
+                "target_blob": {"type": "string", "description": "Or: target blob hash"}
+            }
+        }
+    },
     # Session Checkpoint Tools
     {
         "name": "boswell_checkpoint",
@@ -5986,6 +6353,32 @@ def dispatch_mcp_tool(tool_name, args):
             path=f'/v2/trails/to/{blob}',
             view_args={"target_blob": blob}
         )
+
+    # ===== TRAIL LIFECYCLE TOOLS =====
+
+    elif tool_name == "boswell_trail_health":
+        return invoke_view(trail_health)
+
+    elif tool_name == "boswell_buried_memories":
+        qs = {}
+        if "limit" in args:
+            qs["limit"] = args["limit"]
+        if "include_archived" in args:
+            qs["include_archived"] = str(args["include_archived"]).lower()
+        return invoke_view(buried_memories, query_string=qs if qs else None)
+
+    elif tool_name == "boswell_decay_forecast":
+        return invoke_view(decay_forecast)
+
+    elif tool_name == "boswell_resurrect":
+        payload = {}
+        if "trail_id" in args:
+            payload["trail_id"] = args["trail_id"]
+        if "source_blob" in args:
+            payload["source_blob"] = args["source_blob"]
+        if "target_blob" in args:
+            payload["target_blob"] = args["target_blob"]
+        return invoke_view(resurrect_trail, method='POST', json_data=payload)
 
     # ===== SESSION CHECKPOINT TOOLS =====
 
