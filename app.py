@@ -4065,6 +4065,77 @@ def backfill_tasks_to_memory():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/tasks/link-blobs', methods=['POST'])
+def link_tasks_to_blobs():
+    """Link existing tasks to their memory blobs via blob_hash column.
+    
+    Task Unification: finds tasks with existing task:{id} tags but missing blob_hash,
+    and updates the task record to point to its blob.
+    """
+    db = get_db()
+    cur = get_cursor()
+    
+    linked = 0
+    already_linked = 0
+    no_blob = 0
+    errors = []
+    
+    try:
+        # Get all tasks
+        cur.execute('SELECT id FROM tasks WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        tasks = cur.fetchall()
+        
+        for task in tasks:
+            task_id = str(task['id'])
+            
+            # Check if already linked
+            cur.execute('SELECT blob_hash FROM tasks WHERE id = %s AND tenant_id = %s', (task_id, DEFAULT_TENANT))
+            task_row = cur.fetchone()
+            if task_row and task_row['blob_hash']:
+                already_linked += 1
+                continue
+            
+            # Find blob via tag
+            cur.execute('''
+                SELECT blob_hash FROM tags 
+                WHERE tenant_id = %s AND tag = %s
+                LIMIT 1
+            ''', (DEFAULT_TENANT, f"task:{task_id}"))
+            
+            tag_row = cur.fetchone()
+            if not tag_row:
+                no_blob += 1
+                continue
+            
+            blob_hash = tag_row['blob_hash']
+            
+            # Link task to blob
+            try:
+                cur.execute('''
+                    UPDATE tasks SET blob_hash = %s WHERE id = %s AND tenant_id = %s
+                ''', (blob_hash, task_id, DEFAULT_TENANT))
+                linked += 1
+            except Exception as e:
+                errors.append({'task_id': task_id, 'error': str(e)})
+        
+        db.commit()
+        cur.close()
+        
+        return jsonify({
+            'status': 'complete',
+            'linked': linked,
+            'already_linked': already_linked,
+            'no_blob_found': no_blob,
+            'errors': errors,
+            'total_tasks': len(tasks)
+        })
+        
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
 # ==================== SESSION CHECKPOINTS (Crash Recovery) ====================
 
 @app.route('/v2/session/checkpoint', methods=['POST'])
