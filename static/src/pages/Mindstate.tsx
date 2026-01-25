@@ -1,6 +1,6 @@
 // Build: 2026-01-18-v3 - timeline removed, legend added
 import { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { fetchWithAuth, getCurrentUser, type UserProfile } from '../lib/api';
 import * as d3 from 'd3';
 
@@ -189,6 +189,8 @@ function formatRelativeTime(dateStr: string | undefined): string {
 
 export default function Mindstate() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const focusBlob = searchParams.get('focus');
   const svgRef = useRef<SVGSVGElement>(null);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
@@ -349,6 +351,34 @@ export default function Mindstate() {
     }
     fetchData();
   }, [profile, branches]);
+
+  // Handle focus param from URL - select and zoom to memory
+  useEffect(() => {
+    if (!focusBlob || memories.length === 0 || loading) return;
+
+    // Find memory by full or partial blob hash
+    const targetMemory = memories.find(m =>
+      m.fullId === focusBlob || m.fullId.startsWith(focusBlob) || m.id === focusBlob.substring(0, 8)
+    );
+
+    if (targetMemory) {
+      setSelectedMemory(targetMemory);
+      // Zoom to the node if we have the D3 references
+      if (gRef.current && svgRef.current && zoomRef.current) {
+        const node = nodesRef.current.find((n: any) => n.id === targetMemory.id);
+        if (node) {
+          const svg = d3.select(svgRef.current);
+          const width = svgRef.current.clientWidth;
+          const height = svgRef.current.clientHeight;
+          // Zoom and center on the node
+          svg.transition().duration(750).call(
+            zoomRef.current.transform,
+            d3.zoomIdentity.translate(width / 2 - node.x * 1.5, height / 2 - node.y * 1.5).scale(1.5)
+          );
+        }
+      }
+    }
+  }, [focusBlob, memories, loading]);
 
   // D3 Visualization
   useEffect(() => {
