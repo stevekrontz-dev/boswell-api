@@ -259,9 +259,9 @@ export default function Mindstate() {
     async function fetchData() {
       try {
         const [graphData, trailsData, linksData] = await Promise.all([
-          fetchWithAuth('/v2/graph?limit=300'),
-          fetchWithAuth('/v2/trails/hot?limit=100'),
-          fetchWithAuth('/v2/links?limit=100')
+          fetchWithAuth('/v2/graph?limit=10000'),
+          fetchWithAuth('/v2/trails/hot?limit=10000'),
+          fetchWithAuth('/v2/links?limit=10000')
         ]);
 
         // Calculate heat for each memory
