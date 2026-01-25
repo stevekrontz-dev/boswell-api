@@ -416,7 +416,15 @@ def get_current_alerts_internal():
 
 
 def commit_health_snapshot(snapshot):
-    """Commit health snapshot to health-status branch (best-effort)."""
+    """Commit health snapshot to health-status branch (best-effort).
+    
+    DISABLED: This was committing every 5 minutes (288/day), each generating 
+    an embedding. Bleeding Railway costs. See conversation 2026-01-25.
+    TODO: Reimplement with change-detection (only commit on state transitions).
+    """
+    return {'committed': False, 'reason': 'disabled - cost optimization'}
+    
+    # Original implementation below (disabled)
     try:
         db = get_db()
         cur = get_cursor()
