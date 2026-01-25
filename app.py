@@ -5600,7 +5600,7 @@ def get_current_user():
 
     try:
         cur.execute('''
-            SELECT email, name, tenant_id, plan, status, api_key_encrypted,
+            SELECT email, name, tenant_id, subscription_tier, status, api_key_encrypted,
                    stripe_customer_id, stripe_subscription_id, created_at
             FROM users WHERE id = %s
         ''', (user_id,))
@@ -5645,7 +5645,7 @@ def get_current_user():
             'email': user['email'],
             'name': user.get('name'),
             'tenant_id': str(user['tenant_id']) if user.get('tenant_id') else None,
-            'plan': user.get('plan') or 'free',
+            'plan': user.get('subscription_tier') or 'free',
             'status': user.get('status') or 'pending_payment',
             'api_key': api_key,
             'has_subscription': bool(user.get('stripe_subscription_id')),
