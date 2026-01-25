@@ -172,7 +172,7 @@ def handle_checkout_completed(session):
                 tenant_id = %s,
                 stripe_customer_id = %s,
                 stripe_subscription_id = %s,
-                subscription_tier = %s,
+                plan = %s,
                 status = 'active',
                 api_key_encrypted = %s,
                 updated_at = %s
@@ -558,13 +558,13 @@ def get_subscription():
         plan_id = None
         try:
             cur.execute("""
-                SELECT subscription_tier FROM users
+                SELECT plan FROM users
                 WHERE tenant_id = %s AND status = 'active'
                 LIMIT 1
             """, (tenant_id,))
             user_row = cur.fetchone()
-            if user_row and user_row.get('subscription_tier'):
-                plan_id = user_row['subscription_tier']
+            if user_row and user_row.get('plan'):
+                plan_id = user_row['plan']
         except Exception as e:
             print(f"[BILLING] Users table query error: {e}", flush=True)
 

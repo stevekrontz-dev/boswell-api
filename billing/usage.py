@@ -90,14 +90,14 @@ def get_tenant_plan(cursor, tenant_id: str) -> str:
     try:
         cursor.execute("SAVEPOINT tenant_plan_users")
         cursor.execute("""
-            SELECT subscription_tier FROM users
+            SELECT plan FROM users
             WHERE tenant_id = %s AND status = 'active'
             LIMIT 1
         """, (tenant_id,))
         row = cursor.fetchone()
         cursor.execute("RELEASE SAVEPOINT tenant_plan_users")
-        if row and row.get('subscription_tier'):
-            return row['subscription_tier']
+        if row and row.get('plan'):
+            return row['plan']
     except Exception:
         try:
             cursor.execute("ROLLBACK TO SAVEPOINT tenant_plan_users")
