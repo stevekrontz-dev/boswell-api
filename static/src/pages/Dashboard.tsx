@@ -136,7 +136,7 @@ export default function Dashboard() {
             </p>
             
             <div className="space-y-3 text-left mb-8">
-              {['50,000 memories per month', 'Unlimited branches', '5GB encrypted storage', 'Priority support'].map((feature) => (
+              {['50,000 memories per month', 'Unlimited branches', 'Semantic search', 'Priority support'].map((feature) => (
                 <div key={feature} className="flex items-center gap-3 text-parchment-200/70">
                   <svg className="w-5 h-5 text-ember-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
