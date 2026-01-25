@@ -104,14 +104,16 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
     'achievement', 'title', 'decision', 'insight', 'principle', 'lesson',
     'problem', 'solution', 'commitment', 'vision', 'definition', 'spec',
     'action', 'milestone', 'summary', 'message', 'description', 'what',
-    'change', 'feature', 'component', 'service', 'finding', 'outcome'
+    'change', 'feature', 'component', 'service', 'finding', 'outcome',
+    'name', 'institution', 'concept'
   ];
 
   // Metadata fields to skip when looking for content
   const metadataFields = [
     'type', 'date', 'timestamp', 'created_at', 'claimed_at', 'updated_at',
     'id', 'task_id', 'worker_id', 'instance_id', 'branch', 'tenant_id',
-    'blob_hash', 'commit_hash', 'version'
+    'blob_hash', 'commit_hash', 'version', 'status', 'result', 'completed_at',
+    'layer', 'payload', 'slug', 'url', 'department', 'pages', 'faculty', 'faculty_count'
   ];
 
   // Find the best content field
@@ -123,6 +125,17 @@ function narrateMemory(preview: string): { narrative: string; emotion?: string }
       if (!mainContent) mainContent = data[field];
       else if (!secondaryContent) secondaryContent = data[field];
       else break;
+    }
+  }
+
+  // Check inside payload object if present
+  if (!mainContent && data.payload && typeof data.payload === 'object') {
+    for (const field of contentFields) {
+      if (data.payload[field] && typeof data.payload[field] === 'string' && data.payload[field].length > 3) {
+        if (!mainContent) mainContent = data.payload[field];
+        else if (!secondaryContent) secondaryContent = data.payload[field];
+        else break;
+      }
     }
   }
 
