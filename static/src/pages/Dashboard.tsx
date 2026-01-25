@@ -14,14 +14,27 @@ function narrateInsight(preview: string): string {
   if (!preview) return 'A memory worth revisiting';
   try {
     const data = JSON.parse(preview);
-    const contentFields = ['achievement', 'title', 'decision', 'insight', 'principle', 'problem', 'action', 'summary', 'message', 'description'];
+    const contentFields = ['achievement', 'title', 'decision', 'insight', 'principle', 'problem', 'action', 'summary', 'message', 'description', 'name', 'concept', 'vision'];
+    // Check top-level content fields
     for (const field of contentFields) {
       if (data[field] && typeof data[field] === 'string' && data[field].length > 3) {
         return data[field].substring(0, 100);
       }
     }
+    // Check inside payload object if present
+    if (data.payload && typeof data.payload === 'object') {
+      for (const field of contentFields) {
+        if (data.payload[field] && typeof data.payload[field] === 'string' && data.payload[field].length > 3) {
+          return data.payload[field].substring(0, 100);
+        }
+      }
+    }
+    // Check institution field specifically for scrape data
+    if (data.institution && typeof data.institution === 'string') {
+      return `${data.institution} data`;
+    }
     // Fallback to first non-metadata string
-    const metadataFields = ['type', 'date', 'timestamp', 'created_at', 'id', 'task_id', 'worker_id', 'branch'];
+    const metadataFields = ['type', 'date', 'timestamp', 'created_at', 'id', 'task_id', 'worker_id', 'branch', 'status', 'result', 'completed_at', 'layer', 'payload', 'slug', 'url', 'department', 'pages'];
     for (const [key, value] of Object.entries(data)) {
       if (!metadataFields.includes(key) && typeof value === 'string' && value.length > 3) {
         return (value as string).substring(0, 100);
@@ -289,9 +302,10 @@ export default function Dashboard() {
           ) : (
             <div className="space-y-3">
               {insights.map((insight) => (
-                <div
+                <Link
                   key={insight.blob_hash}
-                  className="p-4 rounded-xl bg-ink-900/50 border border-parchment-200/5 hover:border-purple-500/20 transition-all group"
+                  to={`/dashboard/mindstate?focus=${insight.blob_hash}`}
+                  className="block p-4 rounded-xl bg-ink-900/50 border border-parchment-200/5 hover:border-purple-500/20 transition-all group"
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div className="flex-1 min-w-0">
@@ -314,7 +328,7 @@ export default function Dashboard() {
                       </svg>
                     </div>
                   </div>
-                </div>
+                </Link>
               ))}
             </div>
           )}
