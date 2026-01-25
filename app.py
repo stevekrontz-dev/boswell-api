@@ -3907,9 +3907,19 @@ def backfill_tasks_to_memory():
     
     Tasks created before dual-write are orphaned from semantic search.
     This creates memory commits for all tasks missing the task:{id} tag.
+    Also ensures blob_hash column exists (Task Unification migration).
     """
     db = get_db()
     cur = get_cursor()
+    
+    # Ensure blob_hash column exists (idempotent migration)
+    try:
+        cur.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS blob_hash TEXT')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_blob_hash ON tasks(blob_hash)')
+        db.commit()
+    except Exception as e:
+        print(f"[BACKFILL] Migration note: {e}", file=sys.stderr)
+        db.rollback()
     
     backfilled = 0
     skipped = 0
