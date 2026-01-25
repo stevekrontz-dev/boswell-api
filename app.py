@@ -3257,6 +3257,12 @@ def create_task():
             (blob_hash, DEFAULT_TENANT, content_str, 'task', now, len(content_str))
         )
 
+        # Link task to blob for unified lookup
+        cur.execute(
+            '''UPDATE tasks SET blob_hash = %s WHERE id = %s AND tenant_id = %s''',
+            (blob_hash, task_id, DEFAULT_TENANT)
+        )
+
         # Generate embedding for semantic search
         embedding = generate_embedding(content_str)
         if embedding:
@@ -4020,6 +4026,11 @@ def backfill_tasks_to_memory():
                     INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
                     VALUES (%s, %s, %s, %s)
                 ''', (DEFAULT_TENANT, blob_hash, f"task:{task_id}", created_at))
+                
+                # Link task to blob (Task Unification)
+                cur.execute('''
+                    UPDATE tasks SET blob_hash = %s WHERE id = %s AND tenant_id = %s
+                ''', (blob_hash, task_id, DEFAULT_TENANT))
                 
                 backfilled += 1
                 db.commit()  # Commit each successful task
