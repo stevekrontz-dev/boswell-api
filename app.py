@@ -1719,14 +1719,25 @@ def semantic_startup():
 
     cur.close()
     
+    # Build timestamp first - this orients the AI temporally
+    now_utc = datetime.utcnow()
+    timestamp_utc = now_utc.isoformat() + 'Z'
+    
+    # Convert to Steve's local time (America/New_York)
+    from zoneinfo import ZoneInfo
+    eastern = ZoneInfo('America/New_York')
+    now_local = now_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(eastern)
+    local_time = now_local.strftime('%A, %B %d, %Y at %I:%M %p %Z')
+    
     response = {
+        'timestamp': timestamp_utc,
+        'local_time': local_time,
         'sacred_manifest': sacred_manifest,
         'tool_registry': tool_registry,
         'relevant_memories': relevant_memories,
         'hot_memories': hot_memories,
         'open_tasks': open_tasks,
-        'context_used': context,
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
+        'context_used': context
     }
     
     # If agent_id provided, add their specific tasks
