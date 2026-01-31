@@ -6545,24 +6545,27 @@ def mcp_handler():
                 "name": MCP_SERVER_NAME,
                 "version": MCP_SERVER_VERSION,
                 "title": "Boswell Memory System",
-                "description": "Git-style memory architecture for persistent context across Claude instances"
+                "description": "Git-style memory architecture for persistent context across AI instances"
             },
             "capabilities": {
                 "tools": {"listChanged": False}
             },
-            "instructions": """Boswell is Steve's external memory system. Use these tools proactively:
+            "instructions": """Boswell is a git-style memory system for AI instances. Use these tools proactively:
 
-WHEN TO CALL:
-- boswell_startup: FIRST thing every conversation, before responding
-- boswell_log/boswell_search: When asked about recent work and context is ambiguous
-- boswell_commit: To preserve decisions, insights, context worth remembering (capture WHY not just WHAT)
+STARTUP:
+- Call boswell_startup FIRST every conversation, before responding to anything
+- This loads active commitments and relevant context
+
+DURING CONVERSATION:
+- boswell_commit: Preserve decisions, insights, and context worth remembering. Capture WHY, not just WHAT.
+- boswell_search: Find past decisions when context is ambiguous
+- boswell_brief: Quick overview of recent activity and open tasks
+- boswell_log: View commit history on a branch
 
 BEHAVIORAL RULES:
-- If someone asks "what were we doing" and immediate context is empty, search Boswell before answering
-- Recent commits often contain the thread of work in progress
-- Check boswell_brief for open tasks and recent activity
-
-This is an exobrain. Use it like you'd use your own memory."""
+- If asked "what were we doing" and immediate context is empty, query Boswell before answering
+- Recent commits contain the thread of work in progress
+- Treat this as your external memory—use it like you'd use your own recall"""
         }
         return jsonify(mcp_success_response(req_id, result))
     
