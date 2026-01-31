@@ -1796,7 +1796,18 @@ def semantic_startup():
     if agent_id:
         response['agent_id'] = agent_id
         response['my_tasks'] = my_tasks
-    
+
+    # Surface quarantine alert if there are quarantined memories
+    try:
+        quarantine_count = get_quarantine_count()
+        if quarantine_count > 0:
+            response['quarantine_alert'] = {
+                'count': quarantine_count,
+                'message': f"{quarantine_count} memories quarantined - run boswell_quarantine_list to review"
+            }
+    except Exception:
+        pass  # immune system tables might not exist yet
+
     return jsonify(response)
 
 
@@ -4945,6 +4956,635 @@ def resurrect_trail():
         return jsonify({'error': str(e)}), 500
 
 
+# ==================== IMMUNE SYSTEM (Anomaly Detection & Quarantine) ====================
+
+def ensure_immune_tables():
+    """Create immune system tables if they don't exist."""
+    cur = get_cursor()
+
+    # Add quarantine columns to blobs
+    cur.execute('''
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'blobs' AND column_name = 'quarantined') THEN
+                ALTER TABLE blobs ADD COLUMN quarantined BOOLEAN DEFAULT FALSE;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'blobs' AND column_name = 'quarantined_at') THEN
+                ALTER TABLE blobs ADD COLUMN quarantined_at TIMESTAMPTZ;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'blobs' AND column_name = 'quarantine_reason') THEN
+                ALTER TABLE blobs ADD COLUMN quarantine_reason TEXT;
+            END IF;
+        END $$;
+    ''')
+
+    # Create partial index for quarantined blobs
+    cur.execute('''
+        CREATE INDEX IF NOT EXISTS idx_blobs_quarantined
+        ON blobs(quarantined) WHERE quarantined = TRUE
+    ''')
+
+    # Create immune_log table
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS immune_log (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            tenant_id UUID DEFAULT '00000000-0000-0000-0000-000000000001',
+            action VARCHAR(50) NOT NULL,
+            blob_hash VARCHAR(64),
+            patrol_type VARCHAR(50),
+            details JSONB,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    ''')
+
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_immune_log_action ON immune_log(action)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_immune_log_blob ON immune_log(blob_hash) WHERE blob_hash IS NOT NULL')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_immune_log_tenant ON immune_log(tenant_id)')
+
+    # Add health columns to branch_fingerprints if table exists
+    cur.execute('''
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'branch_fingerprints') THEN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_name = 'branch_fingerprints' AND column_name = 'health_score') THEN
+                    ALTER TABLE branch_fingerprints ADD COLUMN health_score FLOAT DEFAULT 1.0;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_name = 'branch_fingerprints' AND column_name = 'last_patrol') THEN
+                    ALTER TABLE branch_fingerprints ADD COLUMN last_patrol TIMESTAMPTZ;
+                END IF;
+            END IF;
+        END $$;
+    ''')
+
+    get_db().commit()
+    cur.close()
+
+
+def log_immune_action(action: str, blob_hash: str = None, patrol_type: str = None, details: dict = None):
+    """Log an immune system action for audit trail."""
+    cur = get_cursor()
+    cur.execute('''
+        INSERT INTO immune_log (tenant_id, action, blob_hash, patrol_type, details)
+        VALUES (%s, %s, %s, %s, %s)
+    ''', (DEFAULT_TENANT, action, blob_hash, patrol_type, json.dumps(details) if details else None))
+    get_db().commit()
+    cur.close()
+
+
+def quarantine_blob(blob_hash: str, reason: str, patrol_type: str = None):
+    """Quarantine a blob and log the action."""
+    cur = get_cursor()
+    cur.execute('''
+        UPDATE blobs SET quarantined = TRUE, quarantined_at = NOW(), quarantine_reason = %s
+        WHERE blob_hash = %s AND tenant_id = %s
+    ''', (reason, blob_hash, DEFAULT_TENANT))
+    get_db().commit()
+    cur.close()
+
+    log_immune_action('QUARANTINE', blob_hash, patrol_type, {'reason': reason})
+
+
+def get_quarantine_count() -> int:
+    """Get count of quarantined blobs."""
+    cur = get_cursor()
+    cur.execute('''
+        SELECT COUNT(*) as cnt FROM blobs
+        WHERE quarantined = TRUE AND tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+    row = cur.fetchone()
+    cur.close()
+    return row['cnt'] if row else 0
+
+
+# Patrol Routes - Anomaly Detectors
+
+def patrol_centroid_drift(threshold: float = 0.5) -> list:
+    """Detect blobs whose embeddings are too far from their branch centroid."""
+    findings = []
+    cur = get_cursor()
+
+    # Get all branch centroids
+    cur.execute('''
+        SELECT branch_name, centroid FROM branch_fingerprints
+        WHERE tenant_id = %s AND centroid IS NOT NULL
+    ''', (DEFAULT_TENANT,))
+    fingerprints = {row['branch_name']: row['centroid'] for row in cur.fetchall()}
+
+    if not fingerprints:
+        cur.close()
+        return findings
+
+    # Check each blob against its branch centroid
+    for branch_name, centroid in fingerprints.items():
+        cur.execute('''
+            SELECT b.blob_hash, b.embedding <=> %s::vector AS distance
+            FROM blobs b
+            JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+            JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+            JOIN branches br ON br.head_commit = c.commit_hash AND br.tenant_id = c.tenant_id
+            WHERE br.name = %s AND b.embedding IS NOT NULL
+              AND b.tenant_id = %s AND COALESCE(b.quarantined, FALSE) = FALSE
+              AND b.embedding <=> %s::vector > %s
+        ''', (centroid, branch_name, DEFAULT_TENANT, centroid, threshold))
+
+        for row in cur.fetchall():
+            findings.append({
+                'blob_hash': row['blob_hash'],
+                'reason': f"Embedding distance {row['distance']:.3f} exceeds threshold {threshold} for branch {branch_name}",
+                'distance': float(row['distance']),
+                'branch': branch_name
+            })
+
+    cur.close()
+    return findings
+
+
+def patrol_orphan_blobs() -> list:
+    """Detect blobs not referenced by any commit tree."""
+    findings = []
+    cur = get_cursor()
+
+    cur.execute('''
+        SELECT b.blob_hash, substring(b.content, 1, 100) as preview
+        FROM blobs b
+        LEFT JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+        WHERE t.id IS NULL AND b.tenant_id = %s AND COALESCE(b.quarantined, FALSE) = FALSE
+    ''', (DEFAULT_TENANT,))
+
+    for row in cur.fetchall():
+        findings.append({
+            'blob_hash': row['blob_hash'],
+            'reason': f"Orphan blob not referenced by any commit",
+            'preview': row['preview']
+        })
+
+    cur.close()
+    return findings
+
+
+def patrol_broken_links() -> list:
+    """Detect cross_references pointing to non-existent blobs."""
+    findings = []
+    cur = get_cursor()
+
+    # Check source_blob references
+    cur.execute('''
+        SELECT cr.id, cr.source_blob, cr.target_blob, cr.link_type
+        FROM cross_references cr
+        LEFT JOIN blobs b ON cr.source_blob = b.blob_hash AND cr.tenant_id = b.tenant_id
+        WHERE b.blob_hash IS NULL AND cr.tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+
+    for row in cur.fetchall():
+        findings.append({
+            'blob_hash': row['source_blob'],
+            'reason': f"Broken link: source_blob does not exist (link_type: {row['link_type']})",
+            'link_id': row['id'],
+            'target_blob': row['target_blob']
+        })
+
+    # Check target_blob references
+    cur.execute('''
+        SELECT cr.id, cr.source_blob, cr.target_blob, cr.link_type
+        FROM cross_references cr
+        LEFT JOIN blobs b ON cr.target_blob = b.blob_hash AND cr.tenant_id = b.tenant_id
+        WHERE b.blob_hash IS NULL AND cr.tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+
+    for row in cur.fetchall():
+        findings.append({
+            'blob_hash': row['target_blob'],
+            'reason': f"Broken link: target_blob does not exist (link_type: {row['link_type']})",
+            'link_id': row['id'],
+            'source_blob': row['source_blob']
+        })
+
+    cur.close()
+    return findings
+
+
+def patrol_isolated_clusters() -> list:
+    """Detect blobs with no trails and no cross_references (isolated memories)."""
+    findings = []
+    cur = get_cursor()
+
+    # Find blobs with no outgoing/incoming trails AND no cross_references
+    cur.execute('''
+        SELECT b.blob_hash, substring(b.content, 1, 100) as preview
+        FROM blobs b
+        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+        LEFT JOIN trails tr_out ON b.blob_hash = tr_out.source_blob
+        LEFT JOIN trails tr_in ON b.blob_hash = tr_in.target_blob
+        LEFT JOIN cross_references cr_out ON b.blob_hash = cr_out.source_blob AND b.tenant_id = cr_out.tenant_id
+        LEFT JOIN cross_references cr_in ON b.blob_hash = cr_in.target_blob AND b.tenant_id = cr_in.tenant_id
+        WHERE b.tenant_id = %s
+          AND COALESCE(b.quarantined, FALSE) = FALSE
+          AND tr_out.id IS NULL AND tr_in.id IS NULL
+          AND cr_out.id IS NULL AND cr_in.id IS NULL
+    ''', (DEFAULT_TENANT,))
+
+    for row in cur.fetchall():
+        findings.append({
+            'blob_hash': row['blob_hash'],
+            'reason': "Isolated memory: no trails or cross-references",
+            'preview': row['preview']
+        })
+
+    cur.close()
+    return findings
+
+
+def patrol_duplicate_embeddings(threshold: float = 0.02) -> list:
+    """Detect near-identical embeddings (possible duplicates)."""
+    findings = []
+    cur = get_cursor()
+
+    # Find pairs of blobs with very similar embeddings
+    cur.execute('''
+        SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
+               b1.embedding <=> b2.embedding AS distance
+        FROM blobs b1
+        JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
+        WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
+          AND b1.tenant_id = %s
+          AND COALESCE(b1.quarantined, FALSE) = FALSE
+          AND COALESCE(b2.quarantined, FALSE) = FALSE
+          AND b1.embedding <=> b2.embedding < %s
+        LIMIT 50
+    ''', (DEFAULT_TENANT, threshold))
+
+    seen = set()
+    for row in cur.fetchall():
+        # Only report the second blob (keep the older one)
+        if row['blob2'] not in seen:
+            findings.append({
+                'blob_hash': row['blob2'],
+                'reason': f"Near-duplicate of {row['blob1'][:12]}... (distance: {row['distance']:.4f})",
+                'duplicate_of': row['blob1'],
+                'distance': float(row['distance'])
+            })
+            seen.add(row['blob2'])
+
+    cur.close()
+    return findings
+
+
+def patrol_stale_checkpoints(days: int = 30) -> list:
+    """Detect session checkpoints older than threshold."""
+    findings = []
+    cur = get_cursor()
+
+    try:
+        cur.execute('''
+            SELECT s.session_id, s.synced_at, s.status, substring(s.content, 1, 100) as preview
+            FROM sessions s
+            WHERE s.tenant_id = %s
+              AND s.synced_at < NOW() - INTERVAL '%s days'
+              AND s.status != 'archived'
+        ''', (DEFAULT_TENANT, days))
+
+        for row in cur.fetchall():
+            findings.append({
+                'blob_hash': row['session_id'],  # Use session_id as identifier
+                'reason': f"Stale checkpoint: {days}+ days old (synced: {row['synced_at']})",
+                'status': row['status'],
+                'preview': row['preview']
+            })
+    except Exception:
+        # sessions table might not have synced_at column
+        pass
+
+    cur.close()
+    return findings
+
+
+# Define patrol routes
+PATROL_ROUTES = [
+    {'name': 'CENTROID_DRIFT', 'detector': patrol_centroid_drift},
+    {'name': 'ORPHAN_BLOB', 'detector': patrol_orphan_blobs},
+    {'name': 'BROKEN_LINK', 'detector': patrol_broken_links},
+    {'name': 'ISOLATED_CLUSTER', 'detector': patrol_isolated_clusters},
+    {'name': 'DUPLICATE_EMBEDDING', 'detector': patrol_duplicate_embeddings},
+    {'name': 'STALE_CHECKPOINT', 'detector': patrol_stale_checkpoints},
+]
+
+
+@app.route('/v2/immune/patrol', methods=['POST'])
+def immune_patrol():
+    """Run immune system patrol - detect and quarantine anomalies.
+
+    POST body (optional):
+    - auto_quarantine: bool (default: True) - whether to quarantine findings
+    - routes: list[str] - specific routes to run (default: all)
+    """
+    import uuid as uuid_module
+    ensure_immune_tables()
+
+    start_time = time.time()
+    data = request.get_json() or {}
+    auto_quarantine = data.get('auto_quarantine', True)
+    route_filter = data.get('routes')  # Optional list of route names
+
+    results = {
+        'patrol_id': str(uuid_module.uuid4()),
+        'started_at': datetime.utcnow().isoformat() + 'Z',
+        'routes_checked': [],
+        'quarantined': [],
+        'findings': [],  # All findings regardless of quarantine
+        'errors': []
+    }
+
+    # Log patrol start
+    log_immune_action('PATROL_START', details={'patrol_id': results['patrol_id']})
+
+    # Run each patrol route
+    for route in PATROL_ROUTES:
+        if route_filter and route['name'] not in route_filter:
+            continue
+
+        try:
+            findings = route['detector']()
+            results['routes_checked'].append({
+                'route': route['name'],
+                'findings_count': len(findings)
+            })
+
+            for finding in findings:
+                results['findings'].append({
+                    'route': route['name'],
+                    **finding
+                })
+
+                if auto_quarantine and 'blob_hash' in finding:
+                    try:
+                        quarantine_blob(finding['blob_hash'], finding['reason'], route['name'])
+                        results['quarantined'].append({
+                            'blob_hash': finding['blob_hash'],
+                            'route': route['name'],
+                            'reason': finding['reason']
+                        })
+                    except Exception as qe:
+                        results['errors'].append({
+                            'route': route['name'],
+                            'blob_hash': finding.get('blob_hash'),
+                            'error': f"Quarantine failed: {str(qe)}"
+                        })
+
+        except Exception as e:
+            results['errors'].append({'route': route['name'], 'error': str(e)})
+
+    # Update branch health scores
+    try:
+        cur = get_cursor()
+        cur.execute('''
+            UPDATE branch_fingerprints SET last_patrol = NOW()
+            WHERE tenant_id = %s
+        ''', (DEFAULT_TENANT,))
+        get_db().commit()
+        cur.close()
+    except Exception:
+        pass
+
+    # Log patrol end
+    results['duration_seconds'] = round(time.time() - start_time, 2)
+    results['completed_at'] = datetime.utcnow().isoformat() + 'Z'
+    log_immune_action('PATROL_END', details={
+        'patrol_id': results['patrol_id'],
+        'routes_checked': len(results['routes_checked']),
+        'findings_count': len(results['findings']),
+        'quarantined_count': len(results['quarantined']),
+        'duration_seconds': results['duration_seconds']
+    })
+
+    return jsonify(results)
+
+
+@app.route('/v2/immune/quarantine', methods=['GET'])
+def list_quarantine():
+    """List all quarantined memories awaiting human review."""
+    ensure_immune_tables()
+
+    limit = request.args.get('limit', 50, type=int)
+
+    cur = get_cursor()
+    cur.execute('''
+        SELECT b.blob_hash, substring(b.content, 1, 300) as content_preview,
+               b.quarantine_reason, b.quarantined_at, b.created_at as blob_created,
+               c.message as commit_message
+        FROM blobs b
+        LEFT JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+        LEFT JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+        WHERE b.quarantined = TRUE AND b.tenant_id = %s
+        ORDER BY b.quarantined_at DESC
+        LIMIT %s
+    ''', (DEFAULT_TENANT, limit))
+
+    quarantined = []
+    for row in cur.fetchall():
+        quarantined.append({
+            'blob_hash': row['blob_hash'],
+            'content_preview': row['content_preview'],
+            'quarantine_reason': row['quarantine_reason'],
+            'quarantined_at': row['quarantined_at'].isoformat() if row['quarantined_at'] else None,
+            'blob_created_at': row['blob_created'].isoformat() if row['blob_created'] else None,
+            'commit_message': row['commit_message']
+        })
+
+    cur.close()
+    return jsonify({
+        'count': len(quarantined),
+        'quarantined': quarantined
+    })
+
+
+@app.route('/v2/immune/quarantine/<blob_hash>/resolve', methods=['POST'])
+def resolve_quarantine(blob_hash):
+    """Resolve a quarantined memory: reinstate or delete.
+
+    POST body:
+    - action: "reinstate" | "delete" (required)
+    - reason: str (optional) - why reinstating/deleting
+    """
+    ensure_immune_tables()
+
+    data = request.get_json() or {}
+    action = data.get('action')
+    reason = data.get('reason', '')
+
+    if action not in ('reinstate', 'delete'):
+        return jsonify({'error': 'action must be "reinstate" or "delete"'}), 400
+
+    cur = get_cursor()
+    db = get_db()
+
+    # Verify blob exists and is quarantined
+    cur.execute('''
+        SELECT blob_hash, quarantine_reason FROM blobs
+        WHERE blob_hash = %s AND tenant_id = %s AND quarantined = TRUE
+    ''', (blob_hash, DEFAULT_TENANT))
+
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        return jsonify({'error': 'Blob not found or not quarantined'}), 404
+
+    original_reason = row['quarantine_reason']
+
+    try:
+        if action == 'reinstate':
+            # Clear quarantine flags
+            cur.execute('''
+                UPDATE blobs SET quarantined = FALSE, quarantined_at = NULL, quarantine_reason = NULL
+                WHERE blob_hash = %s AND tenant_id = %s
+            ''', (blob_hash, DEFAULT_TENANT))
+            db.commit()
+
+            log_immune_action('REINSTATE', blob_hash, details={
+                'original_reason': original_reason,
+                'reinstate_reason': reason
+            })
+
+            cur.close()
+            return jsonify({
+                'status': 'reinstated',
+                'blob_hash': blob_hash,
+                'message': f"Memory reinstated: {reason}" if reason else "Memory reinstated"
+            })
+
+        else:  # delete
+            # Delete blob and associated data
+            cur.execute('DELETE FROM tree_entries WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+            cur.execute('DELETE FROM cross_references WHERE (source_blob = %s OR target_blob = %s) AND tenant_id = %s',
+                       (blob_hash, blob_hash, DEFAULT_TENANT))
+            cur.execute('DELETE FROM tags WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+
+            # Delete from trails if table exists
+            try:
+                cur.execute('DELETE FROM trails WHERE source_blob = %s OR target_blob = %s', (blob_hash, blob_hash))
+            except Exception:
+                pass
+
+            cur.execute('DELETE FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+            db.commit()
+
+            log_immune_action('DELETE', blob_hash, details={
+                'original_reason': original_reason,
+                'delete_reason': reason
+            })
+
+            cur.close()
+            return jsonify({
+                'status': 'deleted',
+                'blob_hash': blob_hash,
+                'message': f"Memory permanently deleted: {reason}" if reason else "Memory permanently deleted"
+            })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/immune/status', methods=['GET'])
+def immune_status():
+    """Get immune system health: quarantine counts, last patrol, branch health."""
+    ensure_immune_tables()
+
+    cur = get_cursor()
+
+    # Get quarantine count
+    cur.execute('''
+        SELECT COUNT(*) as cnt FROM blobs
+        WHERE quarantined = TRUE AND tenant_id = %s
+    ''', (DEFAULT_TENANT,))
+    quarantine_count = cur.fetchone()['cnt']
+
+    # Get last patrol info
+    last_patrol = None
+    last_patrol_findings = 0
+    cur.execute('''
+        SELECT details, created_at FROM immune_log
+        WHERE action = 'PATROL_END' AND tenant_id = %s
+        ORDER BY created_at DESC LIMIT 1
+    ''', (DEFAULT_TENANT,))
+    row = cur.fetchone()
+    if row:
+        last_patrol = row['created_at'].isoformat() if row['created_at'] else None
+        details = row['details'] or {}
+        last_patrol_findings = details.get('findings_count', 0)
+
+    # Get branch health
+    branch_health = []
+    try:
+        cur.execute('''
+            SELECT branch_name, health_score, last_patrol, last_updated,
+                   EXTRACT(EPOCH FROM (NOW() - last_updated)) / 86400 as centroid_age_days
+            FROM branch_fingerprints
+            WHERE tenant_id = %s AND centroid IS NOT NULL
+        ''', (DEFAULT_TENANT,))
+
+        for row in cur.fetchall():
+            branch_health.append({
+                'branch': row['branch_name'],
+                'health_score': float(row['health_score']) if row['health_score'] else 1.0,
+                'centroid_age_days': round(float(row['centroid_age_days']), 1) if row['centroid_age_days'] else None,
+                'last_patrol': row['last_patrol'].isoformat() if row['last_patrol'] else None
+            })
+    except Exception:
+        pass
+
+    cur.close()
+
+    return jsonify({
+        'quarantine_count': quarantine_count,
+        'last_patrol': last_patrol,
+        'last_patrol_findings': last_patrol_findings,
+        'branch_health': branch_health,
+        'patrol_routes': [r['name'] for r in PATROL_ROUTES]
+    })
+
+
+@app.route('/v2/immune/log', methods=['GET'])
+def immune_log():
+    """Get immune system audit log."""
+    limit = request.args.get('limit', 50, type=int)
+    action_filter = request.args.get('action')  # Optional filter by action
+
+    cur = get_cursor()
+
+    if action_filter:
+        cur.execute('''
+            SELECT * FROM immune_log
+            WHERE tenant_id = %s AND action = %s
+            ORDER BY created_at DESC LIMIT %s
+        ''', (DEFAULT_TENANT, action_filter, limit))
+    else:
+        cur.execute('''
+            SELECT * FROM immune_log
+            WHERE tenant_id = %s
+            ORDER BY created_at DESC LIMIT %s
+        ''', (DEFAULT_TENANT, limit))
+
+    entries = []
+    for row in cur.fetchall():
+        entries.append({
+            'id': str(row['id']),
+            'action': row['action'],
+            'blob_hash': row['blob_hash'],
+            'patrol_type': row['patrol_type'],
+            'details': row['details'],
+            'created_at': row['created_at'].isoformat() if row['created_at'] else None
+        })
+
+    cur.close()
+    return jsonify({'entries': entries, 'count': len(entries)})
+
+
 # ==================== BRANCH FINGERPRINTS (Intelligent Routing) ====================
 
 def ensure_fingerprints_table():
@@ -6301,6 +6941,38 @@ MCP_TOOLS = [
             "required": ["content"]
         }
     },
+    # ===== IMMUNE SYSTEM TOOLS =====
+    {
+        "name": "boswell_quarantine_list",
+        "description": "List all quarantined memories awaiting human review. Quarantined memories are anomalies detected by the immune system patrol. Review and resolve them with boswell_quarantine_resolve.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max entries to return (default: 50)", "default": 50}
+            }
+        }
+    },
+    {
+        "name": "boswell_quarantine_resolve",
+        "description": "Resolve a quarantined memory: reinstate it to active status or permanently delete it. Always provide a reason explaining your decision.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "blob_hash": {"type": "string", "description": "Hash of the quarantined blob"},
+                "action": {"type": "string", "enum": ["reinstate", "delete"], "description": "Whether to reinstate or delete"},
+                "reason": {"type": "string", "description": "Why you're reinstating or deleting this memory"}
+            },
+            "required": ["blob_hash", "action"]
+        }
+    },
+    {
+        "name": "boswell_immune_status",
+        "description": "Get immune system health: quarantine counts, last patrol time, branch health scores. Use to monitor memory graph health.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
 ]
 
 def mcp_error_response(req_id, code, message):
@@ -6563,6 +7235,31 @@ def dispatch_mcp_tool(tool_name, args):
             "branch": args.get("branch", "command-center")
         }
         return invoke_view(validate_commit_routing, method='POST', json_data=json_data)
+
+    # ===== IMMUNE SYSTEM TOOLS =====
+
+    elif tool_name == "boswell_quarantine_list":
+        qs = {}
+        if "limit" in args:
+            qs["limit"] = args["limit"]
+        return invoke_view(list_quarantine, query_string=qs if qs else None)
+
+    elif tool_name == "boswell_quarantine_resolve":
+        blob_hash = args["blob_hash"]
+        json_data = {
+            "action": args["action"],
+            "reason": args.get("reason", "")
+        }
+        return invoke_view(
+            resolve_quarantine,
+            method='POST',
+            path=f'/v2/immune/quarantine/{blob_hash}/resolve',
+            json_data=json_data,
+            view_args={"blob_hash": blob_hash}
+        )
+
+    elif tool_name == "boswell_immune_status":
+        return invoke_view(immune_status)
 
     else:
         return {"error": f"Unknown tool: {tool_name}"}, 400
