@@ -1509,10 +1509,15 @@ def semantic_startup():
     - context: Optional context string to search for relevant memories
     - k: Number of relevant memories to return (default: 5)
     - agent_id: Optional agent ID to filter tasks assigned to this agent
+    - verbosity: minimal | normal | full (default: normal)
+      - minimal: sacred_manifest + top 3 tasks (slim) + local_time
+      - normal: sacred_manifest + tasks (5) + relevant_memories (3) - no tool_registry
+      - full: everything including tool_registry and hot_memories
     """
     context = request.args.get('context', 'important decisions and active commitments')
     k = request.args.get('k', 5, type=int)
     agent_id = request.args.get('agent_id')  # Filter tasks for specific agent
+    verbosity = request.args.get('verbosity', 'normal')  # minimal, normal, full
 
     cur = get_cursor()
 
@@ -1729,16 +1734,63 @@ def semantic_startup():
     now_local = now_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(eastern)
     local_time = now_local.strftime('%A, %B %d, %Y at %I:%M %p %Z')
     
-    response = {
-        'timestamp': timestamp_utc,
-        'local_time': local_time,
-        'sacred_manifest': sacred_manifest,
-        'tool_registry': tool_registry,
-        'relevant_memories': relevant_memories,
-        'hot_memories': hot_memories,
-        'open_tasks': open_tasks,
-        'context_used': context
-    }
+    # Build response based on verbosity level
+    if verbosity == 'minimal':
+        # Bare essentials: sacred manifest + top 3 tasks (slim)
+        slim_tasks = [{
+            'id': t['id'],
+            'description': t['description'][:200],  # Truncate long descriptions
+            'priority': t['priority']
+        } for t in open_tasks[:3]]
+        
+        response = {
+            'local_time': local_time,
+            'sacred_manifest': sacred_manifest,
+            'open_tasks': slim_tasks,
+            'verbosity': 'minimal'
+        }
+    elif verbosity == 'full':
+        # Everything for debugging
+        response = {
+            'timestamp': timestamp_utc,
+            'local_time': local_time,
+            'sacred_manifest': sacred_manifest,
+            'tool_registry': tool_registry,
+            'relevant_memories': relevant_memories,
+            'hot_memories': hot_memories,
+            'open_tasks': open_tasks,
+            'context_used': context,
+            'verbosity': 'full'
+        }
+    else:
+        # normal (default): balanced payload
+        # - No tool_registry (he knows his tools)
+        # - Cap tasks at 5, trim metadata
+        # - Cap relevant_memories at 3
+        # - No hot_memories (redundant with relevant)
+        trimmed_tasks = [{
+            'id': t['id'],
+            'description': t['description'],
+            'branch': t['branch'],
+            'priority': t['priority'],
+            'assigned_to': t['assigned_to']
+        } for t in open_tasks[:5]]
+        
+        trimmed_memories = [{
+            'blob_hash': m['blob_hash'],
+            'message': m['message'],
+            'distance': m.get('distance')
+        } for m in relevant_memories[:3]]
+        
+        response = {
+            'timestamp': timestamp_utc,
+            'local_time': local_time,
+            'sacred_manifest': sacred_manifest,
+            'relevant_memories': trimmed_memories,
+            'open_tasks': trimmed_tasks,
+            'context_used': context,
+            'verbosity': 'normal'
+        }
     
     # If agent_id provided, add their specific tasks
     if agent_id:
@@ -5909,12 +5961,13 @@ def invoke_view(view_fn, method='GET', path='/', query_string=None, json_data=No
 MCP_TOOLS = [
     {
         "name": "boswell_startup",
-        "description": "Load startup context. Returns sacred commitments, open tasks, and relevant memories. CALL THIS FIRST at conversation start, before responding to anything—even 'hi'. Sets the stage for continuity.",
+        "description": "Load startup context. Returns sacred commitments, open tasks, and relevant memories. CALL THIS FIRST at conversation start, before responding to anything—even 'hi'. Sets the stage for continuity. Use verbosity='minimal' for greetings, 'normal' (default) for work, 'full' for debugging.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "context": {"type": "string", "description": "Optional context for semantic retrieval (default: 'important decisions and active commitments')"},
-                "k": {"type": "integer", "description": "Number of relevant memories to return (default: 5)", "default": 5}
+                "k": {"type": "integer", "description": "Number of relevant memories to return (default: 5)", "default": 5},
+                "verbosity": {"type": "string", "enum": ["minimal", "normal", "full"], "description": "Response size: minimal (greeting), normal (work), full (debug)", "default": "normal"}
             }
         }
     },
