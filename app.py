@@ -6303,8 +6303,6 @@ MCP_TOOLS = [
     },
 ]
 
-]
-
 def mcp_error_response(req_id, code, message):
     """Build JSON-RPC error response."""
     return {
