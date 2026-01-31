@@ -6543,11 +6543,26 @@ def mcp_handler():
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "serverInfo": {
                 "name": MCP_SERVER_NAME,
-                "version": MCP_SERVER_VERSION
+                "version": MCP_SERVER_VERSION,
+                "title": "Boswell Memory System",
+                "description": "Git-style memory architecture for persistent context across Claude instances"
             },
             "capabilities": {
                 "tools": {"listChanged": False}
-            }
+            },
+            "instructions": """Boswell is Steve's external memory system. Use these tools proactively:
+
+WHEN TO CALL:
+- boswell_startup: FIRST thing every conversation, before responding
+- boswell_log/boswell_search: When asked about recent work and context is ambiguous
+- boswell_commit: To preserve decisions, insights, context worth remembering (capture WHY not just WHAT)
+
+BEHAVIORAL RULES:
+- If someone asks "what were we doing" and immediate context is empty, search Boswell before answering
+- Recent commits often contain the thread of work in progress
+- Check boswell_brief for open tasks and recent activity
+
+This is an exobrain. Use it like you'd use your own memory."""
         }
         return jsonify(mcp_success_response(req_id, result))
     
