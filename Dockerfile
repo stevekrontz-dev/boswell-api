@@ -18,6 +18,9 @@ COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY extension/ ./extension/
 
+# Copy database migrations (needed for ensure_hippocampal_tables)
+COPY db/ ./db/
+
 # Copy pre-built React dashboard (built locally, committed to repo)
 COPY static/dist/ ./static/dist/
 
