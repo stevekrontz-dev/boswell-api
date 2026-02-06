@@ -1,0 +1,31 @@
+name: Daily Trail Decay
+
+on:
+  schedule:
+    # Run at 6am UTC daily
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  decay:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger trail decay
+        run: |
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://delightful-imagination-production-f6a1.up.railway.app/v2/trails/decay" \
+            -H "Content-Type: application/json")
+
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          echo "Response: $body"
+          echo "HTTP Status: $http_code"
+
+          if [ "$http_code" -ne 200 ]; then
+            echo "Decay request failed with status $http_code"
+            exit 1
+          fi
+
+          echo "Trail decay completed successfully"
