@@ -1262,6 +1262,8 @@ def get_log():
 @app.route('/v2/search', methods=['GET'])
 def search_memories():
     """Search memories across branches."""
+    if HIPPOCAMPAL_ENABLED:
+        ensure_hippocampal_tables()
     query = request.args.get('q', '')
     memory_type = request.args.get('type')
     limit = request.args.get('limit', 20, type=int)
@@ -1351,6 +1353,9 @@ def semantic_search():
     - q: Search query (required)
     - limit: Max results (default: 10)
     """
+    if HIPPOCAMPAL_ENABLED:
+        ensure_hippocampal_tables()
+
     query = request.args.get('q', '')
     limit = request.args.get('limit', 10, type=int)
 
@@ -1656,6 +1661,8 @@ def semantic_startup():
     Uses semantic search to find the most relevant memories for the
     current conversation context, rather than hardcoded lookups.
 
+    If HIPPOCAMPAL_ENABLED, also returns recent bookmarks from working memory.
+
     Query params:
     - context: Optional context string to search for relevant memories
     - k: Number of relevant memories to return (default: 5)
@@ -1876,6 +1883,7 @@ def semantic_startup():
     # v4: Recent bookmarks (working memory / RAM)
     recent_bookmarks = []
     if HIPPOCAMPAL_ENABLED:
+        ensure_hippocampal_tables()
         try:
             cur.execute("""
                 SELECT id, branch, summary, salience, replay_count, created_at, expires_at
