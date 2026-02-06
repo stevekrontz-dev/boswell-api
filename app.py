@@ -57,6 +57,9 @@ def generate_embedding(text: str) -> list:
 app = Flask(__name__)
 CORS(app)
 
+# Hippocampal memory staging (v4.0)
+HIPPOCAMPAL_ENABLED = os.environ.get('HIPPOCAMPAL_ENABLED', 'true').lower() == 'true'
+
 # Encryption support (Phase 2)
 ENCRYPTION_ENABLED = os.environ.get('ENCRYPTION_ENABLED', 'false').lower() == 'true'
 CREDENTIALS_PATH = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'service-account-key.json')
@@ -1299,8 +1302,42 @@ def search_memories():
             'created_at': str(row['created_at']) if row['created_at'] else None,
             'commit_hash': row['commit_hash'],
             'message': row['message'],
-            'author': row['author']
+            'author': row['author'],
+            'source': 'permanent'
         })
+
+    # v4: Also search candidate_memories (RAM) if enabled
+    if HIPPOCAMPAL_ENABLED:
+        try:
+            remaining = limit - len(results)
+            if remaining > 0:
+                cur.execute("""
+                    SELECT id, branch, summary, content, message, source_instance,
+                           created_at
+                    FROM candidate_memories
+                    WHERE tenant_id = %s AND status IN ('active', 'cooling')
+                      AND (summary ILIKE %s OR content::text ILIKE %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (DEFAULT_TENANT, f'%{query}%', f'%{query}%', remaining))
+
+                for row in cur.fetchall():
+                    content = row['summary']
+                    if row['content']:
+                        content_str = json.dumps(row['content'], default=str) if isinstance(row['content'], dict) else str(row['content'])
+                        content = f"{row['summary']}\n{content_str}"
+                    results.append({
+                        'blob_hash': str(row['id']),
+                        'content': content[:500] + '...' if len(content) > 500 else content,
+                        'content_type': 'staged',
+                        'created_at': str(row['created_at']) if row['created_at'] else None,
+                        'commit_hash': None,
+                        'message': row['message'],
+                        'author': row['source_instance'],
+                        'source': 'staged'
+                    })
+        except Exception as e:
+            print(f"[SEARCH] Candidate search error: {e}", file=sys.stderr)
 
     cur.close()
     return jsonify({'query': query, 'results': results, 'count': len(results)})
@@ -1331,24 +1368,64 @@ def semantic_search():
     ensure_deprecated_commits_table()
     cur = get_cursor()
 
-    # Vector cosine search using pgvector (excluding deprecated commits)
-    cur.execute("""
-        SELECT b.blob_hash, b.content, b.content_type, b.created_at,
-               c.commit_hash, c.message, c.author,
-               b.embedding <=> %s::vector AS distance
-        FROM blobs b
-        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
-        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
-        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
-        ORDER BY distance
-        LIMIT %s
-    """, (query_embedding, DEFAULT_TENANT, limit))
+    if HIPPOCAMPAL_ENABLED:
+        # v4: UNION permanent memories with staged candidates (recency-boosted)
+        cur.execute("""
+            SELECT * FROM (
+                SELECT b.blob_hash, b.content, b.content_type, b.created_at,
+                       c.commit_hash, c.message, c.author,
+                       b.embedding <=> %s::vector AS distance,
+                       'permanent' as source
+                FROM blobs b
+                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+                WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
+
+                UNION ALL
+
+                SELECT cm.id::text as blob_hash, cm.summary as content, 'staged' as content_type,
+                       cm.created_at, NULL as commit_hash, cm.message,
+                       cm.source_instance as author,
+                       (cm.embedding <=> %s::vector) -
+                         CASE WHEN cm.created_at > NOW() - INTERVAL '24 hours' THEN 0.1
+                              WHEN cm.created_at > NOW() - INTERVAL '72 hours' THEN 0.05
+                              ELSE 0 END AS distance,
+                       'staged' as source
+                FROM candidate_memories cm
+                WHERE cm.embedding IS NOT NULL AND cm.tenant_id = %s
+                  AND cm.status IN ('active', 'cooling')
+            ) combined
+            ORDER BY distance
+            LIMIT %s
+        """, (query_embedding, DEFAULT_TENANT, query_embedding, DEFAULT_TENANT, limit))
+    else:
+        # Legacy: permanent memories only
+        cur.execute("""
+            SELECT b.blob_hash, b.content, b.content_type, b.created_at,
+                   c.commit_hash, c.message, c.author,
+                   b.embedding <=> %s::vector AS distance,
+                   'permanent' as source
+            FROM blobs b
+            JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+            JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+            LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+            WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
+            ORDER BY distance
+            LIMIT %s
+        """, (query_embedding, DEFAULT_TENANT, limit))
 
     results = []
-    for row in cur.fetchall():
+    staged_in_top3 = []  # Track staged candidates for auto-replay
+    for idx, row in enumerate(cur.fetchall()):
         content = row['content']
-        results.append({
+        source = row.get('source', 'permanent') if isinstance(row, dict) else 'permanent'
+        try:
+            source = row['source']
+        except (KeyError, TypeError):
+            source = 'permanent'
+
+        result_entry = {
             'blob_hash': row['blob_hash'],
             'content': content[:500] + '...' if len(content) > 500 else content,
             'content_type': row['content_type'],
@@ -1356,8 +1433,82 @@ def semantic_search():
             'commit_hash': row['commit_hash'],
             'message': row['message'],
             'author': row['author'],
-            'distance': float(row['distance'])
-        })
+            'distance': float(row['distance']),
+            'source': source
+        }
+        results.append(result_entry)
+
+        # Collect staged candidates in top 3 for auto-replay
+        if HIPPOCAMPAL_ENABLED and source == 'staged' and idx < 3:
+            staged_in_top3.append(row['blob_hash'])  # This is the candidate UUID
+
+    # Auto-replay: fire replay for staged candidates in top 3 if context is different
+    if HIPPOCAMPAL_ENABLED and staged_in_top3:
+        import uuid as uuid_mod
+        for cand_id in staged_in_top3:
+            try:
+                cur.execute("""
+                    SELECT id, context_embedding, embedding, replay_count, expires_at
+                    FROM candidate_memories
+                    WHERE id = %s AND tenant_id = %s
+                """, (cand_id, DEFAULT_TENANT))
+                cand = cur.fetchone()
+                if not cand:
+                    continue
+
+                # Determine threshold and which embedding to compare
+                if cand['context_embedding'] is not None:
+                    # Compare query vs context_embedding (0.3 threshold)
+                    cur.execute("SELECT %s::vector <=> %s::vector AS ctx_distance",
+                                (query_embedding, cand['context_embedding']))
+                    dist_row = cur.fetchone()
+                    ctx_distance = float(dist_row['ctx_distance'])
+                    threshold = 0.3
+                    context_type = 'context_embedding'
+                else:
+                    # Fallback: compare query vs content embedding (0.5 stricter threshold)
+                    cur.execute("SELECT %s::vector <=> %s::vector AS ctx_distance",
+                                (query_embedding, cand['embedding']))
+                    dist_row = cur.fetchone()
+                    ctx_distance = float(dist_row['ctx_distance'])
+                    threshold = 0.5
+                    context_type = 'content_fallback'
+
+                if ctx_distance > threshold:
+                    # Different context — fire replay
+                    cur.execute("UPDATE candidate_memories SET replay_count = replay_count + 1 WHERE id = %s",
+                                (cand_id,))
+                    # Near-expiry rescue
+                    cur.execute("""
+                        UPDATE candidate_memories
+                        SET expires_at = expires_at + INTERVAL '3 days'
+                        WHERE id = %s AND replay_count >= 3
+                          AND expires_at < NOW() + INTERVAL '48 hours'
+                          AND expires_at > NOW()
+                    """, (cand_id,))
+                    cur.execute("""
+                        INSERT INTO replay_events (id, tenant_id, candidate_id, session_id,
+                                                   replay_context, similarity_score, fired,
+                                                   threshold_used, context_type)
+                        VALUES (%s, %s, %s, NULL, %s, %s, true, %s, %s)
+                    """, (str(uuid_mod.uuid4()), DEFAULT_TENANT, cand_id,
+                          query[:200], ctx_distance, threshold, context_type))
+                elif ctx_distance > (threshold - 0.1):
+                    # Near-miss — log for tuning but don't fire
+                    cur.execute("""
+                        INSERT INTO replay_events (id, tenant_id, candidate_id, session_id,
+                                                   replay_context, similarity_score, fired,
+                                                   threshold_used, context_type)
+                        VALUES (%s, %s, %s, NULL, %s, %s, false, %s, %s)
+                    """, (str(uuid_mod.uuid4()), DEFAULT_TENANT, cand_id,
+                          query[:200], ctx_distance, threshold, context_type))
+            except Exception as e:
+                print(f"[AUTO-REPLAY] Error for candidate {cand_id}: {e}", file=sys.stderr)
+
+        try:
+            get_db().commit()
+        except Exception:
+            pass
 
     cur.close()
     return jsonify({'query': query, 'results': results, 'count': len(results)})
@@ -1722,18 +1873,43 @@ def semantic_startup():
         # tasks table might not exist - that's ok
         pass
 
+    # v4: Recent bookmarks (working memory / RAM)
+    recent_bookmarks = []
+    if HIPPOCAMPAL_ENABLED:
+        try:
+            cur.execute("""
+                SELECT id, branch, summary, salience, replay_count, created_at, expires_at
+                FROM candidate_memories
+                WHERE tenant_id = %s AND status IN ('active', 'cooling')
+                  AND created_at > NOW() - INTERVAL '48 hours'
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (DEFAULT_TENANT,))
+            for row in cur.fetchall():
+                recent_bookmarks.append({
+                    'id': str(row['id']),
+                    'branch': row['branch'],
+                    'summary': row['summary'],
+                    'salience': row['salience'],
+                    'replay_count': row['replay_count'],
+                    'created_at': str(row['created_at']) if row['created_at'] else None,
+                    'expires_at': str(row['expires_at']) if row['expires_at'] else None
+                })
+        except Exception as e:
+            print(f"[STARTUP] Bookmark fetch error: {e}", file=sys.stderr)
+
     cur.close()
-    
+
     # Build timestamp first - this orients the AI temporally
     now_utc = datetime.utcnow()
     timestamp_utc = now_utc.isoformat() + 'Z'
-    
+
     # Convert to Steve's local time (America/New_York)
     from zoneinfo import ZoneInfo
     eastern = ZoneInfo('America/New_York')
     now_local = now_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(eastern)
     local_time = now_local.strftime('%A, %B %d, %Y at %I:%M %p %Z')
-    
+
     # Build response based on verbosity level
     if verbosity == 'minimal':
         # Bare essentials: sacred manifest + top 3 tasks (slim)
@@ -1742,7 +1918,7 @@ def semantic_startup():
             'description': t['description'][:200],  # Truncate long descriptions
             'priority': t['priority']
         } for t in open_tasks[:3]]
-        
+
         response = {
             'local_time': local_time,
             'sacred_manifest': sacred_manifest,
@@ -1764,10 +1940,6 @@ def semantic_startup():
         }
     else:
         # normal (default): balanced payload
-        # - No tool_registry (he knows his tools)
-        # - Cap tasks at 5, trim metadata
-        # - Cap relevant_memories at 3
-        # - No hot_memories (redundant with relevant)
         trimmed_tasks = [{
             'id': t['id'],
             'description': t['description'],
@@ -1775,13 +1947,13 @@ def semantic_startup():
             'priority': t['priority'],
             'assigned_to': t['assigned_to']
         } for t in open_tasks[:5]]
-        
+
         trimmed_memories = [{
             'blob_hash': m['blob_hash'],
             'message': m['message'],
             'distance': m.get('distance')
         } for m in relevant_memories[:3]]
-        
+
         response = {
             'timestamp': timestamp_utc,
             'local_time': local_time,
@@ -1791,7 +1963,11 @@ def semantic_startup():
             'context_used': context,
             'verbosity': 'normal'
         }
-    
+
+    # v4: Add recent bookmarks if available
+    if HIPPOCAMPAL_ENABLED and recent_bookmarks:
+        response['recent_bookmarks'] = recent_bookmarks
+
     # If agent_id provided, add their specific tasks
     if agent_id:
         response['agent_id'] = agent_id
@@ -5878,6 +6054,678 @@ def spawn_agent():
 
 
 # =============================================================================
+# HIPPOCAMPAL MEMORY STAGING (Boswell v4.0)
+# Two-stage memory: working memory (bookmarks) + long-term (commits)
+# Connected by consolidation cycle (sleep phase)
+# =============================================================================
+
+_hippocampal_tables_ensured = False
+
+def ensure_hippocampal_tables():
+    """Create hippocampal staging tables if they don't exist."""
+    global _hippocampal_tables_ensured
+    if _hippocampal_tables_ensured:
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        migration_path = os.path.join(os.path.dirname(__file__), 'db', 'migrations', '013_hippocampal_staging.sql')
+        if os.path.exists(migration_path):
+            with open(migration_path, 'r') as f:
+                cur.execute(f.read())
+            db.commit()
+        cur.close()
+        _hippocampal_tables_ensured = True
+        print("[STARTUP] Hippocampal tables ensured", file=sys.stderr)
+    except Exception as e:
+        print(f"[STARTUP] Hippocampal tables check: {e}", file=sys.stderr)
+        try:
+            db.rollback()
+        except:
+            pass
+        _hippocampal_tables_ensured = True  # Don't retry on every request
+
+
+@app.route('/v2/bookmark', methods=['POST'])
+def create_bookmark():
+    """Stage a lightweight memory bookmark (working memory / RAM).
+    Does NOT create blob/tree/commit. Does NOT touch centroids.
+    Generates dual embeddings: content for search, context for auto-replay."""
+    ensure_hippocampal_tables()
+    data = request.get_json() or {}
+    summary = data.get('summary')
+    if not summary:
+        return jsonify({'error': 'summary is required'}), 400
+
+    branch = data.get('branch', 'command-center')
+    content = data.get('content')
+    message = data.get('message', summary[:100])
+    tags = data.get('tags', [])
+    salience = min(max(float(data.get('salience', 0.3)), 0.0), 1.0)
+    salience_type = data.get('salience_type')
+    source_instance = data.get('source_instance')
+    context_str = data.get('context')  # working context for auto-replay
+    ttl_days = data.get('ttl_days', 7)
+    session_context = data.get('session_context')
+
+    # Generate content embedding from summary + content
+    embed_text = summary
+    if content:
+        content_str = json.dumps(content, default=str) if isinstance(content, dict) else str(content)
+        embed_text = f"{summary}\n{content_str}"
+    embedding = generate_embedding(embed_text)
+
+    # Generate context embedding if context provided
+    context_embedding = None
+    if context_str:
+        context_embedding = generate_embedding(context_str)
+
+    import uuid
+    candidate_id = str(uuid.uuid4())
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO candidate_memories
+                (id, tenant_id, branch, summary, content, message, tags, salience, salience_type,
+                 embedding, context_embedding, status, source_instance, session_context, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s,
+                    NOW() + INTERVAL '%s days')
+        """, (
+            candidate_id, DEFAULT_TENANT, branch, summary,
+            json.dumps(content, default=str) if content else None,
+            message, tags, salience, salience_type,
+            embedding, context_embedding,
+            source_instance,
+            json.dumps(session_context, default=str) if session_context else None,
+            ttl_days
+        ))
+        db.commit()
+
+        # Fetch expires_at for response
+        cur.execute("SELECT expires_at FROM candidate_memories WHERE id = %s", (candidate_id,))
+        row = cur.fetchone()
+        expires_at = str(row['expires_at']) if row else None
+        cur.close()
+
+        return jsonify({
+            'status': 'bookmarked',
+            'candidate_id': candidate_id,
+            'branch': branch,
+            'salience': salience,
+            'expires_at': expires_at,
+            'has_context': context_embedding is not None
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Bookmark failed: {str(e)}'}), 500
+
+
+@app.route('/v2/replay', methods=['POST'])
+def record_replay():
+    """Record topic recurrence — strengthens a bookmark's case for permanent storage."""
+    ensure_hippocampal_tables()
+    data = request.get_json() or {}
+    candidate_id = data.get('candidate_id')
+    keywords = data.get('keywords')
+    session_id = data.get('session_id')
+    replay_context = data.get('replay_context')
+
+    if not candidate_id and not keywords:
+        return jsonify({'error': 'candidate_id or keywords required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Resolve candidate by ID or keyword search
+        if candidate_id:
+            cur.execute("""
+                SELECT id, replay_count, expires_at, status
+                FROM candidate_memories
+                WHERE id = %s AND tenant_id = %s AND status IN ('active', 'cooling')
+            """, (candidate_id, DEFAULT_TENANT))
+        else:
+            # Semantic search against candidate embeddings
+            query_embedding = generate_embedding(keywords)
+            if not query_embedding:
+                return jsonify({'error': 'Failed to generate embedding for keywords'}), 500
+            cur.execute("""
+                SELECT id, replay_count, expires_at, status,
+                       embedding <=> %s::vector AS distance
+                FROM candidate_memories
+                WHERE tenant_id = %s AND status IN ('active', 'cooling') AND embedding IS NOT NULL
+                ORDER BY distance LIMIT 1
+            """, (query_embedding, DEFAULT_TENANT))
+
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return jsonify({'error': 'No matching active candidate found'}), 404
+
+        cid = str(row['id'])
+        new_replay_count = row['replay_count'] + 1
+
+        # Increment replay_count
+        cur.execute("""
+            UPDATE candidate_memories SET replay_count = %s WHERE id = %s
+        """, (new_replay_count, cid))
+
+        # Near-expiry rescue: if replay_count >= 3 and expires within 48h, extend TTL by 3 days
+        cur.execute("""
+            UPDATE candidate_memories
+            SET expires_at = expires_at + INTERVAL '3 days'
+            WHERE id = %s AND replay_count >= 3
+              AND expires_at < NOW() + INTERVAL '48 hours'
+              AND expires_at > NOW()
+        """, (cid,))
+
+        # Log replay event
+        import uuid
+        cur.execute("""
+            INSERT INTO replay_events (id, tenant_id, candidate_id, session_id, replay_context,
+                                       similarity_score, fired, threshold_used, context_type)
+            VALUES (%s, %s, %s, %s, %s, NULL, true, NULL, 'manual')
+        """, (str(uuid.uuid4()), DEFAULT_TENANT, cid, session_id, replay_context))
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'replayed',
+            'candidate_id': cid,
+            'replay_count': new_replay_count
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Replay failed: {str(e)}'}), 500
+
+
+@app.route('/v2/candidates', methods=['GET'])
+def list_candidates():
+    """View staging buffer — what's in working memory."""
+    ensure_hippocampal_tables()
+    branch = request.args.get('branch')
+    status = request.args.get('status')
+    limit = request.args.get('limit', 20, type=int)
+    sort = request.args.get('sort', 'created_at')
+
+    valid_sorts = {'salience': 'salience DESC', 'replay_count': 'replay_count DESC',
+                   'created_at': 'created_at DESC', 'expires_at': 'expires_at ASC'}
+    order_clause = valid_sorts.get(sort, 'created_at DESC')
+
+    cur = get_cursor()
+    sql = """
+        SELECT id, branch, summary, salience, salience_type, replay_count,
+               consolidation_score, status, source_instance,
+               created_at, expires_at, promoted_at, promoted_commit_hash,
+               (context_embedding IS NOT NULL) as has_context
+        FROM candidate_memories
+        WHERE tenant_id = %s
+    """
+    params = [DEFAULT_TENANT]
+
+    if branch:
+        sql += " AND branch = %s"
+        params.append(branch)
+    if status:
+        sql += " AND status = %s::candidate_status"
+        params.append(status)
+
+    sql += f" ORDER BY {order_clause} LIMIT %s"
+    params.append(limit)
+
+    cur.execute(sql, params)
+    candidates = []
+    for row in cur.fetchall():
+        candidates.append({
+            'id': str(row['id']),
+            'branch': row['branch'],
+            'summary': row['summary'],
+            'salience': row['salience'],
+            'salience_type': row['salience_type'],
+            'replay_count': row['replay_count'],
+            'consolidation_score': row['consolidation_score'],
+            'status': row['status'],
+            'source_instance': row['source_instance'],
+            'has_context': row['has_context'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'expires_at': str(row['expires_at']) if row['expires_at'] else None,
+            'promoted_at': str(row['promoted_at']) if row['promoted_at'] else None,
+            'promoted_commit_hash': row['promoted_commit_hash']
+        })
+
+    cur.close()
+    return jsonify({'candidates': candidates, 'count': len(candidates)})
+
+
+@app.route('/v2/candidates/decay-status', methods=['GET'])
+def get_decay_status():
+    """View expiring candidates — what's about to be forgotten."""
+    ensure_hippocampal_tables()
+    days = request.args.get('days', 2, type=int)
+    cur = get_cursor()
+
+    cur.execute("""
+        SELECT id, branch, summary, salience, replay_count, status,
+               created_at, expires_at,
+               EXTRACT(EPOCH FROM (expires_at - NOW())) / 3600 as hours_remaining
+        FROM candidate_memories
+        WHERE tenant_id = %s AND status IN ('active', 'cooling')
+          AND expires_at < NOW() + INTERVAL '%s days'
+          AND expires_at > NOW()
+        ORDER BY expires_at ASC
+    """, (DEFAULT_TENANT, days))
+
+    expiring = []
+    for row in cur.fetchall():
+        expiring.append({
+            'id': str(row['id']),
+            'branch': row['branch'],
+            'summary': row['summary'],
+            'salience': row['salience'],
+            'replay_count': row['replay_count'],
+            'status': row['status'],
+            'hours_remaining': round(float(row['hours_remaining']), 1),
+            'expires_at': str(row['expires_at'])
+        })
+
+    cur.close()
+    return jsonify({'expiring': expiring, 'count': len(expiring), 'within_days': days})
+
+
+def _compute_connectivity(embedding, branch_name, cur):
+    """Compute connectivity score for a candidate embedding.
+    Cross-branch neighbors weighted 1.0, same-branch neighbors 0.1.
+    Normalized to 0-1, capped at 10 neighbors."""
+    if embedding is None:
+        return 0.0
+
+    cur.execute("""
+        SELECT b.blob_hash, te.name as branch_hint,
+               b.embedding <=> %s::vector AS distance
+        FROM blobs b
+        JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
+        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+          AND b.embedding <=> %s::vector < 0.4
+        ORDER BY distance LIMIT 20
+    """, (embedding, DEFAULT_TENANT, embedding))
+
+    # Need to determine branch per neighbor via commit chain
+    # Simplified: use the commit's branch
+    weighted_count = 0.0
+    for row in cur.fetchall():
+        # Look up which branch this blob belongs to
+        cur2 = get_cursor()
+        cur2.execute("""
+            SELECT br.name as branch_name
+            FROM tree_entries te
+            JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
+            JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
+            WHERE te.blob_hash = %s AND te.tenant_id = %s
+            LIMIT 1
+        """, (row['blob_hash'], DEFAULT_TENANT))
+        branch_row = cur2.fetchone()
+        cur2.close()
+
+        neighbor_branch = branch_row['branch_name'] if branch_row else 'unknown'
+        if neighbor_branch.lower() == branch_name.lower():
+            weighted_count += 0.1  # Same-branch: low weight
+        else:
+            weighted_count += 1.0  # Cross-branch: full weight
+
+    # Normalize: cap at 10 neighbors worth of weight
+    return min(weighted_count / 10.0, 1.0)
+
+
+def _promote_candidate_to_commit(candidate_row, cur, db):
+    """Promote a candidate memory to a permanent commit.
+    Reuses existing commit-chain logic. Copies embedding (zero API cost)."""
+    import uuid
+
+    content = candidate_row['content']
+    if content is None:
+        content = json.dumps({"summary": candidate_row['summary'], "source": "hippocampal_promotion"})
+    elif isinstance(content, dict):
+        content = json.dumps(content, default=str)
+
+    blob_hash = compute_hash(content)
+    branch = candidate_row['branch']
+    message = candidate_row['message'] or f"Promoted: {candidate_row['summary'][:80]}"
+    now = datetime.utcnow().isoformat() + 'Z'
+    tags = candidate_row['tags'] or []
+
+    # Insert blob (copy embedding from candidate — zero API cost)
+    cur.execute(
+        '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size, embedding)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (blob_hash) DO NOTHING''',
+        (blob_hash, DEFAULT_TENANT, content, 'memory', now, len(content),
+         candidate_row['embedding'])
+    )
+
+    # Create tree entry
+    tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
+    cur.execute(
+        '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
+           VALUES (%s, %s, %s, %s, %s)''',
+        (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'memory')
+    )
+
+    # Get parent commit
+    cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s',
+                (branch, DEFAULT_TENANT))
+    branch_row = cur.fetchone()
+    if branch_row:
+        branch = branch_row['name']
+        parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
+    else:
+        cur.execute(
+            '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
+               VALUES (%s, %s, %s, %s)''',
+            (DEFAULT_TENANT, branch, 'GENESIS', now)
+        )
+        parent_hash = None
+
+    # Create commit
+    commit_data = f"{tree_hash}:{parent_hash}:{message}:{now}"
+    commit_hash = compute_hash(commit_data)
+    cur.execute(
+        '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+        (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'consolidation', message, now)
+    )
+
+    # Update branch HEAD
+    cur.execute(
+        'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
+        (commit_hash, branch, DEFAULT_TENANT)
+    )
+
+    # Insert tags
+    for tag in tags:
+        tag_str = tag if isinstance(tag, str) else str(tag)
+        try:
+            cur.execute(
+                '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+                   VALUES (%s, %s, %s, %s)''',
+                (DEFAULT_TENANT, blob_hash, tag_str, now)
+            )
+        except Exception:
+            pass
+
+    # Update candidate status
+    cur.execute("""
+        UPDATE candidate_memories
+        SET status = 'promoted', promoted_at = NOW(), promoted_commit_hash = %s
+        WHERE id = %s
+    """, (commit_hash, str(candidate_row['id'])))
+
+    return commit_hash, blob_hash
+
+
+@app.route('/v2/consolidate', methods=['POST'])
+def run_consolidation():
+    """Sleep phase: score and promote top candidates to permanent memory."""
+    ensure_hippocampal_tables()
+    data = request.get_json() or {}
+    max_promotions = data.get('max_promotions', 10)
+    dry_run = data.get('dry_run', False)
+    filter_branch = data.get('branch')
+    min_score = data.get('min_score', 0.0)
+    cycle_type = data.get('cycle_type', 'manual')
+
+    import math
+    start_time = time.time()
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Step 1: Transition stale candidates to cooling
+        cur.execute("""
+            UPDATE candidate_memories
+            SET status = 'cooling'
+            WHERE tenant_id = %s AND status = 'active'
+              AND created_at < NOW() - INTERVAL '3 days'
+        """, (DEFAULT_TENANT,))
+        cooled = cur.rowcount
+
+        # Step 2: Expire dead candidates (past TTL)
+        cur.execute("""
+            UPDATE candidate_memories
+            SET status = 'expired'
+            WHERE tenant_id = %s AND status IN ('active', 'cooling')
+              AND expires_at < NOW()
+        """, (DEFAULT_TENANT,))
+        expired = cur.rowcount
+
+        # Step 3: Load all active/cooling candidates
+        filter_sql = ""
+        filter_params = [DEFAULT_TENANT]
+        if filter_branch:
+            filter_sql = " AND branch = %s"
+            filter_params.append(filter_branch)
+
+        cur.execute(f"""
+            SELECT id, branch, summary, content, message, tags, salience,
+                   replay_count, embedding, status
+            FROM candidate_memories
+            WHERE tenant_id = %s AND status IN ('active', 'cooling'){filter_sql}
+        """, filter_params)
+
+        candidates = cur.fetchall()
+
+        # Step 4: Compute consolidation scores
+        scored = []
+        for c in candidates:
+            connectivity = _compute_connectivity(c['embedding'], c['branch'], cur)
+            score = c['salience'] * (1 + math.log(c['replay_count'] + 1)) * (1 + connectivity)
+
+            # Update score on the candidate
+            cur.execute("""
+                UPDATE candidate_memories SET consolidation_score = %s WHERE id = %s
+            """, (score, str(c['id'])))
+
+            if score >= min_score:
+                scored.append({
+                    'candidate': c,
+                    'score': score,
+                    'connectivity': connectivity
+                })
+
+        # Step 5: Rank and take top N
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        to_promote = scored[:max_promotions]
+
+        promoted_commits = []
+        if not dry_run:
+            # Step 6: Promote winners
+            affected_branches = set()
+            for item in to_promote:
+                commit_hash, blob_hash = _promote_candidate_to_commit(item['candidate'], cur, db)
+                promoted_commits.append(commit_hash)
+                affected_branches.add(item['candidate']['branch'])
+
+            # Step 7: Hard-delete expired candidates older than 30 days
+            cur.execute("""
+                DELETE FROM candidate_memories
+                WHERE tenant_id = %s AND status = 'expired'
+                  AND expires_at < NOW() - INTERVAL '30 days'
+            """, (DEFAULT_TENANT,))
+            hard_deleted = cur.rowcount
+
+            db.commit()
+
+            # Step 8: Refresh centroids for affected branches
+            for br in affected_branches:
+                try:
+                    ensure_fingerprints_table()
+                    centroid, count = compute_branch_centroid(br)
+                    if centroid:
+                        fp_cur = get_cursor()
+                        fp_cur.execute("""
+                            INSERT INTO branch_fingerprints (tenant_id, branch_name, centroid, commit_count, last_updated)
+                            VALUES (%s, %s, %s, %s, NOW())
+                            ON CONFLICT (tenant_id, branch_name) DO UPDATE
+                            SET centroid = EXCLUDED.centroid, commit_count = EXCLUDED.commit_count,
+                                last_updated = NOW()
+                        """, (DEFAULT_TENANT, br, centroid, count))
+                        get_db().commit()
+                        fp_cur.close()
+                except Exception as e:
+                    print(f"[CONSOLIDATION] Centroid refresh failed for {br}: {e}", file=sys.stderr)
+        else:
+            hard_deleted = 0
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Log to consolidation_log
+        import uuid
+        top_score = scored[0]['score'] if scored else None
+        cur.execute("""
+            INSERT INTO consolidation_log
+                (id, tenant_id, cycle_type, candidates_evaluated, candidates_promoted,
+                 candidates_expired, top_score, threshold_used, promoted_commits,
+                 duration_ms, completed_at, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+        """, (
+            str(uuid.uuid4()), DEFAULT_TENANT, cycle_type,
+            len(candidates), len(promoted_commits) if not dry_run else 0,
+            expired, top_score, min_score, promoted_commits,
+            duration_ms, json.dumps({'dry_run': dry_run, 'cooled': cooled, 'hard_deleted': hard_deleted})
+        ))
+        db.commit()
+        cur.close()
+
+        report = {
+            'status': 'dry_run' if dry_run else 'consolidated',
+            'candidates_evaluated': len(candidates),
+            'candidates_promoted': len(promoted_commits) if not dry_run else 0,
+            'candidates_expired': expired,
+            'candidates_cooled': cooled,
+            'top_scores': [{'id': str(s['candidate']['id']), 'summary': s['candidate']['summary'][:80],
+                           'score': round(s['score'], 4), 'connectivity': round(s['connectivity'], 4)}
+                          for s in scored[:max_promotions]],
+            'promoted_commits': promoted_commits,
+            'duration_ms': duration_ms
+        }
+        if not dry_run:
+            report['hard_deleted'] = hard_deleted
+
+        return jsonify(report)
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Consolidation failed: {str(e)}'}), 500
+
+
+@app.route('/v2/candidates/cleanup', methods=['POST'])
+def cleanup_candidates():
+    """Expire past-TTL candidates and hard-delete old expired ones."""
+    ensure_hippocampal_tables()
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Expire past-TTL
+        cur.execute("""
+            UPDATE candidate_memories
+            SET status = 'expired'
+            WHERE tenant_id = %s AND status IN ('active', 'cooling')
+              AND expires_at < NOW()
+        """, (DEFAULT_TENANT,))
+        expired = cur.rowcount
+
+        # Hard-delete expired > 30 days
+        cur.execute("""
+            DELETE FROM candidate_memories
+            WHERE tenant_id = %s AND status = 'expired'
+              AND expires_at < NOW() - INTERVAL '30 days'
+        """, (DEFAULT_TENANT,))
+        hard_deleted = cur.rowcount
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'status': 'cleaned',
+            'expired': expired,
+            'hard_deleted': hard_deleted,
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/nightly', methods=['POST'])
+def nightly_maintenance():
+    """Composite nightly maintenance: trails + candidates + consolidation + centroids."""
+    start_time = time.time()
+    results = {}
+
+    # Step 1: Trail decay
+    try:
+        with app.test_request_context(method='POST', path='/v2/trails/decay'):
+            trail_result = decay_trails()
+            if isinstance(trail_result, tuple):
+                results['trail_decay'] = trail_result[0].get_json() if hasattr(trail_result[0], 'get_json') else trail_result[0]
+            elif hasattr(trail_result, 'get_json'):
+                results['trail_decay'] = trail_result.get_json()
+            else:
+                results['trail_decay'] = trail_result
+    except Exception as e:
+        results['trail_decay'] = {'error': str(e)}
+
+    # Step 2: Candidate cleanup
+    try:
+        with app.test_request_context(method='POST', path='/v2/candidates/cleanup',
+                                       content_type='application/json', json={}):
+            cleanup_result = cleanup_candidates()
+            if isinstance(cleanup_result, tuple):
+                results['candidate_cleanup'] = cleanup_result[0].get_json() if hasattr(cleanup_result[0], 'get_json') else cleanup_result[0]
+            elif hasattr(cleanup_result, 'get_json'):
+                results['candidate_cleanup'] = cleanup_result.get_json()
+            else:
+                results['candidate_cleanup'] = cleanup_result
+    except Exception as e:
+        results['candidate_cleanup'] = {'error': str(e)}
+
+    # Step 3: Consolidation (promote top 10)
+    try:
+        with app.test_request_context(method='POST', path='/v2/consolidate',
+                                       content_type='application/json',
+                                       json={'max_promotions': 10, 'cycle_type': 'nightly'}):
+            consol_result = run_consolidation()
+            if isinstance(consol_result, tuple):
+                results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
+            elif hasattr(consol_result, 'get_json'):
+                results['consolidation'] = consol_result.get_json()
+            else:
+                results['consolidation'] = consol_result
+    except Exception as e:
+        results['consolidation'] = {'error': str(e)}
+
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    return jsonify({
+        'status': 'nightly_complete',
+        'results': results,
+        'duration_ms': duration_ms,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+
+# =============================================================================
 # PASSKEY AUTHENTICATION ENDPOINTS (WebAuthn / Face ID)
 # Author: CC2 - Swarm task beta-4
 # =============================================================================
@@ -6973,6 +7821,75 @@ MCP_TOOLS = [
             "properties": {}
         }
     },
+    # Hippocampal Memory Tools (v4.0)
+    {
+        "name": "boswell_bookmark",
+        "description": "Lightweight memory staging. Use for observations, patterns, context that MIGHT be worth remembering. Cheaper than commit — expires in 7 days unless replayed. Default salience 0.3.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string", "description": "Branch to stage on (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
+                "summary": {"type": "string", "description": "Brief summary of the observation/insight"},
+                "content": {"type": "object", "description": "Optional structured content"},
+                "message": {"type": "string", "description": "Optional commit-style message"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags"},
+                "salience": {"type": "number", "description": "Importance 0-1 (default 0.3). Higher = more likely to be promoted"},
+                "context": {"type": "string", "description": "Optional working context description — used for auto-replay differentiation"},
+                "source_instance": {"type": "string", "description": "Which instance created this (e.g., CC1, CW-PM)"},
+                "ttl_days": {"type": "integer", "description": "Days until expiry (default 7)"}
+            },
+            "required": ["branch", "summary"]
+        }
+    },
+    {
+        "name": "boswell_replay",
+        "description": "Record topic recurrence — strengthens a bookmark's case for permanent storage. Increases replay_count. Near-expiry bookmarks with 3+ replays get TTL extension.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "string", "description": "UUID of the candidate to replay"},
+                "keywords": {"type": "string", "description": "Alternative: semantic search for matching candidate"},
+                "session_id": {"type": "string", "description": "Optional session identifier"},
+                "replay_context": {"type": "string", "description": "Optional context of the replay"}
+            }
+        }
+    },
+    {
+        "name": "boswell_consolidate",
+        "description": "Manual consolidation trigger — score and promote top candidates to permanent memory. Use dry_run=true to preview scores without committing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_promotions": {"type": "integer", "description": "Max candidates to promote (default 10)", "default": 10},
+                "dry_run": {"type": "boolean", "description": "Preview scores without promoting (default false)", "default": False},
+                "branch": {"type": "string", "description": "Optional: only consolidate this branch"},
+                "min_score": {"type": "number", "description": "Minimum consolidation score to promote (default 0)", "default": 0}
+            }
+        }
+    },
+    {
+        "name": "boswell_candidates",
+        "description": "View staging buffer — what's in working memory. Shows bookmarks with salience, replay count, and expiry.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string", "description": "Optional: filter by branch"},
+                "status": {"type": "string", "description": "Optional: filter by status (active, cooling, promoted, expired)"},
+                "limit": {"type": "integer", "description": "Max results (default 20)", "default": 20},
+                "sort": {"type": "string", "description": "Sort by: salience, replay_count, created_at, expires_at (default created_at)"}
+            }
+        }
+    },
+    {
+        "name": "boswell_decay_status",
+        "description": "View expiring candidates — what's about to be forgotten. Shows bookmarks expiring within N days.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Show candidates expiring within this many days (default 2)", "default": 2}
+            }
+        }
+    },
 ]
 
 def mcp_error_response(req_id, code, message):
@@ -7260,6 +8177,46 @@ def dispatch_mcp_tool(tool_name, args):
 
     elif tool_name == "boswell_immune_status":
         return invoke_view(immune_status)
+
+    # ===== HIPPOCAMPAL MEMORY TOOLS (v4.0) =====
+
+    elif tool_name == "boswell_bookmark":
+        payload = {
+            "branch": args.get("branch", "command-center"),
+            "summary": args["summary"]
+        }
+        for field in ["content", "message", "tags", "salience", "salience_type",
+                       "source_instance", "context", "ttl_days", "session_context"]:
+            if field in args:
+                payload[field] = args[field]
+        return invoke_view(create_bookmark, method='POST', json_data=payload)
+
+    elif tool_name == "boswell_replay":
+        payload = {}
+        for field in ["candidate_id", "keywords", "session_id", "replay_context"]:
+            if field in args:
+                payload[field] = args[field]
+        return invoke_view(record_replay, method='POST', json_data=payload)
+
+    elif tool_name == "boswell_consolidate":
+        payload = {}
+        for field in ["max_promotions", "dry_run", "branch", "min_score"]:
+            if field in args:
+                payload[field] = args[field]
+        return invoke_view(run_consolidation, method='POST', json_data=payload)
+
+    elif tool_name == "boswell_candidates":
+        qs = {}
+        for field in ["branch", "status", "limit", "sort"]:
+            if field in args:
+                qs[field] = args[field]
+        return invoke_view(list_candidates, query_string=qs if qs else None)
+
+    elif tool_name == "boswell_decay_status":
+        qs = {}
+        if "days" in args:
+            qs["days"] = args["days"]
+        return invoke_view(get_decay_status, query_string=qs if qs else None)
 
     else:
         return {"error": f"Unknown tool: {tool_name}"}, 400
