@@ -1480,6 +1480,16 @@ def semantic_search():
                     context_type = 'content_fallback'
 
                 if ctx_distance > threshold:
+                    # Cooldown: max one replay per candidate per hour
+                    cur.execute("""
+                        SELECT 1 FROM replay_events
+                        WHERE candidate_id = %s AND fired = true
+                          AND created_at > NOW() - INTERVAL '1 hour'
+                        LIMIT 1
+                    """, (cand_id,))
+                    if cur.fetchone():
+                        continue  # Already replayed recently, skip
+
                     # Different context — fire replay
                     cur.execute("UPDATE candidate_memories SET replay_count = replay_count + 1 WHERE id = %s",
                                 (cand_id,))
