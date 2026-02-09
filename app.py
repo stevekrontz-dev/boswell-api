@@ -6251,6 +6251,18 @@ def ensure_hippocampal_tables():
             with open(migration_path, 'r') as f:
                 cur.execute(f.read())
             db.commit()
+        # Kill TTL: set expires_at = NULL for all active/cooling candidates
+        # Steve's directive: "No expiry. Not a long expiry. No expiry."
+        cur.execute("""
+            UPDATE candidate_memories
+            SET expires_at = NULL
+            WHERE tenant_id = %s AND status IN ('active', 'cooling')
+              AND expires_at IS NOT NULL
+        """, (DEFAULT_TENANT,))
+        if cur.rowcount > 0:
+            print(f"[TTL-KILL] Set expires_at = NULL for {cur.rowcount} candidates", file=sys.stderr)
+        db.commit()
+
         cur.close()
         _hippocampal_tables_ensured = True
         print("[STARTUP] Hippocampal tables ensured", file=sys.stderr)
