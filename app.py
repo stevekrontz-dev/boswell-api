@@ -4801,7 +4801,11 @@ def get_trails_to(target_blob):
 def decay_trails():
     """Apply Physarum-inspired decay to trails based on idle time.
 
-    Formula: strength = base_strength * (0.95 ^ days_idle)
+    FROZEN by sacred directive (2026-02-09). No decay until Steve re-enables.
+    See Boswell commit bf4b68532a81 on branch boswell.
+    Lift condition: Steve explicitly re-enables after architecture review.
+
+    Original formula: strength = base_strength * (0.95 ^ days_idle)
 
     State transitions based on strength:
     - ACTIVE: strength >= 1.0 (frequently used)
@@ -4811,6 +4815,22 @@ def decay_trails():
 
     Call via Railway cron daily.
     """
+    # SACRED DIRECTIVE: Decay frozen (2026-02-09)
+    # No trail may transition to dormant or archived.
+    # Lift condition: Steve explicitly re-enables after architecture review.
+    return jsonify({
+        'status': 'frozen',
+        'reason': 'Sacred directive bf4b68532a81 - decay disabled until architecture review',
+        'decay_rate': 1.0,
+        'trails_processed': 0,
+        'state_transitions': {
+            'became_active': 0, 'became_fading': 0,
+            'became_dormant': 0, 'became_archived': 0
+        },
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+    # --- ORIGINAL DECAY LOGIC (frozen) ---
     ensure_trails_table()
 
     db = get_db()
@@ -6646,7 +6666,22 @@ def run_consolidation():
 
 @app.route('/v2/candidates/cleanup', methods=['POST'])
 def cleanup_candidates():
-    """Expire past-TTL candidates and hard-delete old expired ones."""
+    """Expire past-TTL candidates and hard-delete old expired ones.
+
+    FROZEN by sacred directive (2026-02-09). No candidates may expire or be deleted.
+    See Boswell commit bf4b68532a81 on branch boswell.
+    Lift condition: Steve explicitly re-enables after architecture review.
+    """
+    # SACRED DIRECTIVE: Candidate cleanup frozen (2026-02-09)
+    return jsonify({
+        'status': 'frozen',
+        'reason': 'Sacred directive bf4b68532a81 - candidate cleanup disabled until architecture review',
+        'expired': 0,
+        'hard_deleted': 0,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+    # --- ORIGINAL CLEANUP LOGIC (frozen) ---
     ensure_hippocampal_tables()
     db = get_db()
     cur = get_cursor()
