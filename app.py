@@ -1632,11 +1632,12 @@ def recall_memory():
                     SELECT b.blob_hash,
                            SUBSTRING(b.content, 1, 200) as preview,
                            c.message as commit_message,
-                           c.branch,
+                           COALESCE(br.name, 'unknown') as branch,
                            b.embedding <=> %s::vector AS distance
                     FROM blobs b
                     JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
                     JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                    LEFT JOIN branches br ON br.head_commit = c.commit_hash AND br.tenant_id = c.tenant_id
                     WHERE b.tenant_id = %s
                       AND b.blob_hash != %s
                       AND b.embedding IS NOT NULL
@@ -6302,20 +6303,19 @@ def create_bookmark():
     cur = get_cursor()
 
     try:
+        # TTL is dead — expires_at = NULL. Bookmarks live until consolidated or explicitly cleaned.
         cur.execute("""
             INSERT INTO candidate_memories
                 (id, tenant_id, branch, summary, content, message, tags, salience, salience_type,
                  embedding, context_embedding, status, source_instance, session_context, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s,
-                    NOW() + INTERVAL '%s days')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, NULL)
         """, (
             candidate_id, DEFAULT_TENANT, branch, summary,
             json.dumps(content, default=str) if content else None,
             message, tags, salience, salience_type,
             embedding, context_embedding,
             source_instance,
-            json.dumps(session_context, default=str) if session_context else None,
-            ttl_days
+            json.dumps(session_context, default=str) if session_context else None
         ))
         db.commit()
 
@@ -6672,12 +6672,12 @@ def run_consolidation():
         """, (DEFAULT_TENANT,))
         cooled = cur.rowcount
 
-        # Step 2: Expire dead candidates (past TTL)
+        # Step 2: Expire dead candidates (past TTL — only if expires_at is set)
         cur.execute("""
             UPDATE candidate_memories
             SET status = 'expired'
             WHERE tenant_id = %s AND status IN ('active', 'cooling')
-              AND expires_at < NOW()
+              AND expires_at IS NOT NULL AND expires_at < NOW()
         """, (DEFAULT_TENANT,))
         expired = cur.rowcount
 
@@ -6825,12 +6825,12 @@ def cleanup_candidates():
     cur = get_cursor()
 
     try:
-        # Expire past-TTL
+        # Expire past-TTL (only if expires_at is set — NULL means no expiry)
         cur.execute("""
             UPDATE candidate_memories
             SET status = 'expired'
             WHERE tenant_id = %s AND status IN ('active', 'cooling')
-              AND expires_at < NOW()
+              AND expires_at IS NOT NULL AND expires_at < NOW()
         """, (DEFAULT_TENANT,))
         expired = cur.rowcount
 
@@ -6838,7 +6838,7 @@ def cleanup_candidates():
         cur.execute("""
             DELETE FROM candidate_memories
             WHERE tenant_id = %s AND status = 'expired'
-              AND expires_at < NOW() - INTERVAL '30 days'
+              AND expires_at IS NOT NULL AND expires_at < NOW() - INTERVAL '30 days'
         """, (DEFAULT_TENANT,))
         hard_deleted = cur.rowcount
 
@@ -6893,16 +6893,23 @@ def discovery_pass():
 
     try:
         # 1. Find blobs with zero or few trails + links
+        # Note: commits table has no 'branch' column, so we get branch from
+        # cross_references or default to 'unknown'. For scoring we use the
+        # branch_fingerprints approach: find which branch HEAD chain includes each commit.
+        # Pragmatic approach: LEFT JOIN branches where commit is HEAD (catches latest),
+        # fall back to 'unknown' for older commits.
         cur.execute('''
             WITH blob_connectivity AS (
-                SELECT b.blob_hash, b.content,
+                SELECT DISTINCT ON (b.blob_hash)
+                       b.blob_hash, b.content,
                        COALESCE(t.trail_count, 0) as trail_count,
                        COALESCE(cr.link_count, 0) as link_count,
                        c.message as commit_message,
-                       c.branch
+                       COALESCE(br.name, 'unknown') as branch
                 FROM blobs b
                 JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
                 JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
+                LEFT JOIN branches br ON br.head_commit = c.commit_hash AND br.tenant_id = c.tenant_id
                 LEFT JOIN (
                     SELECT source_blob as blob, COUNT(*) as trail_count FROM trails
                     WHERE tenant_id = %s GROUP BY source_blob
