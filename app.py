@@ -162,8 +162,9 @@ AUDIT_ENABLED = os.environ.get('AUDIT_ENABLED', 'true').lower() == 'true'
 
 @app.before_request
 def before_request():
-    """Start timing for audit logging + MCP auth check."""
+    """Start timing for audit logging + MCP auth check + co-access tracking."""
     g.audit_start = time.time()
+    g.accessed_blobs = set()  # Auto-trail: track blobs touched in this request
 
     # MCP Auth check (OAuth 2.1 / internal / API key)
     from auth import check_mcp_auth
@@ -171,9 +172,45 @@ def before_request():
     if result:
         return result
 
+def _record_co_access_trails():
+    """Auto-trail: create/strengthen trails between blobs co-accessed in this request."""
+    blobs = getattr(g, 'accessed_blobs', set())
+    if len(blobs) < 2:
+        return
+
+    # Cap at 10 blobs to avoid O(n^2) explosion
+    blob_list = list(blobs)[:10]
+    try:
+        db = get_db()
+        cur = get_cursor()
+        for i in range(len(blob_list)):
+            for j in range(i + 1, len(blob_list)):
+                cur.execute('''
+                    INSERT INTO trails (tenant_id, source_blob, target_blob,
+                                        traversal_count, last_traversed, strength)
+                    VALUES (%s, %s, %s, 1, NOW(), 1.0)
+                    ON CONFLICT (tenant_id, source_blob, target_blob) DO UPDATE
+                    SET traversal_count = trails.traversal_count + 1,
+                        last_traversed = NOW(),
+                        strength = LEAST(trails.strength * 1.1, 10.0)
+                ''', (DEFAULT_TENANT, blob_list[i], blob_list[j]))
+        db.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[AUTO-TRAIL] Error recording co-access trails: {e}", file=sys.stderr)
+
 @app.after_request
 def after_request(response):
-    """Log request to audit trail."""
+    """Log request to audit trail + auto-trail co-accessed blobs."""
+    # Auto-trail: record co-access trails for successful non-health requests
+    if (response.status_code >= 200 and response.status_code < 300
+            and request.path not in ('/', '/health', '/favicon.ico', '/v2/', '/v2/health', '/v2/health/daemon')
+            and not request.path.startswith('/v2/trails/')):
+        try:
+            _record_co_access_trails()
+        except Exception as e:
+            print(f"[AUTO-TRAIL] after_request error: {e}", file=sys.stderr)
+
     if not AUDIT_ENABLED:
         return response
     # Skip health checks and static
@@ -1019,6 +1056,10 @@ def create_commit():
                 pass
 
         db.commit()
+
+        # Auto-trail: track newly committed blob
+        g.accessed_blobs.add(blob_hash)
+
         cur.close()
 
         response = {
@@ -1341,6 +1382,11 @@ def search_memories():
         except Exception as e:
             print(f"[SEARCH] Candidate search error: {e}", file=sys.stderr)
 
+    # Auto-trail: track top 3 result blob hashes
+    for r in results[:3]:
+        if r.get('blob_hash') and r.get('source') != 'staged':
+            g.accessed_blobs.add(r['blob_hash'])
+
     cur.close()
     return jsonify({'query': query, 'results': results, 'count': len(results)})
 
@@ -1525,6 +1571,11 @@ def semantic_search():
         except Exception:
             pass
 
+    # Auto-trail: track top 3 result blob hashes
+    for r in results[:3]:
+        if r.get('blob_hash') and r.get('source') != 'staged':
+            g.accessed_blobs.add(r['blob_hash'])
+
     cur.close()
     return jsonify({'query': query, 'results': results, 'count': len(results)})
 
@@ -1569,23 +1620,62 @@ def recall_memory():
         if not blob:
             cur.close()
             return jsonify({'error': 'Memory not found'}), 404
+
+        # Auto-trail: track recalled blob
+        g.accessed_blobs.add(blob['blob_hash'])
+
+        # Semantic neighbors: find k=5 nearest blobs via pgvector
+        neighbors = []
+        if blob.get('embedding') is not None:
+            try:
+                cur.execute('''
+                    SELECT b.blob_hash,
+                           SUBSTRING(b.content, 1, 200) as preview,
+                           c.message as commit_message,
+                           c.branch,
+                           b.embedding <=> %s::vector AS distance
+                    FROM blobs b
+                    JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                    JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                    WHERE b.tenant_id = %s
+                      AND b.blob_hash != %s
+                      AND b.embedding IS NOT NULL
+                    ORDER BY distance ASC
+                    LIMIT 5
+                ''', (blob['embedding'], DEFAULT_TENANT, blob_hash))
+                for row in cur.fetchall():
+                    neighbors.append({
+                        'blob_hash': row['blob_hash'],
+                        'preview': row['preview'],
+                        'commit_message': row['commit_message'],
+                        'branch': row['branch'],
+                        'distance': float(row['distance'])
+                    })
+                    # Auto-trail: add neighbors to co-access set
+                    g.accessed_blobs.add(row['blob_hash'])
+            except Exception as e:
+                print(f"[RECALL] Semantic neighbors error: {e}", file=sys.stderr)
+
         cur.close()
 
         # Decrypt content if needed
         content = decrypt_blob_content(dict(blob))
 
-        return jsonify({
+        response_data = {
             'blob_hash': blob['blob_hash'],
             'content': content,
             'content_type': blob['content_type'],
             'created_at': str(blob['created_at']) if blob['created_at'] else None,
             'byte_size': blob['byte_size'],
             'encrypted': bool(blob.get('content_encrypted'))
-        })
+        }
+        if neighbors:
+            response_data['semantic_neighbors'] = neighbors
+        return jsonify(response_data)
 
     elif commit_hash:
         cur.execute(
-            '''SELECT c.*, b.content, b.content_type, b.content_encrypted, b.nonce, b.encryption_key_id
+            '''SELECT c.*, b.blob_hash as resolved_blob_hash, b.content, b.content_type, b.content_encrypted, b.nonce, b.encryption_key_id
                FROM commits c
                JOIN tree_entries t ON c.tree_hash = t.tree_hash AND c.tenant_id = t.tenant_id
                JOIN blobs b ON t.blob_hash = b.blob_hash AND t.tenant_id = b.tenant_id
@@ -1598,14 +1688,19 @@ def recall_memory():
             return jsonify({'error': 'Commit not found'}), 404
         result = dict(commit)
 
+        # Auto-trail: track recalled blob
+        if result.get('resolved_blob_hash'):
+            g.accessed_blobs.add(result['resolved_blob_hash'])
+
         # Decrypt content if needed
         result['content'] = decrypt_blob_content(result)
         result['encrypted'] = bool(result.get('content_encrypted'))
 
-        # Clean up encryption fields from response
+        # Clean up internal fields from response
         result.pop('content_encrypted', None)
         result.pop('nonce', None)
         result.pop('encryption_key_id', None)
+        result.pop('resolved_blob_hash', None)
 
         if result.get('created_at'):
             result['created_at'] = str(result['created_at'])
@@ -1740,6 +1835,8 @@ def semantic_startup():
                     'message': row['message'],
                     'distance': float(row['distance'])
                 })
+                # Auto-trail: track startup relevant memories
+                g.accessed_blobs.add(row['blob_hash'])
 
     # Boost semantic scores by trail strength (hot paths surface higher)
     hot_memories = []
@@ -1824,6 +1921,43 @@ def semantic_startup():
     except Exception as e:
         # trails table might not exist - that's ok
         pass
+
+    # Discovery blobs — orphaned memories worth connecting
+    discovery_blobs = []
+    try:
+        ensure_discovery_queue_table()
+        cur_disc = get_cursor()
+        cur_disc.execute('''
+            SELECT blob_hash, preview, commit_message, branch,
+                   orphan_score, value_score
+            FROM discovery_queue
+            WHERE tenant_id = %s AND status = 'pending'
+            ORDER BY value_score DESC
+            LIMIT 3
+        ''', (DEFAULT_TENANT,))
+        discovery_blobs = [dict(row) for row in cur_disc.fetchall()]
+
+        # Mark as consumed
+        if discovery_blobs:
+            consumed_hashes = [d['blob_hash'] for d in discovery_blobs]
+            cur_disc.execute('''
+                UPDATE discovery_queue
+                SET status = 'consumed', consumed_at = NOW(),
+                    consumed_by = %s
+                WHERE tenant_id = %s AND blob_hash = ANY(%s)
+            ''', (request.args.get('instance_id', 'unknown'),
+                  DEFAULT_TENANT, consumed_hashes))
+            get_db().commit()
+
+            # Auto-trail: seed discovered blobs into co-access set
+            for d in discovery_blobs:
+                g.accessed_blobs.add(d['blob_hash'])
+                # Convert Decimal/float for JSON serialization
+                d['orphan_score'] = float(d['orphan_score'])
+                d['value_score'] = float(d['value_score'])
+        cur_disc.close()
+    except Exception:
+        pass  # Non-critical — don't break startup
 
     # Get open tasks (priority 1-3 = high, show first)
     # If agent_id provided, show: their assigned tasks + unassigned tasks
@@ -1985,6 +2119,10 @@ def semantic_startup():
     # v4: Add recent bookmarks if available
     if HIPPOCAMPAL_ENABLED and recent_bookmarks:
         response['recent_bookmarks'] = recent_bookmarks
+
+    # v5: Discovery blobs — orphaned memories surfaced for reconnection
+    if discovery_blobs and verbosity != 'minimal':
+        response['discovery_blobs'] = discovery_blobs
 
     # If agent_id provided, add their specific tasks
     if agent_id:
@@ -6720,9 +6858,145 @@ def cleanup_candidates():
         return jsonify({'error': str(e)}), 500
 
 
+def ensure_discovery_queue_table():
+    """Create discovery_queue table if it doesn't exist."""
+    cur = get_cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS discovery_queue (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id VARCHAR(100) NOT NULL DEFAULT 'default',
+            blob_hash VARCHAR(64) NOT NULL,
+            orphan_score FLOAT NOT NULL,
+            value_score FLOAT NOT NULL,
+            branch VARCHAR(255),
+            preview TEXT,
+            commit_message TEXT,
+            surfaced_at TIMESTAMPTZ DEFAULT NOW(),
+            consumed_by VARCHAR(255),
+            consumed_at TIMESTAMPTZ,
+            status VARCHAR(20) DEFAULT 'pending',
+            UNIQUE(tenant_id, blob_hash)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_discovery_queue_status ON discovery_queue(status, value_score DESC)')
+    get_db().commit()
+    cur.close()
+
+
+@app.route('/v2/discovery/pass', methods=['POST'])
+def discovery_pass():
+    """Score orphaned blobs and populate discovery queue."""
+    ensure_discovery_queue_table()
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # 1. Find blobs with zero or few trails + links
+        cur.execute('''
+            WITH blob_connectivity AS (
+                SELECT b.blob_hash, b.content,
+                       COALESCE(t.trail_count, 0) as trail_count,
+                       COALESCE(cr.link_count, 0) as link_count,
+                       c.message as commit_message,
+                       c.branch
+                FROM blobs b
+                JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
+                JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
+                LEFT JOIN (
+                    SELECT source_blob as blob, COUNT(*) as trail_count FROM trails
+                    WHERE tenant_id = %s GROUP BY source_blob
+                    UNION ALL
+                    SELECT target_blob, COUNT(*) FROM trails
+                    WHERE tenant_id = %s GROUP BY target_blob
+                ) t ON b.blob_hash = t.blob
+                LEFT JOIN (
+                    SELECT source_blob as blob, COUNT(*) as link_count FROM cross_references
+                    WHERE tenant_id = %s GROUP BY source_blob
+                    UNION ALL
+                    SELECT target_blob, COUNT(*) FROM cross_references
+                    WHERE tenant_id = %s GROUP BY target_blob
+                ) cr ON b.blob_hash = cr.blob
+                WHERE b.tenant_id = %s
+                  AND b.embedding IS NOT NULL
+                  AND COALESCE(b.quarantined, FALSE) = FALSE
+            )
+            SELECT blob_hash, content, commit_message, branch,
+                   trail_count, link_count,
+                   1.0 / (1.0 + trail_count + link_count) as orphan_score
+            FROM blob_connectivity
+            WHERE trail_count + link_count < 3
+            ORDER BY orphan_score DESC, LENGTH(content) DESC
+        ''', (DEFAULT_TENANT,) * 5)
+
+        candidates = cur.fetchall()
+
+        # 2. Value filter — skip noise
+        scored = []
+        for c in candidates:
+            content_len = len(c['content'] or '')
+            branch = c['branch']
+
+            # Branch priority
+            branch_weight = {
+                'tint-atlanta': 1.0, 'iris': 1.0, 'tint-empire': 0.9,
+                'family': 0.7, 'boswell': 0.6, 'thalamus': 0.5,
+                'command-center': 0.3, 'viscera': 0.2
+            }.get(branch, 0.5)
+
+            # Content substance (longer = more likely substantive)
+            content_weight = min(content_len / 500.0, 1.0)
+
+            # Skip very short commits (likely noise)
+            if content_len < 50:
+                continue
+
+            value = float(c['orphan_score']) * branch_weight * content_weight
+            scored.append({
+                'blob_hash': c['blob_hash'],
+                'content': c['content'],
+                'commit_message': c['commit_message'],
+                'branch': c['branch'],
+                'orphan_score': float(c['orphan_score']),
+                'value_score': value
+            })
+
+        # 3. Take top 20 and upsert into discovery_queue
+        scored.sort(key=lambda x: x['value_score'], reverse=True)
+        top_orphans = scored[:20]
+
+        for orphan in top_orphans:
+            cur.execute('''
+                INSERT INTO discovery_queue
+                    (tenant_id, blob_hash, orphan_score, value_score, branch,
+                     preview, commit_message, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+                ON CONFLICT (tenant_id, blob_hash) DO UPDATE
+                SET orphan_score = EXCLUDED.orphan_score,
+                    value_score = EXCLUDED.value_score,
+                    surfaced_at = NOW(),
+                    status = 'pending'
+            ''', (DEFAULT_TENANT, orphan['blob_hash'], orphan['orphan_score'],
+                  orphan['value_score'], orphan['branch'],
+                  (orphan['content'] or '')[:200], orphan['commit_message']))
+
+        db.commit()
+        cur.close()
+        return jsonify({
+            'status': 'discovery_complete',
+            'candidates_scanned': len(candidates),
+            'orphans_queued': len(top_orphans)
+        })
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': f'Discovery pass failed: {str(e)}'}), 500
+
+
 @app.route('/v2/nightly', methods=['POST'])
 def nightly_maintenance():
-    """Composite nightly maintenance: trails + candidates + consolidation + centroids."""
+    """Composite nightly maintenance: trails + candidates + consolidation + centroids + discovery."""
     start_time = time.time()
     results = {}
 
@@ -6767,6 +7041,19 @@ def nightly_maintenance():
                 results['consolidation'] = consol_result
     except Exception as e:
         results['consolidation'] = {'error': str(e)}
+
+    # Step 4: Discovery pass (surface orphaned memories)
+    try:
+        with app.test_request_context(method='POST', path='/v2/discovery/pass'):
+            discovery_result = discovery_pass()
+            if isinstance(discovery_result, tuple):
+                results['discovery_pass'] = discovery_result[0].get_json() if hasattr(discovery_result[0], 'get_json') else discovery_result[0]
+            elif hasattr(discovery_result, 'get_json'):
+                results['discovery_pass'] = discovery_result.get_json()
+            else:
+                results['discovery_pass'] = discovery_result
+    except Exception as e:
+        results['discovery_pass'] = {'error': str(e)}
 
     duration_ms = int((time.time() - start_time) * 1000)
 
