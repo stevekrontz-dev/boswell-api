@@ -255,12 +255,22 @@ def handle_subscription_updated(subscription):
         ))
 
         row = cur.fetchone()
-        db.commit()
 
         if row:
-            print(f"[STRIPE] Updated subscription {subscription_id}: {plan_id} ({status})", flush=True)
+            tenant_id = row['tenant_id']
+            # Sync users table (source of truth for /v2/me and dashboard)
+            cur.execute("""
+                UPDATE users SET
+                    plan = %s,
+                    status = CASE WHEN %s = 'active' THEN 'active' ELSE status END,
+                    updated_at = %s
+                WHERE tenant_id = %s
+            """, (plan_id, status, now, tenant_id))
+            print(f"[STRIPE] Updated subscription {subscription_id}: {plan_id} ({status}) - synced users table", flush=True)
         else:
             print(f"[STRIPE] Subscription {subscription_id} not found in database", flush=True)
+
+        db.commit()
 
     except Exception as e:
         db.rollback()
@@ -295,12 +305,22 @@ def handle_subscription_deleted(subscription):
         """, (now, now, subscription_id))
 
         row = cur.fetchone()
-        db.commit()
 
         if row:
-            print(f"[STRIPE] Subscription {subscription_id} canceled, downgraded to free", flush=True)
+            tenant_id = row['tenant_id']
+            # Clear subscription from users table
+            cur.execute("""
+                UPDATE users SET
+                    plan = 'free',
+                    stripe_subscription_id = NULL,
+                    updated_at = %s
+                WHERE tenant_id = %s
+            """, (now, tenant_id))
+            print(f"[STRIPE] Subscription {subscription_id} canceled, downgraded to free - synced users table", flush=True)
         else:
             print(f"[STRIPE] Subscription {subscription_id} not found for cancellation", flush=True)
+
+        db.commit()
 
     except Exception as e:
         db.rollback()
@@ -614,6 +634,152 @@ def get_subscription():
             'usage': usage
         })
 
+    finally:
+        cur.close()
+
+
+@billing_bp.route('/sync', methods=['POST'])
+def sync_subscription():
+    """
+    Force-sync subscription status from Stripe to local DB.
+
+    Reads the user's stripe_subscription_id, fetches current state from Stripe,
+    and updates both users and subscriptions tables. Recovers from desync.
+
+    Requires JWT authentication or godmode.
+    """
+    from auth import verify_jwt
+    get_db, get_cursor, DEFAULT_TENANT = get_db_functions()
+
+    # Auth: JWT or godmode
+    auth_header = request.headers.get('Authorization', '')
+    godmode_password = os.environ.get('GODMODE_PASSWORD')
+    user_id = None
+
+    if auth_header.startswith('Bearer '):
+        try:
+            token = auth_header[7:]
+            payload = verify_jwt(token)
+            user_id = payload.get('sub')
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 401
+    elif godmode_password and request.headers.get('X-Godmode') == godmode_password:
+        # Godmode: user_id must be passed in body
+        data = request.get_json() or {}
+        user_id = data.get('user_id')
+    else:
+        return jsonify({'error': 'Authentication required'}), 401
+
+    if not user_id:
+        return jsonify({'error': 'user_id required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Get user's current Stripe subscription ID
+        cur.execute("""
+            SELECT id, tenant_id, stripe_subscription_id, stripe_customer_id, plan
+            FROM users WHERE id = %s
+        """, (user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        stripe_sub_id = user.get('stripe_subscription_id')
+        tenant_id = user.get('tenant_id')
+        old_plan = user.get('plan')
+
+        if not stripe_sub_id:
+            return jsonify({
+                'status': 'no_subscription',
+                'message': 'User has no stripe_subscription_id',
+                'plan': old_plan
+            })
+
+        # Fetch current state from Stripe
+        try:
+            subscription = stripe.Subscription.retrieve(stripe_sub_id)
+        except stripe.error.InvalidRequestError:
+            # Subscription no longer exists in Stripe — clean up
+            now = datetime.utcnow().isoformat() + 'Z'
+            cur.execute("""
+                UPDATE users SET
+                    plan = 'free',
+                    stripe_subscription_id = NULL,
+                    updated_at = %s
+                WHERE id = %s
+            """, (now, user_id))
+            db.commit()
+            return jsonify({
+                'status': 'cleaned',
+                'message': f'Subscription {stripe_sub_id} not found in Stripe, cleared locally',
+                'old_plan': old_plan,
+                'new_plan': 'free'
+            })
+
+        # Derive plan and status from Stripe
+        price_id = subscription['items']['data'][0]['price']['id']
+        plan_id = get_plan_from_price(price_id)
+        stripe_status = subscription['status']
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        # Sync users table
+        if stripe_status in ('active', 'trialing'):
+            cur.execute("""
+                UPDATE users SET
+                    plan = %s,
+                    status = 'active',
+                    stripe_subscription_id = %s,
+                    updated_at = %s
+                WHERE id = %s
+            """, (plan_id, stripe_sub_id, now, user_id))
+        else:
+            cur.execute("""
+                UPDATE users SET
+                    plan = 'free',
+                    stripe_subscription_id = NULL,
+                    updated_at = %s
+                WHERE id = %s
+            """, (now, user_id))
+            plan_id = 'free'
+
+        # Sync subscriptions table
+        if tenant_id:
+            cur.execute("""
+                UPDATE subscriptions SET
+                    plan_id = %s,
+                    status = %s,
+                    current_period_start = %s,
+                    current_period_end = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+            """, (
+                plan_id,
+                stripe_status,
+                datetime.fromtimestamp(subscription['current_period_start']).isoformat(),
+                datetime.fromtimestamp(subscription['current_period_end']).isoformat(),
+                now,
+                tenant_id
+            ))
+
+        db.commit()
+
+        print(f"[STRIPE] Sync complete: user={user_id} old_plan={old_plan} new_plan={plan_id} stripe_status={stripe_status}", flush=True)
+
+        return jsonify({
+            'status': 'synced',
+            'old_plan': old_plan,
+            'new_plan': plan_id,
+            'stripe_status': stripe_status,
+            'subscription_id': stripe_sub_id
+        })
+
+    except Exception as e:
+        db.rollback()
+        print(f"[STRIPE] Error in sync: {e}", flush=True)
+        return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
 
