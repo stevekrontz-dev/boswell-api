@@ -107,6 +107,7 @@ def decrypt_api_key(encrypted: str) -> str:
 AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', '')
 AUTH0_AUDIENCE = os.environ.get('AUTH0_AUDIENCE', '')
 AUTH_ENABLED = os.environ.get('AUTH_ENABLED', 'false').lower() == 'true'
+AUTH_GRACE_MODE = os.environ.get('AUTH_GRACE_MODE', 'false').lower() == 'true'
 INTERNAL_SECRET = os.environ.get('INTERNAL_SECRET', '')
 DEFAULT_TENANT = '00000000-0000-0000-0000-000000000001'
 
@@ -159,18 +160,20 @@ def is_internal_request():
     return INTERNAL_SECRET and request.headers.get('X-Boswell-Internal') == INTERNAL_SECRET
 
 
-def check_mcp_auth(get_cursor_func):
+def check_mcp_auth(get_cursor_func, get_db_func=None):
     """
     MCP auth check for before_request.
     Returns None if OK, or (response, status) if denied.
     """
+    import sys
+
     # Auth disabled - allow all
     if not AUTH_ENABLED:
         g.mcp_auth = {'source': 'disabled', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Skip discovery/health
-    if request.path in ['/', '/health', '/v2/health', '/api/health', '/.well-known/oauth-protected-resource']:
+    # Skip discovery/health (including daemon health cron)
+    if request.path in ['/', '/health', '/v2/health', '/v2/health/daemon', '/v2/health/ping', '/api/health', '/.well-known/oauth-protected-resource']:
         return None
 
     # Internal request (stdio) - CRITICAL: protects CC/Desktop
@@ -178,12 +181,19 @@ def check_mcp_auth(get_cursor_func):
         g.mcp_auth = {'source': 'internal', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Check existing API key auth (X-API-Key header)
+    # Check API key auth (X-API-Key header) via database validation
     api_key = request.headers.get('X-API-Key')
     if api_key and api_key.startswith('bos_'):
-        # Existing API key validation (reuse existing logic)
-        g.mcp_auth = {'source': 'api_key', 'tenant_id': DEFAULT_TENANT}
-        return None
+        from auth.api_keys import validate_api_key
+        key_info = validate_api_key(api_key, get_cursor_func, get_db_func)
+        if key_info:
+            g.mcp_auth = {
+                'source': 'api_key',
+                'tenant_id': key_info.get('tenant_id') or DEFAULT_TENANT,
+                'user_id': key_info.get('user_id'),
+            }
+            return None
+        # Invalid API key — fall through to denial
 
     # Check Bearer token (Auth0)
     auth_header = request.headers.get('Authorization', '')
@@ -194,7 +204,17 @@ def check_mcp_auth(get_cursor_func):
             g.mcp_auth = auth_info
             return None
 
-    # No valid auth
+    # No valid auth — grace mode logs but allows through
+    if AUTH_GRACE_MODE:
+        print(
+            f'[AUTH-GRACE] Unauthenticated request: {request.method} {request.path} '
+            f'from {request.remote_addr}',
+            file=sys.stderr
+        )
+        g.mcp_auth = {'source': 'grace_mode', 'tenant_id': DEFAULT_TENANT}
+        return None
+
+    # Hard deny
     return jsonify({
         'error': 'unauthorized',
         'error_description': 'Valid authentication required'

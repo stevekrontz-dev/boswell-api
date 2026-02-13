@@ -168,7 +168,7 @@ def before_request():
 
     # MCP Auth check (OAuth 2.1 / internal / API key)
     from auth import check_mcp_auth
-    result = check_mcp_auth(get_cursor)
+    result = check_mcp_auth(get_cursor, get_db)
     if result:
         return result
 
