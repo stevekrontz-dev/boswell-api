@@ -4,7 +4,7 @@
 import psycopg2
 
 # Connection string from Railway (DATABASE_PUBLIC_URL format) with SSL
-DATABASE_URL = "postgresql://postgres:TZZuQAjZiJZPwHojTDhwchCZmNVPbNXY@gondola.proxy.rlwy.net:13404/railway?sslmode=require"
+DATABASE_URL = "postgresql://postgres:ItAxQqfRlFJlScRpgzPGswYNKMvzCuTg@gondola.proxy.rlwy.net:13404/railway?sslmode=require"
 
 # Define each SQL statement explicitly
 STATEMENTS = [
