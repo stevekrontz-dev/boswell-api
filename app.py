@@ -7594,17 +7594,37 @@ def get_current_user():
     """
     from auth import verify_jwt, decrypt_api_key
 
-    # Require JWT authentication
+    # Require authentication (JWT or session token)
     auth_header = request.headers.get('Authorization', '')
     if not auth_header.startswith('Bearer '):
         return jsonify({'error': 'Authorization header required'}), 401
 
+    token = auth_header[7:]
+    user_id = None
+
+    # Try JWT first
     try:
-        token = auth_header[7:]
         payload = verify_jwt(token)
         user_id = payload.get('sub')
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 401
+    except ValueError:
+        # Fall back to session token (passkey auth)
+        from passkey_auth import hash_session_token
+        token_hash = hash_session_token(token)
+        scur = get_cursor()
+        try:
+            scur.execute(
+                '''SELECT user_id FROM passkey_sessions
+                   WHERE token = %s AND expires_at > NOW()''',
+                (token_hash,)
+            )
+            session = scur.fetchone()
+            if session:
+                user_id = session['user_id']
+        finally:
+            scur.close()
+
+    if not user_id:
+        return jsonify({'error': 'Invalid or expired token'}), 401
 
     cur = get_cursor()
 

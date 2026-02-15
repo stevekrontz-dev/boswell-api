@@ -40,6 +40,12 @@ export async function fetchWithAuth(endpoint: string, options: RequestInit = {})
       ...options.headers,
     },
   });
+  if (res.status === 401) {
+    localStorage.removeItem('boswell_token');
+    localStorage.removeItem('boswell_user');
+    window.location.href = '/dashboard/login';
+    throw new Error('Session expired');
+  }
   return res.json();
 }
 
@@ -82,6 +88,12 @@ export async function getCurrentUser(tokenOverride?: string): Promise<UserProfil
       ...(token && { 'Authorization': `Bearer ${token}` }),
     },
   });
+  if (res.status === 401 && !tokenOverride) {
+    localStorage.removeItem('boswell_token');
+    localStorage.removeItem('boswell_user');
+    window.location.href = '/dashboard/login';
+    throw new Error('Session expired');
+  }
   return res.json();
 }
 
