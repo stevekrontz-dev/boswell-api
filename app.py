@@ -16,10 +16,11 @@ import hashlib
 import json
 import os
 from datetime import datetime
-from flask import Flask, request, jsonify, g, send_from_directory
+from flask import Flask, request, jsonify, g, send_from_directory, has_request_context
 from flask_cors import CORS
 import time
 import math
+import threading
 import numpy as np
 
 # OpenAI for embeddings (v3)
@@ -90,7 +91,7 @@ def get_active_dek():
         cur = get_cursor()
         cur.execute(
             "SELECT key_id, wrapped_key FROM data_encryption_keys WHERE tenant_id = %s AND status = 'active' LIMIT 1",
-            (DEFAULT_TENANT,)
+            (get_tenant_id(),)
         )
         row = cur.fetchone()
         cur.close()
@@ -113,6 +114,34 @@ if DATABASE_URL:
 
 # Default tenant for single-tenant mode (Steve Krontz)
 DEFAULT_TENANT = '00000000-0000-0000-0000-000000000001'
+
+_tenant_override = threading.local()
+
+def get_tenant_id():
+    """Get the active tenant ID. Checks (in order):
+    1. Thread-local override stack (set by invoke_view/nightly_maintenance)
+    2. g.mcp_auth['tenant_id'] (set by before_request auth)
+    3. DEFAULT_TENANT fallback
+    """
+    stack = getattr(_tenant_override, 'stack', None)
+    if stack:
+        return stack[-1]
+    auth = getattr(g, 'mcp_auth', None)
+    if auth and auth.get('tenant_id'):
+        return auth['tenant_id']
+    return DEFAULT_TENANT
+
+def push_tenant_override(tenant_id):
+    """Push tenant onto thread-local stack. Always pair with pop."""
+    if not hasattr(_tenant_override, 'stack'):
+        _tenant_override.stack = []
+    _tenant_override.stack.append(tenant_id)
+
+def pop_tenant_override():
+    """Pop tenant from thread-local stack. Safe if stack is empty."""
+    stack = getattr(_tenant_override, 'stack', None)
+    if stack:
+        stack.pop()
 
 # Project to branch mapping for auto-routing
 PROJECT_BRANCH_MAP = {
@@ -141,7 +170,7 @@ def get_db():
                 pass  # pgvector extension not in DB, skip
         # Set tenant context for RLS
         cur = g.db.cursor()
-        cur.execute(f"SET app.current_tenant = '{DEFAULT_TENANT}'")
+        cur.execute("SELECT set_config('app.current_tenant', %s, true)", (get_tenant_id(),))
         cur.close()
     return g.db
 
@@ -193,7 +222,7 @@ def _record_co_access_trails():
                     SET traversal_count = trails.traversal_count + 1,
                         last_traversed = NOW(),
                         strength = LEAST(trails.strength * 1.1, 10.0)
-                ''', (DEFAULT_TENANT, blob_list[i], blob_list[j]))
+                ''', (get_tenant_id(), blob_list[i], blob_list[j]))
         db.commit()
         cur.close()
     except Exception as e:
@@ -224,7 +253,7 @@ def after_request(response):
         cur = get_cursor()
         log_audit(
             cursor=cur,
-            tenant_id=DEFAULT_TENANT,
+            tenant_id=get_tenant_id(),
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -249,7 +278,7 @@ def get_current_head(branch='command-center'):
     cur = get_cursor()
     cur.execute(
         'SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s',
-        (branch, DEFAULT_TENANT)
+        (branch, get_tenant_id())
     )
     row = cur.fetchone()
     cur.close()
@@ -272,9 +301,9 @@ def health_check():
     """Health check endpoint."""
     try:
         cur = get_cursor()
-        cur.execute('SELECT COUNT(*) as count FROM branches WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT COUNT(*) as count FROM branches WHERE tenant_id = %s', (get_tenant_id(),))
         branch_count = cur.fetchone()['count']
-        cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (get_tenant_id(),))
         commit_count = cur.fetchone()['count']
         cur.close()
         # Check encryption status
@@ -479,7 +508,7 @@ def commit_health_snapshot(snapshot):
             '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
                VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (blob_hash) DO NOTHING''',
-            (blob_hash, DEFAULT_TENANT, content_str, 'health_snapshot', now, len(content_str))
+            (blob_hash, get_tenant_id(), content_str, 'health_snapshot', now, len(content_str))
         )
 
         # Create tree entry
@@ -492,11 +521,11 @@ def commit_health_snapshot(snapshot):
         cur.execute(
             '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
                VALUES (%s, %s, %s, %s, %s)''',
-            (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'health_snapshot')
+            (get_tenant_id(), tree_hash, message[:100], blob_hash, 'health_snapshot')
         )
 
         # Check if branch exists
-        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, get_tenant_id()))
         branch_row = cur.fetchone()
         if branch_row:
             parent_hash = branch_row['head_commit'] if branch_row['head_commit'] != 'GENESIS' else None
@@ -505,7 +534,7 @@ def commit_health_snapshot(snapshot):
             cur.execute(
                 '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
                    VALUES (%s, %s, %s, %s)''',
-                (DEFAULT_TENANT, branch, 'GENESIS', now)
+                (get_tenant_id(), branch, 'GENESIS', now)
             )
             parent_hash = None
 
@@ -516,13 +545,13 @@ def commit_health_snapshot(snapshot):
         cur.execute(
             '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-            (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'health-daemon', message, now)
+            (commit_hash, get_tenant_id(), tree_hash, parent_hash, 'health-daemon', message, now)
         )
 
         # Update branch head
         cur.execute(
             'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
-            (commit_hash, branch, DEFAULT_TENANT)
+            (commit_hash, branch, get_tenant_id())
         )
 
         db.commit()
@@ -637,7 +666,7 @@ def get_head():
     branch = request.args.get('branch', 'command-center')
     cur = get_cursor()
 
-    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, get_tenant_id()))
     branch_info = cur.fetchone()
 
     if not branch_info:
@@ -647,7 +676,7 @@ def get_head():
     head_commit = branch_info['head_commit']
     commit_info = None
     if head_commit and head_commit != 'GENESIS':
-        cur.execute('SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s', (head_commit, DEFAULT_TENANT))
+        cur.execute('SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s', (head_commit, get_tenant_id()))
         commit_row = cur.fetchone()
         if commit_row:
             commit_info = dict(commit_row)
@@ -670,7 +699,7 @@ def checkout_branch():
         return jsonify({'error': 'Branch name required'}), 400
 
     cur = get_cursor()
-    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, get_tenant_id()))
     branch_info = cur.fetchone()
     cur.close()
 
@@ -686,27 +715,7 @@ def checkout_branch():
 @app.route('/v2/branches', methods=['GET'])
 def list_branches():
     """List all cognitive branches for the authenticated user."""
-    from auth import verify_jwt
-
-    # Get user's tenant_id from JWT
-    auth_header = request.headers.get('Authorization', '')
-    tenant_id = DEFAULT_TENANT  # Fallback for API key auth
-
-    if auth_header.startswith('Bearer '):
-        try:
-            token = auth_header[7:]
-            payload = verify_jwt(token)
-            user_id = payload.get('sub')
-
-            # Get user's tenant_id
-            cur = get_cursor()
-            cur.execute('SELECT tenant_id FROM users WHERE id = %s', (user_id,))
-            user = cur.fetchone()
-            if user and user.get('tenant_id'):
-                tenant_id = str(user['tenant_id'])
-            cur.close()
-        except ValueError:
-            pass  # Fall back to DEFAULT_TENANT
+    tenant_id = get_tenant_id()
 
     try:
         cur = get_cursor()
@@ -753,8 +762,6 @@ def list_branches():
 @app.route('/v2/branch', methods=['POST'])
 def create_branch():
     """Create a new cognitive branch."""
-    from auth import verify_jwt
-
     data = request.get_json() or {}
     name = data.get('name')
     from_branch = data.get('from', 'command-center')
@@ -762,25 +769,7 @@ def create_branch():
     if not name:
         return jsonify({'error': 'Branch name required'}), 400
 
-    # Get user's tenant_id from JWT (same pattern as list_branches)
-    auth_header = request.headers.get('Authorization', '')
-    tenant_id = DEFAULT_TENANT  # Fallback for API key auth
-
-    if auth_header.startswith('Bearer '):
-        try:
-            token = auth_header[7:]
-            payload = verify_jwt(token)
-            user_id = payload.get('sub')
-
-            # Get user's tenant_id
-            cur = get_cursor()
-            cur.execute('SELECT tenant_id FROM users WHERE id = %s', (user_id,))
-            user = cur.fetchone()
-            if user and user.get('tenant_id'):
-                tenant_id = str(user['tenant_id'])
-            cur.close()
-        except ValueError:
-            pass  # Fall back to DEFAULT_TENANT
+    tenant_id = get_tenant_id()
 
     # W2P4: Check branch limit before creating
     from billing.enforce import enforce_branch_limit
@@ -826,8 +815,6 @@ def create_branch():
 @app.route('/v2/branch/<name>', methods=['DELETE'])
 def delete_branch(name):
     """Delete a cognitive branch."""
-    from auth import verify_jwt
-
     if not name:
         return jsonify({'error': 'Branch name required'}), 400
 
@@ -836,24 +823,7 @@ def delete_branch(name):
     if name in protected_branches:
         return jsonify({'error': f'Cannot delete protected branch: {name}'}), 403
 
-    # Get user's tenant_id from JWT
-    auth_header = request.headers.get('Authorization', '')
-    tenant_id = DEFAULT_TENANT
-
-    if auth_header.startswith('Bearer '):
-        try:
-            token = auth_header[7:]
-            payload = verify_jwt(token)
-            user_id = payload.get('sub')
-
-            cur = get_cursor()
-            cur.execute('SELECT tenant_id FROM users WHERE id = %s', (user_id,))
-            user = cur.fetchone()
-            if user and user.get('tenant_id'):
-                tenant_id = str(user['tenant_id'])
-            cur.close()
-        except ValueError:
-            pass
+    tenant_id = get_tenant_id()
 
     db = get_db()
     cur = get_cursor()
@@ -900,7 +870,7 @@ def create_commit():
                 SELECT branch_name, centroid, commit_count
                 FROM branch_fingerprints
                 WHERE tenant_id = %s AND centroid IS NOT NULL
-            """, (DEFAULT_TENANT,))
+            """, (get_tenant_id(),))
             scores = []
             for row in check_cur.fetchall():
                 if row['centroid'] is not None:
@@ -922,7 +892,7 @@ def create_commit():
 
     # W2P4: Check commit limit before creating
     from billing.enforce import enforce_commit_limit
-    tenant_id = request.headers.get('X-Tenant-ID', DEFAULT_TENANT)
+    tenant_id = request.headers.get('X-Tenant-ID', get_tenant_id())
     limit_cur = get_cursor()
     limit_error = enforce_commit_limit(limit_cur, tenant_id)
     limit_cur.close()
@@ -951,7 +921,7 @@ def create_commit():
                 '''INSERT INTO blobs (blob_hash, tenant_id, content, content_encrypted, nonce, encryption_key_id, content_type, created_at, byte_size)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (blob_hash) DO NOTHING''',
-                (blob_hash, DEFAULT_TENANT, content_str, psycopg2.Binary(ciphertext), psycopg2.Binary(nonce), key_id, memory_type, now, len(content_str))
+                (blob_hash, get_tenant_id(), content_str, psycopg2.Binary(ciphertext), psycopg2.Binary(nonce), key_id, memory_type, now, len(content_str))
             )
         else:
             # Fallback: store unencrypted
@@ -959,7 +929,7 @@ def create_commit():
                 '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
                    VALUES (%s, %s, %s, %s, %s, %s)
                    ON CONFLICT (blob_hash) DO NOTHING''',
-                (blob_hash, DEFAULT_TENANT, content_str, memory_type, now, len(content_str))
+                (blob_hash, get_tenant_id(), content_str, memory_type, now, len(content_str))
             )
 
         # Generate and store embedding for semantic search
@@ -968,7 +938,7 @@ def create_commit():
             try:
                 cur.execute(
                     '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
-                    (embedding, blob_hash, DEFAULT_TENANT)
+                    (embedding, blob_hash, get_tenant_id())
                 )
             except Exception as e:
                 print(f"[EMBEDDING] Failed to store embedding: {e}", file=sys.stderr)
@@ -983,7 +953,7 @@ def create_commit():
                     SELECT branch_name, centroid, commit_count
                     FROM branch_fingerprints
                     WHERE tenant_id = %s AND centroid IS NOT NULL
-                """, (DEFAULT_TENANT,))
+                """, (get_tenant_id(),))
                 
                 scores = []
                 for row in fp_cur.fetchall():
@@ -1012,10 +982,10 @@ def create_commit():
         cur.execute(
             '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
                VALUES (%s, %s, %s, %s, %s)''',
-            (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, memory_type)
+            (get_tenant_id(), tree_hash, message[:100], blob_hash, memory_type)
         )
 
-        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, get_tenant_id()))
         branch_row = cur.fetchone()
         if branch_row:
             branch = branch_row['name']  # Use canonical casing
@@ -1025,7 +995,7 @@ def create_commit():
             cur.execute(
                 '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
                    VALUES (%s, %s, %s, %s)''',
-                (DEFAULT_TENANT, branch, 'GENESIS', now)
+                (get_tenant_id(), branch, 'GENESIS', now)
             )
             parent_hash = None
 
@@ -1035,12 +1005,12 @@ def create_commit():
         cur.execute(
             '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-            (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, author, message, now)
+            (commit_hash, get_tenant_id(), tree_hash, parent_hash, author, message, now)
         )
 
         cur.execute(
             'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
-            (commit_hash, branch, DEFAULT_TENANT)
+            (commit_hash, branch, get_tenant_id())
         )
 
         for tag in tags:
@@ -1049,7 +1019,7 @@ def create_commit():
                 cur.execute(
                     '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
                        VALUES (%s, %s, %s, %s)''',
-                    (DEFAULT_TENANT, blob_hash, tag_str, now)
+                    (get_tenant_id(), blob_hash, tag_str, now)
                 )
             except Exception:
                 # Tag already exists, ignore duplicate
@@ -1103,7 +1073,7 @@ def cherry_pick_commit():
         # 1. Get the source commit
         cur.execute(
             'SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s',
-            (source_hash, DEFAULT_TENANT)
+            (source_hash, get_tenant_id())
         )
         source_commit = cur.fetchone()
         
@@ -1114,7 +1084,7 @@ def cherry_pick_commit():
         # 2. Get the blob via tree_entry
         cur.execute(
             'SELECT blob_hash, name, mode FROM tree_entries WHERE tree_hash = %s AND tenant_id = %s',
-            (source_commit['tree_hash'], DEFAULT_TENANT)
+            (source_commit['tree_hash'], get_tenant_id())
         )
         tree_entry = cur.fetchone()
         
@@ -1131,12 +1101,12 @@ def cherry_pick_commit():
         cur.execute(
             '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
                VALUES (%s, %s, %s, %s, %s)''',
-            (DEFAULT_TENANT, new_tree_hash, f"[cherry-pick] {original_message}", blob_hash, memory_type)
+            (get_tenant_id(), new_tree_hash, f"[cherry-pick] {original_message}", blob_hash, memory_type)
         )
         
         # 4. Get or create target branch
         cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', 
-                    (target_branch, DEFAULT_TENANT))
+                    (target_branch, get_tenant_id()))
         branch_row = cur.fetchone()
         
         if branch_row:
@@ -1147,7 +1117,7 @@ def cherry_pick_commit():
             cur.execute(
                 '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
                    VALUES (%s, %s, %s, %s)''',
-                (DEFAULT_TENANT, target_branch, 'GENESIS', now)
+                (get_tenant_id(), target_branch, 'GENESIS', now)
             )
             parent_hash = None
         
@@ -1159,13 +1129,13 @@ def cherry_pick_commit():
         cur.execute(
             '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-            (new_commit_hash, DEFAULT_TENANT, new_tree_hash, parent_hash, 'claude', cherry_pick_message, now)
+            (new_commit_hash, get_tenant_id(), new_tree_hash, parent_hash, 'claude', cherry_pick_message, now)
         )
         
         # 6. Update target branch head
         cur.execute(
             'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
-            (new_commit_hash, target_branch, DEFAULT_TENANT)
+            (new_commit_hash, target_branch, get_tenant_id())
         )
         
         db.commit()
@@ -1217,7 +1187,7 @@ def deprecate_commit(commit_hash):
         # Verify commit exists
         cur.execute(
             'SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s',
-            (commit_hash, DEFAULT_TENANT)
+            (commit_hash, get_tenant_id())
         )
         commit = cur.fetchone()
         
@@ -1239,7 +1209,7 @@ def deprecate_commit(commit_hash):
             '''INSERT INTO deprecated_commits (commit_hash, tenant_id, reason)
                VALUES (%s, %s, %s)
                ON CONFLICT (commit_hash) DO UPDATE SET reason = %s, deprecated_at = NOW()''',
-            (commit_hash, DEFAULT_TENANT, reason, reason)
+            (commit_hash, get_tenant_id(), reason, reason)
         )
         
         db.commit()
@@ -1266,7 +1236,7 @@ def get_log():
     try:
         ensure_deprecated_commits_table()
         cur = get_cursor()
-        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        cur.execute('SELECT head_commit FROM branches WHERE name = %s AND tenant_id = %s', (branch, get_tenant_id()))
         branch_row = cur.fetchone()
 
         if not branch_row:
@@ -1282,7 +1252,7 @@ def get_log():
         current_hash = head_commit
 
         while current_hash and len(commits) < limit:
-            cur.execute('SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s', (current_hash, DEFAULT_TENANT))
+            cur.execute('SELECT * FROM commits WHERE commit_hash = %s AND tenant_id = %s', (current_hash, get_tenant_id()))
             commit = cur.fetchone()
             if not commit:
                 break
@@ -1324,7 +1294,7 @@ def search_memories():
         LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
         WHERE b.content LIKE %s AND b.tenant_id = %s AND dc.commit_hash IS NULL
     '''
-    params = [f'%{query}%', DEFAULT_TENANT]
+    params = [f'%{query}%', get_tenant_id()]
 
     if memory_type:
         sql += ' AND b.content_type = %s'
@@ -1362,7 +1332,7 @@ def search_memories():
                       AND (summary ILIKE %s OR content::text ILIKE %s)
                     ORDER BY created_at DESC
                     LIMIT %s
-                """, (DEFAULT_TENANT, f'%{query}%', f'%{query}%', remaining))
+                """, (get_tenant_id(), f'%{query}%', f'%{query}%', remaining))
 
                 for row in cur.fetchall():
                     content = row['summary']
@@ -1449,7 +1419,7 @@ def semantic_search():
             ) combined
             ORDER BY distance
             LIMIT %s
-        """, (query_embedding, DEFAULT_TENANT, query_embedding, DEFAULT_TENANT, limit))
+        """, (query_embedding, get_tenant_id(), query_embedding, get_tenant_id(), limit))
     else:
         # Legacy: permanent memories only
         cur.execute("""
@@ -1464,7 +1434,7 @@ def semantic_search():
             WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
             ORDER BY distance
             LIMIT %s
-        """, (query_embedding, DEFAULT_TENANT, limit))
+        """, (query_embedding, get_tenant_id(), limit))
 
     results = []
     staged_in_top3 = []  # Track staged candidates for auto-replay
@@ -1502,7 +1472,7 @@ def semantic_search():
                     SELECT id, context_embedding, embedding, replay_count, expires_at
                     FROM candidate_memories
                     WHERE id = %s AND tenant_id = %s
-                """, (cand_id, DEFAULT_TENANT))
+                """, (cand_id, get_tenant_id()))
                 cand = cur.fetchone()
                 if not cand:
                     continue
@@ -1552,7 +1522,7 @@ def semantic_search():
                                                    replay_context, similarity_score, fired,
                                                    threshold_used, context_type)
                         VALUES (%s, %s, %s, NULL, %s, %s, true, %s, %s)
-                    """, (str(uuid_mod.uuid4()), DEFAULT_TENANT, cand_id,
+                    """, (str(uuid_mod.uuid4()), get_tenant_id(), cand_id,
                           query[:200], ctx_distance, threshold, context_type))
                 elif ctx_distance > (threshold - 0.1):
                     # Near-miss — log for tuning but don't fire
@@ -1561,7 +1531,7 @@ def semantic_search():
                                                    replay_context, similarity_score, fired,
                                                    threshold_used, context_type)
                         VALUES (%s, %s, %s, NULL, %s, %s, false, %s, %s)
-                    """, (str(uuid_mod.uuid4()), DEFAULT_TENANT, cand_id,
+                    """, (str(uuid_mod.uuid4()), get_tenant_id(), cand_id,
                           query[:200], ctx_distance, threshold, context_type))
             except Exception as e:
                 print(f"[AUTO-REPLAY] Error for candidate {cand_id}: {e}", file=sys.stderr)
@@ -1615,7 +1585,7 @@ def recall_memory():
     cur = get_cursor()
 
     if blob_hash:
-        cur.execute('SELECT * FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+        cur.execute('SELECT * FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
         blob = cur.fetchone()
         if not blob:
             cur.close()
@@ -1643,7 +1613,7 @@ def recall_memory():
                       AND b.embedding IS NOT NULL
                     ORDER BY distance ASC
                     LIMIT 5
-                ''', (blob['embedding'], DEFAULT_TENANT, blob_hash))
+                ''', (blob['embedding'], get_tenant_id(), blob_hash))
                 for row in cur.fetchall():
                     neighbors.append({
                         'blob_hash': row['blob_hash'],
@@ -1681,7 +1651,7 @@ def recall_memory():
                JOIN tree_entries t ON c.tree_hash = t.tree_hash AND c.tenant_id = t.tenant_id
                JOIN blobs b ON t.blob_hash = b.blob_hash AND t.tenant_id = b.tenant_id
                WHERE c.commit_hash = %s AND c.tenant_id = %s''',
-            (commit_hash, DEFAULT_TENANT)
+            (commit_hash, get_tenant_id())
         )
         commit = cur.fetchone()
         cur.close()
@@ -1715,7 +1685,7 @@ def quick_brief():
     branch = request.args.get('branch', 'command-center')
 
     cur = get_cursor()
-    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, DEFAULT_TENANT))
+    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, get_tenant_id()))
     branch_info = cur.fetchone()
 
     if not branch_info:
@@ -1725,7 +1695,7 @@ def quick_brief():
     cur.execute(
         '''SELECT commit_hash, message, created_at, author
            FROM commits WHERE tenant_id = %s ORDER BY created_at DESC LIMIT 5''',
-        (DEFAULT_TENANT,)
+        (get_tenant_id(),)
     )
     recent_commits = []
     for row in cur.fetchall():
@@ -1737,7 +1707,7 @@ def quick_brief():
     cur.execute(
         '''SELECT session_id, branch, summary, synced_at
            FROM sessions WHERE tenant_id = %s ORDER BY synced_at DESC LIMIT 5''',
-        (DEFAULT_TENANT,)
+        (get_tenant_id(),)
     )
     pending_sessions = []
     for row in cur.fetchall():
@@ -1746,7 +1716,7 @@ def quick_brief():
             r['synced_at'] = str(r['synced_at'])
         pending_sessions.append(r)
 
-    cur.execute('SELECT name FROM branches WHERE tenant_id = %s', (DEFAULT_TENANT,))
+    cur.execute('SELECT name FROM branches WHERE tenant_id = %s', (get_tenant_id(),))
     branches = [dict(row) for row in cur.fetchall()]
 
     cur.close()
@@ -1794,7 +1764,7 @@ def semantic_startup():
         SELECT b.content FROM blobs b
         WHERE b.content LIKE %s AND b.tenant_id = %s
         ORDER BY b.created_at DESC LIMIT 1
-    """, ('%"type": "sacred_manifest"%', DEFAULT_TENANT))
+    """, ('%"type": "sacred_manifest"%', get_tenant_id()))
     row = cur.fetchone()
     if row:
         try:
@@ -1807,7 +1777,7 @@ def semantic_startup():
         SELECT b.content FROM blobs b
         WHERE b.content LIKE %s AND b.tenant_id = %s
         ORDER BY b.created_at DESC LIMIT 1
-    """, ('%"type": "tool_registry"%', DEFAULT_TENANT))
+    """, ('%"type": "tool_registry"%', get_tenant_id()))
     row = cur.fetchone()
     if row:
         try:
@@ -1828,7 +1798,7 @@ def semantic_startup():
                 JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
                 WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
                 ORDER BY distance LIMIT %s
-            """, (query_embedding, DEFAULT_TENANT, k))
+            """, (query_embedding, get_tenant_id(), k))
             for row in cur.fetchall():
                 relevant_memories.append({
                     'blob_hash': row['blob_hash'],
@@ -1856,7 +1826,7 @@ def semantic_startup():
                     WHERE tenant_id = %s AND target_blob IN ({placeholders})
                 ) t
                 GROUP BY blob_hash
-            """, (DEFAULT_TENANT, *blob_hashes, DEFAULT_TENANT, *blob_hashes))
+            """, (get_tenant_id(), *blob_hashes, get_tenant_id(), *blob_hashes))
 
             trail_strengths = {row['blob_hash']: float(row['total_strength']) for row in cur.fetchall()}
 
@@ -1885,7 +1855,7 @@ def semantic_startup():
             GROUP BY blob_hash
             ORDER BY total_strength DESC
             LIMIT 5
-        """, (DEFAULT_TENANT, DEFAULT_TENANT))
+        """, (get_tenant_id(), get_tenant_id()))
 
         hot_blob_hashes = []
         hot_strengths = {}
@@ -1905,7 +1875,7 @@ def semantic_startup():
                 JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
                 JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
                 WHERE b.tenant_id = %s AND b.blob_hash IN ({placeholders})
-            """, (DEFAULT_TENANT, *hot_blob_hashes))
+            """, (get_tenant_id(), *hot_blob_hashes))
 
             blob_details = {row['blob_hash']: row for row in cur.fetchall()}
 
@@ -1935,7 +1905,7 @@ def semantic_startup():
             WHERE tenant_id = %s AND status = 'pending'
             ORDER BY value_score DESC
             LIMIT 3
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         discovery_blobs = [dict(row) for row in cur_disc.fetchall()]
 
         # Mark as consumed
@@ -1947,7 +1917,7 @@ def semantic_startup():
                     consumed_by = %s
                 WHERE tenant_id = %s AND blob_hash = ANY(%s)
             ''', (request.args.get('instance_id', 'unknown'),
-                  DEFAULT_TENANT, consumed_hashes))
+                  get_tenant_id(), consumed_hashes))
             get_db().commit()
 
             # Auto-trail: seed discovered blobs into co-access set
@@ -1973,7 +1943,7 @@ def semantic_startup():
                 FROM tasks 
                 WHERE tenant_id = %s AND status = 'open' AND assigned_to = %s
                 ORDER BY priority ASC, created_at ASC
-            """, (DEFAULT_TENANT, agent_id))
+            """, (get_tenant_id(), agent_id))
             for row in cur.fetchall():
                 my_tasks.append({
                     'id': str(row['id']),
@@ -1991,7 +1961,7 @@ def semantic_startup():
                 WHERE tenant_id = %s AND status = 'open' AND assigned_to IS NULL
                 ORDER BY priority ASC, created_at ASC
                 LIMIT 5
-            """, (DEFAULT_TENANT,))
+            """, (get_tenant_id(),))
             for row in cur.fetchall():
                 open_tasks.append({
                     'id': str(row['id']),
@@ -2010,7 +1980,7 @@ def semantic_startup():
                 WHERE tenant_id = %s AND status = 'open'
                 ORDER BY priority ASC, created_at ASC
                 LIMIT 10
-            """, (DEFAULT_TENANT,))
+            """, (get_tenant_id(),))
             for row in cur.fetchall():
                 open_tasks.append({
                     'id': str(row['id']),
@@ -2037,7 +2007,7 @@ def semantic_startup():
                   AND created_at > NOW() - INTERVAL '48 hours'
                 ORDER BY created_at DESC
                 LIMIT 10
-            """, (DEFAULT_TENANT,))
+            """, (get_tenant_id(),))
             for row in cur.fetchall():
                 recent_bookmarks.append({
                     'id': str(row['id']),
@@ -2175,7 +2145,7 @@ def create_link():
                (tenant_id, source_blob, target_blob, source_branch, target_branch,
                 link_type, weight, reasoning, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-            (DEFAULT_TENANT, source_blob, target_blob, source_branch, target_branch,
+            (get_tenant_id(), source_blob, target_blob, source_branch, target_branch,
              link_type, weight, reasoning, now)
         )
         db.commit()
@@ -2207,7 +2177,7 @@ def list_links():
     cur = get_cursor()
 
     sql = 'SELECT * FROM cross_references WHERE tenant_id = %s'
-    params = [DEFAULT_TENANT]
+    params = [get_tenant_id()]
 
     if blob:
         sql += ' AND (source_blob = %s OR target_blob = %s)'
@@ -2254,20 +2224,20 @@ def get_graph():
             WHERE br.name = %s AND b.tenant_id = %s
             LIMIT %s
         '''
-        cur.execute(nodes_sql, (branch, DEFAULT_TENANT, limit))
+        cur.execute(nodes_sql, (branch, get_tenant_id(), limit))
     else:
         nodes_sql = '''
             SELECT blob_hash, content_type, created_at,
                    content as preview
             FROM blobs WHERE tenant_id = %s ORDER BY created_at DESC LIMIT %s
         '''
-        cur.execute(nodes_sql, (DEFAULT_TENANT, limit))
+        cur.execute(nodes_sql, (get_tenant_id(), limit))
 
     rows = cur.fetchall()
 
     # Batch lookup branches for all blobs (O(1) queries instead of O(N))
     blob_hashes = [row['blob_hash'] for row in rows]
-    branch_map = get_blob_branches_batch(cur, blob_hashes, DEFAULT_TENANT)
+    branch_map = get_blob_branches_batch(cur, blob_hashes, get_tenant_id())
 
     nodes = []
     for row in rows:
@@ -2284,10 +2254,10 @@ def get_graph():
             SELECT * FROM cross_references
             WHERE (source_branch = %s OR target_branch = %s) AND tenant_id = %s LIMIT %s
         '''
-        cur.execute(edges_sql, (branch, branch, DEFAULT_TENANT, limit))
+        cur.execute(edges_sql, (branch, branch, get_tenant_id(), limit))
     else:
         edges_sql = 'SELECT * FROM cross_references WHERE tenant_id = %s LIMIT %s'
-        cur.execute(edges_sql, (DEFAULT_TENANT, limit))
+        cur.execute(edges_sql, (get_tenant_id(), limit))
 
     edges = []
     for row in cur.fetchall():
@@ -2330,7 +2300,7 @@ def reflect():
         LIMIT %s
     '''
 
-    cur.execute(sql, (DEFAULT_TENANT, DEFAULT_TENANT, min_links, limit))
+    cur.execute(sql, (get_tenant_id(), get_tenant_id(), min_links, limit))
     insights = []
 
     for row in cur.fetchall():
@@ -2352,7 +2322,7 @@ def reflect():
         ORDER BY cr.weight DESC, cr.created_at DESC
         LIMIT %s
     '''
-    cur.execute(cross_branch_sql, (DEFAULT_TENANT, limit))
+    cur.execute(cross_branch_sql, (get_tenant_id(), limit))
     cross_branch_links = []
     for row in cur.fetchall():
         r = dict(row)
@@ -2406,7 +2376,7 @@ def analyze_debug():
         cur = get_cursor()
 
         # Test 1: Can we query blobs?
-        cur.execute('SELECT COUNT(*) as cnt FROM blobs WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT COUNT(*) as cnt FROM blobs WHERE tenant_id = %s', (get_tenant_id(),))
         blob_count = cur.fetchone()['cnt']
 
         # Test 2: Can we get embeddings?
@@ -2415,7 +2385,7 @@ def analyze_debug():
             FROM blobs
             WHERE embedding IS NOT NULL AND tenant_id = %s
             LIMIT 1
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         row = cur.fetchone()
 
         embedding_info = None
@@ -2630,7 +2600,7 @@ def _analyze_connectome_impl():
         SELECT blob_hash, content, embedding
         FROM blobs
         WHERE embedding IS NOT NULL AND tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
 
     blobs = []
     for row in cur.fetchall():
@@ -2645,7 +2615,7 @@ def _analyze_connectome_impl():
         SELECT source_blob || '-' || target_blob as link_key
         FROM cross_references
         WHERE tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     existing_links = set(row['link_key'] for row in cur.fetchall())
 
     # Also add reverse keys
@@ -2653,7 +2623,7 @@ def _analyze_connectome_impl():
         SELECT target_blob || '-' || source_blob as link_key
         FROM cross_references
         WHERE tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     existing_links.update(row['link_key'] for row in cur.fetchall())
 
     # 3. Compute pairwise similarities for blobs with embeddings
@@ -2688,8 +2658,8 @@ def _analyze_connectome_impl():
                 weight = min(1 / (distance + 0.1), 5.0)  # Cap at 5.0 to prevent visual dominance
                 if weight >= min_weight:
                     # Get branches for both blobs
-                    source_branch = get_blob_branch(cur, blob_a['hash'], DEFAULT_TENANT)
-                    target_branch = get_blob_branch(cur, blob_b['hash'], DEFAULT_TENANT)
+                    source_branch = get_blob_branch(cur, blob_a['hash'], get_tenant_id())
+                    target_branch = get_blob_branch(cur, blob_b['hash'], get_tenant_id())
 
                     # Skip orphan blobs (not in any commit chain)
                     if source_branch == 'unknown' or target_branch == 'unknown':
@@ -2724,7 +2694,7 @@ def _analyze_connectome_impl():
     proposed_tags = []
     if propagate_tags:
         # Get all unique tags
-        cur.execute('SELECT DISTINCT tag FROM tags WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT DISTINCT tag FROM tags WHERE tenant_id = %s', (get_tenant_id(),))
         all_tags = [row['tag'] for row in cur.fetchall()]
 
         for tag in all_tags[:20]:  # Limit to 20 tags
@@ -2734,7 +2704,7 @@ def _analyze_connectome_impl():
                 FROM blobs b
                 JOIN tags t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
                 WHERE t.tag = %s AND b.embedding IS NOT NULL AND b.tenant_id = %s
-            ''', (tag, DEFAULT_TENANT))
+            ''', (tag, get_tenant_id()))
             tagged_blobs = [{'hash': r['blob_hash'], 'embedding': r['embedding']} for r in cur.fetchall()]
 
             if not tagged_blobs:
@@ -2747,7 +2717,7 @@ def _analyze_connectome_impl():
                 WHERE embedding IS NOT NULL AND tenant_id = %s
                 AND blob_hash NOT IN (SELECT blob_hash FROM tags WHERE tag = %s AND tenant_id = %s)
                 LIMIT 100
-            ''', (DEFAULT_TENANT, tag, DEFAULT_TENANT))
+            ''', (get_tenant_id(), tag, get_tenant_id()))
             untagged_blobs = [{'hash': r['blob_hash'], 'embedding': r['embedding']} for r in cur.fetchall()]
 
             for untagged in untagged_blobs:
@@ -2786,7 +2756,7 @@ def _analyze_connectome_impl():
                      link_type, weight, reasoning, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
-                    DEFAULT_TENANT, link['source'], link['target'],
+                    get_tenant_id(), link['source'], link['target'],
                     link['source_branch'], link['target_branch'],
                     'resonance', link['weight'], link['reasoning'], now
                 ))
@@ -2800,7 +2770,7 @@ def _analyze_connectome_impl():
                 cur.execute('''
                     INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
                     VALUES (%s, %s, %s, %s)
-                ''', (DEFAULT_TENANT, tag_prop['blob_hash'], tag_prop['tag'], now))
+                ''', (get_tenant_id(), tag_prop['blob_hash'], tag_prop['tag'], now))
                 created_tags += 1
             except Exception:
                 continue  # Tag might already exist
@@ -2857,7 +2827,7 @@ def cleanup_links():
         SELECT COUNT(*) as count FROM cross_references
         WHERE (source_branch = 'unknown' OR target_branch = 'unknown')
         AND tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     count = cur.fetchone()['count']
 
     deleted = 0
@@ -2866,7 +2836,7 @@ def cleanup_links():
             DELETE FROM cross_references
             WHERE (source_branch = 'unknown' OR target_branch = 'unknown')
             AND tenant_id = %s
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         deleted = cur.rowcount
         db.commit()
 
@@ -2894,7 +2864,7 @@ def debug_branch_detection():
             SELECT blob_hash FROM blobs
             WHERE embedding IS NOT NULL AND tenant_id = %s
             LIMIT 1
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         row = cur.fetchone()
         blob_hash = row['blob_hash'] if row else None
         cur.close()
@@ -2906,30 +2876,30 @@ def debug_branch_detection():
     debug_info = {'blob_hash': blob_hash}
 
     # Step 1: Check if blob exists
-    cur.execute('SELECT blob_hash FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+    cur.execute('SELECT blob_hash FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
     debug_info['blob_exists'] = cur.fetchone() is not None
 
     # Step 2: Check tree_entries for this blob
-    cur.execute('SELECT tree_hash, name FROM tree_entries WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+    cur.execute('SELECT tree_hash, name FROM tree_entries WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
     tree_entries = cur.fetchall()
     debug_info['tree_entries'] = [{'tree_hash': r['tree_hash'], 'name': r['name']} for r in tree_entries]
 
     # Step 3: For each tree_entry, find the commit
     commits_found = []
     for te in tree_entries:
-        cur.execute('SELECT commit_hash, message FROM commits WHERE tree_hash = %s AND tenant_id = %s', (te['tree_hash'], DEFAULT_TENANT))
+        cur.execute('SELECT commit_hash, message FROM commits WHERE tree_hash = %s AND tenant_id = %s', (te['tree_hash'], get_tenant_id()))
         commits = cur.fetchall()
         for c in commits:
             commits_found.append({'tree_hash': te['tree_hash'], 'commit_hash': c['commit_hash'], 'message': c['message'][:50]})
     debug_info['commits_found'] = commits_found
 
     # Step 4: Check branch heads
-    cur.execute('SELECT name, head_commit FROM branches WHERE tenant_id = %s', (DEFAULT_TENANT,))
+    cur.execute('SELECT name, head_commit FROM branches WHERE tenant_id = %s', (get_tenant_id(),))
     branches = [{'name': r['name'], 'head_commit': r['head_commit']} for r in cur.fetchall()]
     debug_info['branches'] = branches
 
     # Step 5: Run the actual get_blob_branch function
-    debug_info['detected_branch'] = get_blob_branch(cur, blob_hash, DEFAULT_TENANT)
+    debug_info['detected_branch'] = get_blob_branch(cur, blob_hash, get_tenant_id())
 
     cur.close()
     return jsonify(debug_info)
@@ -2952,7 +2922,7 @@ def backfill_embeddings():
         SELECT blob_hash, content FROM blobs 
         WHERE tenant_id = %s AND embedding IS NULL
         LIMIT %s
-    ''', (DEFAULT_TENANT, limit))
+    ''', (get_tenant_id(), limit))
     
     blobs = cur.fetchall()
     processed = 0
@@ -2968,7 +2938,7 @@ def backfill_embeddings():
             try:
                 cur.execute(
                     '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
-                    (embedding, blob_hash, DEFAULT_TENANT)
+                    (embedding, blob_hash, get_tenant_id())
                 )
                 processed += 1
             except Exception as e:
@@ -2984,7 +2954,7 @@ def backfill_embeddings():
     
     # Check how many still need processing
     cur2 = get_cursor()
-    cur2.execute('SELECT COUNT(*) as remaining FROM blobs WHERE tenant_id = %s AND embedding IS NULL', (DEFAULT_TENANT,))
+    cur2.execute('SELECT COUNT(*) as remaining FROM blobs WHERE tenant_id = %s AND embedding IS NULL', (get_tenant_id(),))
     remaining = cur2.fetchone()['remaining']
     cur2.close()
     
@@ -3007,7 +2977,7 @@ def embeddings_status():
             COUNT(embedding) as with_embedding,
             COUNT(*) - COUNT(embedding) as without_embedding
         FROM blobs WHERE tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     row = cur.fetchone()
     cur.close()
     
@@ -3049,7 +3019,7 @@ def sync_session():
                summary = EXCLUDED.summary,
                synced_at = EXCLUDED.synced_at,
                status = EXCLUDED.status''',
-        (session_id, DEFAULT_TENANT, branch, content_str, summary, now, 'synced')
+        (session_id, get_tenant_id(), branch, content_str, summary, now, 'synced')
     )
     db.commit()
     cur.close()
@@ -3071,7 +3041,7 @@ def list_sessions():
     cur = get_cursor()
 
     sql = 'SELECT * FROM sessions WHERE tenant_id = %s'
-    params = [DEFAULT_TENANT]
+    params = [get_tenant_id()]
 
     if branch:
         sql += ' AND branch = %s'
@@ -3124,7 +3094,7 @@ def query_audit():
         if status_min:
             filters['status_min'] = status_min
 
-        rows = query_audit_logs(cur, DEFAULT_TENANT, filters, limit, offset)
+        rows = query_audit_logs(cur, get_tenant_id(), filters, limit, offset)
         logs = []
         for row in rows:
             logs.append({
@@ -3157,7 +3127,7 @@ def audit_stats():
 
     try:
         from audit_service import get_audit_stats
-        stats = get_audit_stats(cur, DEFAULT_TENANT, hours)
+        stats = get_audit_stats(cur, get_tenant_id(), hours)
         cur.close()
 
         if stats:
@@ -3196,22 +3166,22 @@ def admin_pulse():
         tenant_count = cur.fetchone()['count']
 
         # Count commits
-        cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (get_tenant_id(),))
         commit_count = cur.fetchone()['count']
 
         # Count blobs
-        cur.execute('SELECT COUNT(*) as count FROM blobs WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT COUNT(*) as count FROM blobs WHERE tenant_id = %s', (get_tenant_id(),))
         blob_count = cur.fetchone()['count']
 
         # Total storage
-        cur.execute('SELECT COALESCE(SUM(byte_size), 0) as total FROM blobs WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT COALESCE(SUM(byte_size), 0) as total FROM blobs WHERE tenant_id = %s', (get_tenant_id(),))
         total_storage = cur.fetchone()['total']
 
         # API calls in last 24h
         cur.execute('''
             SELECT COUNT(*) as count FROM audit_logs
             WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '24 hours'
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         api_calls_24h = cur.fetchone()['count']
 
         # Request volume by day (last 7 days)
@@ -3221,7 +3191,7 @@ def admin_pulse():
             WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
             GROUP BY DATE(timestamp)
             ORDER BY day
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         request_volume = [{'day': str(row['day']), 'requests': row['requests']} for row in cur.fetchall()]
 
         # Error rate by day (last 7 days)
@@ -3233,7 +3203,7 @@ def admin_pulse():
             WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
             GROUP BY DATE(timestamp)
             ORDER BY day
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         error_rates = []
         for row in cur.fetchall():
             error_rate = round((row['errors'] / max(row['total'], 1)) * 100, 2)
@@ -3248,7 +3218,7 @@ def admin_pulse():
                 AVG(duration_ms) as avg
             FROM audit_logs
             WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '24 hours'
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         perf_row = cur.fetchone()
         response_times = {
             'p50': round(perf_row['p50'] or 0, 1),
@@ -3637,7 +3607,7 @@ def create_task():
             '''INSERT INTO tasks (tenant_id, description, branch, assigned_to, status, priority, deadline, metadata)
                VALUES (%s, %s, %s, %s, 'open', %s, %s, %s)
                RETURNING id, created_at''',
-            (DEFAULT_TENANT, description, branch, assigned_to, priority, deadline, json.dumps(metadata))
+            (get_tenant_id(), description, branch, assigned_to, priority, deadline, json.dumps(metadata))
         )
         row = cur.fetchone()
         task_id = str(row['id'])
@@ -3661,13 +3631,13 @@ def create_task():
             '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
                VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (blob_hash) DO NOTHING''',
-            (blob_hash, DEFAULT_TENANT, content_str, 'task', now, len(content_str))
+            (blob_hash, get_tenant_id(), content_str, 'task', now, len(content_str))
         )
 
         # Link task to blob for unified lookup
         cur.execute(
             '''UPDATE tasks SET blob_hash = %s WHERE id = %s AND tenant_id = %s''',
-            (blob_hash, task_id, DEFAULT_TENANT)
+            (blob_hash, task_id, get_tenant_id())
         )
 
         # Generate embedding for semantic search
@@ -3676,7 +3646,7 @@ def create_task():
             try:
                 cur.execute(
                     '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
-                    (embedding, blob_hash, DEFAULT_TENANT)
+                    (embedding, blob_hash, get_tenant_id())
                 )
             except Exception as e:
                 print(f"[TASK] Failed to store embedding: {e}", file=sys.stderr)
@@ -3687,11 +3657,11 @@ def create_task():
         cur.execute(
             '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
                VALUES (%s, %s, %s, %s, %s)''',
-            (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'task')
+            (get_tenant_id(), tree_hash, message[:100], blob_hash, 'task')
         )
 
         # Get parent commit (case-insensitive branch lookup)
-        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
+        cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, get_tenant_id()))
         branch_row = cur.fetchone()
         if branch_row:
             branch = branch_row['name']  # Use canonical casing
@@ -3701,7 +3671,7 @@ def create_task():
             cur.execute(
                 '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
                    VALUES (%s, %s, %s, %s)''',
-                (DEFAULT_TENANT, branch, 'GENESIS', now)
+                (get_tenant_id(), branch, 'GENESIS', now)
             )
             parent_hash = None
 
@@ -3712,20 +3682,20 @@ def create_task():
         cur.execute(
             '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-            (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'task-system', message, now)
+            (commit_hash, get_tenant_id(), tree_hash, parent_hash, 'task-system', message, now)
         )
 
         # Update branch head
         cur.execute(
             'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
-            (commit_hash, branch, DEFAULT_TENANT)
+            (commit_hash, branch, get_tenant_id())
         )
 
         # Add task_id tag for easy lookup
         cur.execute(
             '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
                VALUES (%s, %s, %s, %s)''',
-            (DEFAULT_TENANT, blob_hash, f"task:{task_id}", now)
+            (get_tenant_id(), blob_hash, f"task:{task_id}", now)
         )
 
         db.commit()
@@ -3760,7 +3730,7 @@ def list_tasks():
     cur = get_cursor()
 
     sql = 'SELECT * FROM tasks WHERE tenant_id = %s'
-    params = [DEFAULT_TENANT]
+    params = [get_tenant_id()]
 
     if status:
         sql += ' AND status = %s'
@@ -3828,7 +3798,7 @@ def update_task(task_id):
                 set_clauses.append(f'{field} = %s')
                 params.append(value)
 
-        params.extend([task_id, DEFAULT_TENANT])
+        params.extend([task_id, get_tenant_id()])
 
         sql = f'''UPDATE tasks SET {', '.join(set_clauses)}
                   WHERE id = %s AND tenant_id = %s
@@ -3846,7 +3816,7 @@ def update_task(task_id):
             try:
                 cur.execute(
                     'DELETE FROM session_checkpoints WHERE task_id = %s AND tenant_id = %s',
-                    (task_id, DEFAULT_TENANT)
+                    (task_id, get_tenant_id())
                 )
             except Exception as e:
                 # Table may not exist yet - non-fatal
@@ -3884,7 +3854,7 @@ def delete_task(task_id):
             '''UPDATE tasks SET status = 'deleted'
                WHERE id = %s AND tenant_id = %s
                RETURNING id, description, status''',
-            (task_id, DEFAULT_TENANT)
+            (task_id, get_tenant_id())
         )
         row = cur.fetchone()
 
@@ -3952,7 +3922,7 @@ def claim_task(task_id):
         ''')
         row = cur.fetchone()
         if row and row.get('exists', False):
-            cur.execute('SELECT halted, reason FROM halt_state WHERE tenant_id = %s', (DEFAULT_TENANT,))
+            cur.execute('SELECT halted, reason FROM halt_state WHERE tenant_id = %s', (get_tenant_id(),))
             halt_row = cur.fetchone()
             if halt_row and halt_row['halted']:
                 cur.close()
@@ -3964,7 +3934,7 @@ def claim_task(task_id):
         # Check if task exists and is claimable
         cur.execute(
             'SELECT * FROM tasks WHERE id = %s AND tenant_id = %s',
-            (task_id, DEFAULT_TENANT)
+            (task_id, get_tenant_id())
         )
         task = cur.fetchone()
 
@@ -3980,7 +3950,7 @@ def claim_task(task_id):
         cur.execute(
             '''SELECT * FROM task_claims
                WHERE task_id = %s AND tenant_id = %s AND released_at IS NULL''',
-            (task_id, DEFAULT_TENANT)
+            (task_id, get_tenant_id())
         )
         existing_claim = cur.fetchone()
 
@@ -3997,7 +3967,7 @@ def claim_task(task_id):
             '''INSERT INTO task_claims (tenant_id, task_id, instance_id)
                VALUES (%s, %s, %s)
                RETURNING id, claimed_at''',
-            (DEFAULT_TENANT, task_id, instance_id)
+            (get_tenant_id(), task_id, instance_id)
         )
         claim_row = cur.fetchone()
 
@@ -4005,7 +3975,7 @@ def claim_task(task_id):
         cur.execute(
             '''UPDATE tasks SET status = 'claimed', assigned_to = %s
                WHERE id = %s AND tenant_id = %s''',
-            (instance_id, task_id, DEFAULT_TENANT)
+            (instance_id, task_id, get_tenant_id())
         )
 
         db.commit()
@@ -4050,7 +4020,7 @@ def release_task(task_id):
         cur.execute(
             '''SELECT * FROM task_claims
                WHERE task_id = %s AND instance_id = %s AND tenant_id = %s AND released_at IS NULL''',
-            (task_id, instance_id, DEFAULT_TENANT)
+            (task_id, instance_id, get_tenant_id())
         )
         claim = cur.fetchone()
 
@@ -4071,7 +4041,7 @@ def release_task(task_id):
         cur.execute(
             '''UPDATE tasks SET status = %s
                WHERE id = %s AND tenant_id = %s''',
-            (new_status, task_id, DEFAULT_TENANT)
+            (new_status, task_id, get_tenant_id())
         )
 
         db.commit()
@@ -4113,7 +4083,7 @@ def get_stale_tasks():
         WHERE tenant_id = %s AND status = 'open'
         AND created_at < NOW() - INTERVAL '%s hours'
         ORDER BY priority ASC, created_at ASC
-    """, (DEFAULT_TENANT, open_hours))
+    """, (get_tenant_id(), open_hours))
     
     stale_open = []
     for row in cur.fetchall():
@@ -4135,7 +4105,7 @@ def get_stale_tasks():
         AND tc.released_at IS NULL
         AND tc.claimed_at < NOW() - INTERVAL '%s hours'
         ORDER BY tc.claimed_at ASC
-    """, (DEFAULT_TENANT, claimed_hours))
+    """, (get_tenant_id(), claimed_hours))
     
     stale_claimed = []
     for row in cur.fetchall():
@@ -4191,21 +4161,21 @@ def halt_tasks():
             VALUES (%s, TRUE, %s, %s)
             ON CONFLICT (tenant_id) DO UPDATE
             SET halted = TRUE, halted_at = EXCLUDED.halted_at, reason = EXCLUDED.reason
-        ''', (DEFAULT_TENANT, now, reason))
+        ''', (get_tenant_id(), now, reason))
 
         # Set all claimed tasks to blocked
         cur.execute('''
             UPDATE tasks SET status = 'blocked'
             WHERE tenant_id = %s AND status = 'claimed'
             RETURNING id
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         affected_tasks = [str(row['id']) for row in cur.fetchall()]
 
         # Release all active claims with EMERGENCY_HALT reason
         cur.execute('''
             UPDATE task_claims SET released_at = %s, release_reason = 'EMERGENCY_HALT'
             WHERE tenant_id = %s AND released_at IS NULL
-        ''', (now, DEFAULT_TENANT))
+        ''', (now, get_tenant_id()))
 
         db.commit()
         cur.close()
@@ -4248,7 +4218,7 @@ def resume_tasks():
             UPDATE halt_state SET halted = FALSE
             WHERE tenant_id = %s
             RETURNING halted_at, reason
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         row = cur.fetchone()
 
         db.commit()
@@ -4290,7 +4260,7 @@ def halt_status():
         cur.execute('''
             SELECT halted, halted_at, reason FROM halt_state
             WHERE tenant_id = %s
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         row = cur.fetchone()
         cur.close()
 
@@ -4339,7 +4309,7 @@ def backfill_tasks_to_memory():
             FROM tasks
             WHERE tenant_id = %s
             ORDER BY created_at ASC
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         
         tasks = cur.fetchall()
         
@@ -4351,7 +4321,7 @@ def backfill_tasks_to_memory():
                 SELECT 1 FROM tags 
                 WHERE tenant_id = %s AND tag = %s
                 LIMIT 1
-            ''', (DEFAULT_TENANT, f"task:{task_id}"))
+            ''', (get_tenant_id(), f"task:{task_id}"))
             
             if cur.fetchone():
                 skipped += 1
@@ -4392,14 +4362,14 @@ def backfill_tasks_to_memory():
                     INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (blob_hash) DO NOTHING
-                ''', (blob_hash, DEFAULT_TENANT, content_str, 'task', created_at, len(content_str)))
+                ''', (blob_hash, get_tenant_id(), content_str, 'task', created_at, len(content_str)))
                 
                 # Generate and store embedding
                 embedding = generate_embedding(content_str)
                 if embedding:
                     cur.execute('''
                         UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s
-                    ''', (embedding, blob_hash, DEFAULT_TENANT))
+                    ''', (embedding, blob_hash, get_tenant_id()))
                 
                 # Create tree entry
                 tree_hash = compute_hash(f"{branch}:{blob_hash}:{created_at}")
@@ -4408,10 +4378,10 @@ def backfill_tasks_to_memory():
                 cur.execute('''
                     INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
                     VALUES (%s, %s, %s, %s, %s)
-                ''', (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'task'))
+                ''', (get_tenant_id(), tree_hash, message[:100], blob_hash, 'task'))
                 
                 # Get branch head (case-insensitive)
-                cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, DEFAULT_TENANT))
+                cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s', (branch, get_tenant_id()))
                 branch_row = cur.fetchone()
                 
                 if branch_row:
@@ -4421,7 +4391,7 @@ def backfill_tasks_to_memory():
                     cur.execute('''
                         INSERT INTO branches (tenant_id, name, head_commit, created_at)
                         VALUES (%s, %s, %s, %s)
-                    ''', (DEFAULT_TENANT, branch, 'GENESIS', created_at))
+                    ''', (get_tenant_id(), branch, 'GENESIS', created_at))
                     parent_hash = None
                 
                 # Create commit
@@ -4431,23 +4401,23 @@ def backfill_tasks_to_memory():
                 cur.execute('''
                     INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ''', (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'backfill', message, created_at))
+                ''', (commit_hash, get_tenant_id(), tree_hash, parent_hash, 'backfill', message, created_at))
                 
                 # Update branch head
                 cur.execute('''
                     UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s
-                ''', (commit_hash, branch, DEFAULT_TENANT))
+                ''', (commit_hash, branch, get_tenant_id()))
                 
                 # Add tag
                 cur.execute('''
                     INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
                     VALUES (%s, %s, %s, %s)
-                ''', (DEFAULT_TENANT, blob_hash, f"task:{task_id}", created_at))
+                ''', (get_tenant_id(), blob_hash, f"task:{task_id}", created_at))
                 
                 # Link task to blob (Task Unification)
                 cur.execute('''
                     UPDATE tasks SET blob_hash = %s WHERE id = %s AND tenant_id = %s
-                ''', (blob_hash, task_id, DEFAULT_TENANT))
+                ''', (blob_hash, task_id, get_tenant_id()))
                 
                 backfilled += 1
                 db.commit()  # Commit each successful task
@@ -4489,14 +4459,14 @@ def link_tasks_to_blobs():
     
     try:
         # Get all tasks
-        cur.execute('SELECT id FROM tasks WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT id FROM tasks WHERE tenant_id = %s', (get_tenant_id(),))
         tasks = cur.fetchall()
         
         for task in tasks:
             task_id = str(task['id'])
             
             # Check if already linked
-            cur.execute('SELECT blob_hash FROM tasks WHERE id = %s AND tenant_id = %s', (task_id, DEFAULT_TENANT))
+            cur.execute('SELECT blob_hash FROM tasks WHERE id = %s AND tenant_id = %s', (task_id, get_tenant_id()))
             task_row = cur.fetchone()
             if task_row and task_row['blob_hash']:
                 already_linked += 1
@@ -4507,7 +4477,7 @@ def link_tasks_to_blobs():
                 SELECT blob_hash FROM tags 
                 WHERE tenant_id = %s AND tag = %s
                 LIMIT 1
-            ''', (DEFAULT_TENANT, f"task:{task_id}"))
+            ''', (get_tenant_id(), f"task:{task_id}"))
             
             tag_row = cur.fetchone()
             if not tag_row:
@@ -4520,7 +4490,7 @@ def link_tasks_to_blobs():
             try:
                 cur.execute('''
                     UPDATE tasks SET blob_hash = %s WHERE id = %s AND tenant_id = %s
-                ''', (blob_hash, task_id, DEFAULT_TENANT))
+                ''', (blob_hash, task_id, get_tenant_id()))
                 linked += 1
             except Exception as e:
                 errors.append({'task_id': task_id, 'error': str(e)})
@@ -4568,7 +4538,7 @@ def create_checkpoint():
 
     try:
         # Verify task exists
-        cur.execute('SELECT id FROM tasks WHERE id = %s AND tenant_id = %s', (task_id, DEFAULT_TENANT))
+        cur.execute('SELECT id FROM tasks WHERE id = %s AND tenant_id = %s', (task_id, get_tenant_id()))
         if not cur.fetchone():
             cur.close()
             return jsonify({'error': f'Task {task_id} not found'}), 404
@@ -4584,7 +4554,7 @@ def create_checkpoint():
                 context_snapshot = EXCLUDED.context_snapshot,
                 expires_at = EXCLUDED.expires_at
             RETURNING checkpoint_at
-        ''', (task_id, DEFAULT_TENANT, instance_id, progress, next_step, json.dumps(context_snapshot), expires_at))
+        ''', (task_id, get_tenant_id(), instance_id, progress, next_step, json.dumps(context_snapshot), expires_at))
 
         row = cur.fetchone()
         checkpoint_at = str(row['checkpoint_at'])
@@ -4626,7 +4596,7 @@ def get_checkpoint():
             FROM session_checkpoints sc
             JOIN tasks t ON sc.task_id = t.id
             WHERE sc.task_id = %s AND sc.tenant_id = %s
-        ''', (task_id, DEFAULT_TENANT))
+        ''', (task_id, get_tenant_id()))
 
         row = cur.fetchone()
         cur.close()
@@ -4673,7 +4643,7 @@ def delete_checkpoint():
             DELETE FROM session_checkpoints
             WHERE task_id = %s AND tenant_id = %s
             RETURNING task_id
-        ''', (task_id, DEFAULT_TENANT))
+        ''', (task_id, get_tenant_id()))
 
         deleted = cur.fetchone()
         db.commit()
@@ -4710,7 +4680,7 @@ def list_orphaned_checkpoints():
             AND sc.checkpoint_at < NOW() - INTERVAL '%s hours'
             AND t.status != 'done'
             ORDER BY sc.checkpoint_at ASC
-        ''', (DEFAULT_TENANT, hours))
+        ''', (get_tenant_id(), hours))
 
         orphaned = []
         for row in cur.fetchall():
@@ -4805,7 +4775,7 @@ def record_trail():
                 last_traversed = NOW(),
                 strength = LEAST(trails.strength * 1.1, 10.0)
             RETURNING id, traversal_count, strength
-        ''', (DEFAULT_TENANT, source_blob, target_blob))
+        ''', (get_tenant_id(), source_blob, target_blob))
 
         row = cur.fetchone()
         db.commit()
@@ -4842,7 +4812,7 @@ def get_hot_trails():
             WHERE tenant_id = %s
             ORDER BY strength DESC
             LIMIT %s
-        ''', (DEFAULT_TENANT, limit))
+        ''', (get_tenant_id(), limit))
 
         trails = []
         for row in cur.fetchall():
@@ -4880,7 +4850,7 @@ def get_trails_from(source_blob):
             WHERE tenant_id = %s AND source_blob = %s
             ORDER BY strength DESC
             LIMIT %s
-        ''', (DEFAULT_TENANT, source_blob, limit))
+        ''', (get_tenant_id(), source_blob, limit))
 
         trails = []
         for row in cur.fetchall():
@@ -4916,7 +4886,7 @@ def get_trails_to(target_blob):
             WHERE tenant_id = %s AND target_blob = %s
             ORDER BY strength DESC
             LIMIT %s
-        ''', (DEFAULT_TENANT, target_blob, limit))
+        ''', (get_tenant_id(), target_blob, limit))
 
         trails = []
         for row in cur.fetchall():
@@ -4983,7 +4953,7 @@ def decay_trails():
             UPDATE trails
             SET strength = strength * POWER(%s, EXTRACT(EPOCH FROM (NOW() - last_traversed)) / 86400)
             WHERE tenant_id = %s AND state != 'archived'
-        ''', (decay_rate, DEFAULT_TENANT))
+        ''', (decay_rate, get_tenant_id()))
         decayed_count = cur.rowcount
 
         # Update states based on new strength values
@@ -4991,28 +4961,28 @@ def decay_trails():
         cur.execute('''
             UPDATE trails SET state = 'active'
             WHERE tenant_id = %s AND strength >= 1.0 AND state != 'active'
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         became_active = cur.rowcount
 
         # FADING: 0.3 <= strength < 1.0
         cur.execute('''
             UPDATE trails SET state = 'fading'
             WHERE tenant_id = %s AND strength >= 0.3 AND strength < 1.0 AND state != 'fading'
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         became_fading = cur.rowcount
 
         # DORMANT: 0.1 <= strength < 0.3
         cur.execute('''
             UPDATE trails SET state = 'dormant'
             WHERE tenant_id = %s AND strength >= 0.1 AND strength < 0.3 AND state != 'dormant'
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         became_dormant = cur.rowcount
 
         # ARCHIVED: strength < 0.1 (preserve, don't delete)
         cur.execute('''
             UPDATE trails SET state = 'archived', archived_at = NOW()
             WHERE tenant_id = %s AND strength < 0.1 AND state != 'archived'
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         became_archived = cur.rowcount
 
         # Get current state distribution
@@ -5020,7 +4990,7 @@ def decay_trails():
             SELECT state, COUNT(*) as count, AVG(strength) as avg_strength
             FROM trails WHERE tenant_id = %s
             GROUP BY state
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         state_stats = {row['state']: {'count': row['count'], 'avg_strength': float(row['avg_strength'] or 0)}
                       for row in cur.fetchall()}
 
@@ -5063,7 +5033,7 @@ def trail_health():
                    AVG(traversal_count) as avg_traversals
             FROM trails WHERE tenant_id = %s
             GROUP BY state
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         states = {}
         total_trails = 0
         for row in cur.fetchall():
@@ -5083,7 +5053,7 @@ def trail_health():
                 COUNT(*) FILTER (WHERE last_traversed > NOW() - INTERVAL '7 days') as last_7d,
                 COUNT(*) FILTER (WHERE last_traversed > NOW() - INTERVAL '30 days') as last_30d
             FROM trails WHERE tenant_id = %s
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         activity = cur.fetchone()
 
         # Top 5 strongest trails
@@ -5092,7 +5062,7 @@ def trail_health():
                    last_traversed
             FROM trails WHERE tenant_id = %s
             ORDER BY strength DESC LIMIT 5
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         hottest = [{
             'source': row['source_blob'][:12] + '...',
             'target': row['target_blob'][:12] + '...',
@@ -5150,7 +5120,7 @@ def buried_memories():
             WHERE t.tenant_id = %s AND t.state IN ({placeholders})
             ORDER BY t.strength ASC
             LIMIT %s
-        ''', (DEFAULT_TENANT, *states, limit))
+        ''', (get_tenant_id(), *states, limit))
 
         buried = []
         for row in cur.fetchall():
@@ -5197,7 +5167,7 @@ def decay_forecast():
             WHERE tenant_id = %s AND state IN ('active', 'fading')
             ORDER BY strength DESC
             LIMIT 20
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
 
         forecasts = []
         for row in cur.fetchall():
@@ -5270,7 +5240,7 @@ def resurrect_trail():
                     archived_at = NULL
                 WHERE id = %s AND tenant_id = %s
                 RETURNING id, source_blob, target_blob, strength, state, traversal_count
-            ''', (trail_id, DEFAULT_TENANT))
+            ''', (trail_id, get_tenant_id()))
         else:
             cur.execute('''
                 UPDATE trails
@@ -5281,7 +5251,7 @@ def resurrect_trail():
                     archived_at = NULL
                 WHERE source_blob = %s AND target_blob = %s AND tenant_id = %s
                 RETURNING id, source_blob, target_blob, strength, state, traversal_count
-            ''', (source_blob, target_blob, DEFAULT_TENANT))
+            ''', (source_blob, target_blob, get_tenant_id()))
 
         row = cur.fetchone()
         db.commit()
@@ -5384,7 +5354,7 @@ def log_immune_action(action: str, blob_hash: str = None, patrol_type: str = Non
     cur.execute('''
         INSERT INTO immune_log (tenant_id, action, blob_hash, patrol_type, details)
         VALUES (%s, %s, %s, %s, %s)
-    ''', (DEFAULT_TENANT, action, blob_hash, patrol_type, json.dumps(details) if details else None))
+    ''', (get_tenant_id(), action, blob_hash, patrol_type, json.dumps(details) if details else None))
     get_db().commit()
     cur.close()
 
@@ -5395,7 +5365,7 @@ def quarantine_blob(blob_hash: str, reason: str, patrol_type: str = None):
     cur.execute('''
         UPDATE blobs SET quarantined = TRUE, quarantined_at = NOW(), quarantine_reason = %s
         WHERE blob_hash = %s AND tenant_id = %s
-    ''', (reason, blob_hash, DEFAULT_TENANT))
+    ''', (reason, blob_hash, get_tenant_id()))
     get_db().commit()
     cur.close()
 
@@ -5408,7 +5378,7 @@ def get_quarantine_count() -> int:
     cur.execute('''
         SELECT COUNT(*) as cnt FROM blobs
         WHERE quarantined = TRUE AND tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     row = cur.fetchone()
     cur.close()
     return row['cnt'] if row else 0
@@ -5425,7 +5395,7 @@ def patrol_centroid_drift(threshold: float = 0.5) -> list:
     cur.execute('''
         SELECT branch_name, centroid FROM branch_fingerprints
         WHERE tenant_id = %s AND centroid IS NOT NULL
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     fingerprints = {row['branch_name']: row['centroid'] for row in cur.fetchall()}
 
     if not fingerprints:
@@ -5443,7 +5413,7 @@ def patrol_centroid_drift(threshold: float = 0.5) -> list:
             WHERE br.name = %s AND b.embedding IS NOT NULL
               AND b.tenant_id = %s AND COALESCE(b.quarantined, FALSE) = FALSE
               AND b.embedding <=> %s::vector > %s
-        ''', (centroid, branch_name, DEFAULT_TENANT, centroid, threshold))
+        ''', (centroid, branch_name, get_tenant_id(), centroid, threshold))
 
         for row in cur.fetchall():
             findings.append({
@@ -5467,7 +5437,7 @@ def patrol_orphan_blobs() -> list:
         FROM blobs b
         LEFT JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
         WHERE t.id IS NULL AND b.tenant_id = %s AND COALESCE(b.quarantined, FALSE) = FALSE
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
 
     for row in cur.fetchall():
         findings.append({
@@ -5491,7 +5461,7 @@ def patrol_broken_links() -> list:
         FROM cross_references cr
         LEFT JOIN blobs b ON cr.source_blob = b.blob_hash AND cr.tenant_id = b.tenant_id
         WHERE b.blob_hash IS NULL AND cr.tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
 
     for row in cur.fetchall():
         findings.append({
@@ -5507,7 +5477,7 @@ def patrol_broken_links() -> list:
         FROM cross_references cr
         LEFT JOIN blobs b ON cr.target_blob = b.blob_hash AND cr.tenant_id = b.tenant_id
         WHERE b.blob_hash IS NULL AND cr.tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
 
     for row in cur.fetchall():
         findings.append({
@@ -5539,7 +5509,7 @@ def patrol_isolated_clusters() -> list:
           AND COALESCE(b.quarantined, FALSE) = FALSE
           AND tr_out.id IS NULL AND tr_in.id IS NULL
           AND cr_out.id IS NULL AND cr_in.id IS NULL
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
 
     for row in cur.fetchall():
         findings.append({
@@ -5569,7 +5539,7 @@ def patrol_duplicate_embeddings(threshold: float = 0.02) -> list:
           AND COALESCE(b2.quarantined, FALSE) = FALSE
           AND b1.embedding <=> b2.embedding < %s
         LIMIT 50
-    ''', (DEFAULT_TENANT, threshold))
+    ''', (get_tenant_id(), threshold))
 
     seen = set()
     for row in cur.fetchall():
@@ -5599,7 +5569,7 @@ def patrol_stale_checkpoints(days: int = 30) -> list:
             WHERE s.tenant_id = %s
               AND s.synced_at < NOW() - INTERVAL '%s days'
               AND s.status != 'archived'
-        ''', (DEFAULT_TENANT, days))
+        ''', (get_tenant_id(), days))
 
         for row in cur.fetchall():
             findings.append({
@@ -5697,7 +5667,7 @@ def immune_patrol():
         cur.execute('''
             UPDATE branch_fingerprints SET last_patrol = NOW()
             WHERE tenant_id = %s
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
         get_db().commit()
         cur.close()
     except Exception:
@@ -5735,7 +5705,7 @@ def list_quarantine():
         WHERE b.quarantined = TRUE AND b.tenant_id = %s
         ORDER BY b.quarantined_at DESC
         LIMIT %s
-    ''', (DEFAULT_TENANT, limit))
+    ''', (get_tenant_id(), limit))
 
     quarantined = []
     for row in cur.fetchall():
@@ -5779,7 +5749,7 @@ def resolve_quarantine(blob_hash):
     cur.execute('''
         SELECT blob_hash, quarantine_reason FROM blobs
         WHERE blob_hash = %s AND tenant_id = %s AND quarantined = TRUE
-    ''', (blob_hash, DEFAULT_TENANT))
+    ''', (blob_hash, get_tenant_id()))
 
     row = cur.fetchone()
     if not row:
@@ -5794,7 +5764,7 @@ def resolve_quarantine(blob_hash):
             cur.execute('''
                 UPDATE blobs SET quarantined = FALSE, quarantined_at = NULL, quarantine_reason = NULL
                 WHERE blob_hash = %s AND tenant_id = %s
-            ''', (blob_hash, DEFAULT_TENANT))
+            ''', (blob_hash, get_tenant_id()))
             db.commit()
 
             log_immune_action('REINSTATE', blob_hash, details={
@@ -5811,10 +5781,10 @@ def resolve_quarantine(blob_hash):
 
         else:  # delete
             # Delete blob and associated data
-            cur.execute('DELETE FROM tree_entries WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+            cur.execute('DELETE FROM tree_entries WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
             cur.execute('DELETE FROM cross_references WHERE (source_blob = %s OR target_blob = %s) AND tenant_id = %s',
-                       (blob_hash, blob_hash, DEFAULT_TENANT))
-            cur.execute('DELETE FROM tags WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+                       (blob_hash, blob_hash, get_tenant_id()))
+            cur.execute('DELETE FROM tags WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
 
             # Delete from trails if table exists
             try:
@@ -5822,7 +5792,7 @@ def resolve_quarantine(blob_hash):
             except Exception:
                 pass
 
-            cur.execute('DELETE FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, DEFAULT_TENANT))
+            cur.execute('DELETE FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
             db.commit()
 
             log_immune_action('DELETE', blob_hash, details={
@@ -5854,7 +5824,7 @@ def immune_status():
     cur.execute('''
         SELECT COUNT(*) as cnt FROM blobs
         WHERE quarantined = TRUE AND tenant_id = %s
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     quarantine_count = cur.fetchone()['cnt']
 
     # Get last patrol info
@@ -5864,7 +5834,7 @@ def immune_status():
         SELECT details, created_at FROM immune_log
         WHERE action = 'PATROL_END' AND tenant_id = %s
         ORDER BY created_at DESC LIMIT 1
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     row = cur.fetchone()
     if row:
         last_patrol = row['created_at'].isoformat() if row['created_at'] else None
@@ -5879,7 +5849,7 @@ def immune_status():
                    EXTRACT(EPOCH FROM (NOW() - last_updated)) / 86400 as centroid_age_days
             FROM branch_fingerprints
             WHERE tenant_id = %s AND centroid IS NOT NULL
-        ''', (DEFAULT_TENANT,))
+        ''', (get_tenant_id(),))
 
         for row in cur.fetchall():
             branch_health.append({
@@ -5915,13 +5885,13 @@ def immune_log():
             SELECT * FROM immune_log
             WHERE tenant_id = %s AND action = %s
             ORDER BY created_at DESC LIMIT %s
-        ''', (DEFAULT_TENANT, action_filter, limit))
+        ''', (get_tenant_id(), action_filter, limit))
     else:
         cur.execute('''
             SELECT * FROM immune_log
             WHERE tenant_id = %s
             ORDER BY created_at DESC LIMIT %s
-        ''', (DEFAULT_TENANT, limit))
+        ''', (get_tenant_id(), limit))
 
     entries = []
     for row in cur.fetchall():
@@ -5960,7 +5930,7 @@ def ensure_fingerprints_table():
 def compute_branch_centroid(branch_name: str, tenant_id: str = None) -> tuple:
     """Compute the centroid (average embedding) for a branch.
     Returns (centroid_vector, commit_count) or (None, 0) if no embeddings."""
-    tenant_id = tenant_id or DEFAULT_TENANT
+    tenant_id = tenant_id or get_tenant_id()
     cur = get_cursor()
     
     # Get all embeddings for commits on this branch via walking from head
@@ -6020,7 +5990,7 @@ def bootstrap_fingerprints():
     
     try:
         # Get all branches
-        cur.execute('SELECT name FROM branches WHERE tenant_id = %s', (DEFAULT_TENANT,))
+        cur.execute('SELECT name FROM branches WHERE tenant_id = %s', (get_tenant_id(),))
         branches = [row['name'] for row in cur.fetchall()]
         
         results = []
@@ -6035,7 +6005,7 @@ def bootstrap_fingerprints():
                         centroid = EXCLUDED.centroid,
                         commit_count = EXCLUDED.commit_count,
                         last_updated = NOW()
-                ''', (DEFAULT_TENANT, branch_name, centroid, count))
+                ''', (get_tenant_id(), branch_name, centroid, count))
                 results.append({'branch': branch_name, 'commits_with_embeddings': count, 'status': 'computed'})
             else:
                 results.append({'branch': branch_name, 'commits_with_embeddings': 0, 'status': 'skipped_no_embeddings'})
@@ -6066,7 +6036,7 @@ def get_fingerprints():
         FROM branch_fingerprints
         WHERE tenant_id = %s
         ORDER BY commit_count DESC
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     
     fingerprints = []
     for row in cur.fetchall():
@@ -6111,7 +6081,7 @@ def validate_commit_routing():
         SELECT branch_name, centroid, commit_count
         FROM branch_fingerprints
         WHERE tenant_id = %s AND centroid IS NOT NULL
-    ''', (DEFAULT_TENANT,))
+    ''', (get_tenant_id(),))
     
     scores = []
     for row in cur.fetchall():
@@ -6185,7 +6155,7 @@ def spawn_agent():
             '''INSERT INTO tasks (tenant_id, description, branch, assigned_to, status, priority, metadata)
                VALUES (%s, %s, %s, %s, 'open', 1, %s)
                RETURNING id, created_at''',
-            (DEFAULT_TENANT, task_prompt, branch, agent_id, json.dumps(metadata))
+            (get_tenant_id(), task_prompt, branch, agent_id, json.dumps(metadata))
         )
         row = cur.fetchone()
         task_id = str(row['id'])
@@ -6208,7 +6178,7 @@ def spawn_agent():
             '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size)
                VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (blob_hash) DO NOTHING''',
-            (blob_hash, DEFAULT_TENANT, content_str, 'agent_spawn', now, len(content_str))
+            (blob_hash, get_tenant_id(), content_str, 'agent_spawn', now, len(content_str))
         )
 
         db.commit()
@@ -6258,7 +6228,7 @@ def ensure_hippocampal_tables():
             SET expires_at = NULL
             WHERE tenant_id = %s AND status IN ('active', 'cooling')
               AND expires_at IS NOT NULL
-        """, (DEFAULT_TENANT,))
+        """, (get_tenant_id(),))
         if cur.rowcount > 0:
             print(f"[TTL-KILL] Set expires_at = NULL for {cur.rowcount} candidates", file=sys.stderr)
         db.commit()
@@ -6322,7 +6292,7 @@ def create_bookmark():
                  embedding, context_embedding, status, source_instance, session_context, expires_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, NULL)
         """, (
-            candidate_id, DEFAULT_TENANT, branch, summary,
+            candidate_id, get_tenant_id(), branch, summary,
             json.dumps(content, default=str) if content else None,
             message, tags, salience, salience_type,
             embedding, context_embedding,
@@ -6375,7 +6345,7 @@ def record_replay():
                 SELECT id, replay_count, expires_at, status
                 FROM candidate_memories
                 WHERE id = %s AND tenant_id = %s AND status IN ('active', 'cooling')
-            """, (candidate_id, DEFAULT_TENANT))
+            """, (candidate_id, get_tenant_id()))
         else:
             # Semantic search against candidate embeddings
             query_embedding = generate_embedding(keywords)
@@ -6387,7 +6357,7 @@ def record_replay():
                 FROM candidate_memories
                 WHERE tenant_id = %s AND status IN ('active', 'cooling') AND embedding IS NOT NULL
                 ORDER BY distance LIMIT 1
-            """, (query_embedding, DEFAULT_TENANT))
+            """, (query_embedding, get_tenant_id()))
 
         row = cur.fetchone()
         if not row:
@@ -6417,7 +6387,7 @@ def record_replay():
             INSERT INTO replay_events (id, tenant_id, candidate_id, session_id, replay_context,
                                        similarity_score, fired, threshold_used, context_type)
             VALUES (%s, %s, %s, %s, %s, NULL, true, NULL, 'manual')
-        """, (str(uuid.uuid4()), DEFAULT_TENANT, cid, session_id, replay_context))
+        """, (str(uuid.uuid4()), get_tenant_id(), cid, session_id, replay_context))
 
         db.commit()
         cur.close()
@@ -6456,7 +6426,7 @@ def list_candidates():
         FROM candidate_memories
         WHERE tenant_id = %s
     """
-    params = [DEFAULT_TENANT]
+    params = [get_tenant_id()]
 
     if branch:
         sql += " AND branch = %s"
@@ -6508,7 +6478,7 @@ def get_decay_status():
           AND expires_at < NOW() + INTERVAL '%s days'
           AND expires_at > NOW()
         ORDER BY expires_at ASC
-    """, (DEFAULT_TENANT, days))
+    """, (get_tenant_id(), days))
 
     expiring = []
     for row in cur.fetchall():
@@ -6542,7 +6512,7 @@ def _compute_connectivity(embedding, branch_name, cur):
         WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
           AND b.embedding <=> %s::vector < 0.4
         ORDER BY distance LIMIT 20
-    """, (embedding, DEFAULT_TENANT, embedding))
+    """, (embedding, get_tenant_id(), embedding))
 
     # Need to determine branch per neighbor via commit chain
     # Simplified: use the commit's branch
@@ -6557,7 +6527,7 @@ def _compute_connectivity(embedding, branch_name, cur):
             JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
             WHERE te.blob_hash = %s AND te.tenant_id = %s
             LIMIT 1
-        """, (row['blob_hash'], DEFAULT_TENANT))
+        """, (row['blob_hash'], get_tenant_id()))
         branch_row = cur2.fetchone()
         cur2.close()
 
@@ -6593,7 +6563,7 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
         '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size, embedding)
            VALUES (%s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (blob_hash) DO NOTHING''',
-        (blob_hash, DEFAULT_TENANT, content, 'memory', now, len(content),
+        (blob_hash, get_tenant_id(), content, 'memory', now, len(content),
          candidate_row['embedding'])
     )
 
@@ -6602,12 +6572,12 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
     cur.execute(
         '''INSERT INTO tree_entries (tenant_id, tree_hash, name, blob_hash, mode)
            VALUES (%s, %s, %s, %s, %s)''',
-        (DEFAULT_TENANT, tree_hash, message[:100], blob_hash, 'memory')
+        (get_tenant_id(), tree_hash, message[:100], blob_hash, 'memory')
     )
 
     # Get parent commit
     cur.execute('SELECT head_commit, name FROM branches WHERE LOWER(name) = LOWER(%s) AND tenant_id = %s',
-                (branch, DEFAULT_TENANT))
+                (branch, get_tenant_id()))
     branch_row = cur.fetchone()
     if branch_row:
         branch = branch_row['name']
@@ -6616,7 +6586,7 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
         cur.execute(
             '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
                VALUES (%s, %s, %s, %s)''',
-            (DEFAULT_TENANT, branch, 'GENESIS', now)
+            (get_tenant_id(), branch, 'GENESIS', now)
         )
         parent_hash = None
 
@@ -6626,13 +6596,13 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
     cur.execute(
         '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
            VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-        (commit_hash, DEFAULT_TENANT, tree_hash, parent_hash, 'consolidation', message, now)
+        (commit_hash, get_tenant_id(), tree_hash, parent_hash, 'consolidation', message, now)
     )
 
     # Update branch HEAD
     cur.execute(
         'UPDATE branches SET head_commit = %s WHERE name = %s AND tenant_id = %s',
-        (commit_hash, branch, DEFAULT_TENANT)
+        (commit_hash, branch, get_tenant_id())
     )
 
     # Insert tags
@@ -6642,7 +6612,7 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
             cur.execute(
                 '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
                    VALUES (%s, %s, %s, %s)''',
-                (DEFAULT_TENANT, blob_hash, tag_str, now)
+                (get_tenant_id(), blob_hash, tag_str, now)
             )
         except Exception:
             pass
@@ -6681,7 +6651,7 @@ def run_consolidation():
             SET status = 'cooling'
             WHERE tenant_id = %s AND status = 'active'
               AND created_at < NOW() - INTERVAL '3 days'
-        """, (DEFAULT_TENANT,))
+        """, (get_tenant_id(),))
         cooled = cur.rowcount
 
         # Step 2: Expire dead candidates (past TTL — only if expires_at is set)
@@ -6690,12 +6660,12 @@ def run_consolidation():
             SET status = 'expired'
             WHERE tenant_id = %s AND status IN ('active', 'cooling')
               AND expires_at IS NOT NULL AND expires_at < NOW()
-        """, (DEFAULT_TENANT,))
+        """, (get_tenant_id(),))
         expired = cur.rowcount
 
         # Step 3: Load all active/cooling candidates
         filter_sql = ""
-        filter_params = [DEFAULT_TENANT]
+        filter_params = [get_tenant_id()]
         if filter_branch:
             filter_sql = " AND branch = %s"
             filter_params.append(filter_branch)
@@ -6745,7 +6715,7 @@ def run_consolidation():
                 DELETE FROM candidate_memories
                 WHERE tenant_id = %s AND status = 'expired'
                   AND expires_at < NOW() - INTERVAL '30 days'
-            """, (DEFAULT_TENANT,))
+            """, (get_tenant_id(),))
             hard_deleted = cur.rowcount
 
             db.commit()
@@ -6763,7 +6733,7 @@ def run_consolidation():
                             ON CONFLICT (tenant_id, branch_name) DO UPDATE
                             SET centroid = EXCLUDED.centroid, commit_count = EXCLUDED.commit_count,
                                 last_updated = NOW()
-                        """, (DEFAULT_TENANT, br, centroid, count))
+                        """, (get_tenant_id(), br, centroid, count))
                         get_db().commit()
                         fp_cur.close()
                 except Exception as e:
@@ -6783,7 +6753,7 @@ def run_consolidation():
                  duration_ms, completed_at, metadata)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
         """, (
-            str(uuid.uuid4()), DEFAULT_TENANT, cycle_type,
+            str(uuid.uuid4()), get_tenant_id(), cycle_type,
             len(candidates), len(promoted_commits) if not dry_run else 0,
             expired, top_score, min_score, promoted_commits,
             duration_ms, json.dumps({'dry_run': dry_run, 'cooled': cooled, 'hard_deleted': hard_deleted})
@@ -6843,7 +6813,7 @@ def cleanup_candidates():
             SET status = 'expired'
             WHERE tenant_id = %s AND status IN ('active', 'cooling')
               AND expires_at IS NOT NULL AND expires_at < NOW()
-        """, (DEFAULT_TENANT,))
+        """, (get_tenant_id(),))
         expired = cur.rowcount
 
         # Hard-delete expired > 30 days
@@ -6851,7 +6821,7 @@ def cleanup_candidates():
             DELETE FROM candidate_memories
             WHERE tenant_id = %s AND status = 'expired'
               AND expires_at IS NOT NULL AND expires_at < NOW() - INTERVAL '30 days'
-        """, (DEFAULT_TENANT,))
+        """, (get_tenant_id(),))
         hard_deleted = cur.rowcount
 
         db.commit()
@@ -6946,7 +6916,7 @@ def discovery_pass():
             FROM blob_connectivity
             WHERE trail_count + link_count < 3
             ORDER BY orphan_score DESC, LENGTH(content) DESC
-        ''', (DEFAULT_TENANT,) * 5)
+        ''', (get_tenant_id(),) * 5)
 
         candidates = cur.fetchall()
 
@@ -6995,7 +6965,7 @@ def discovery_pass():
                     value_score = EXCLUDED.value_score,
                     surfaced_at = NOW(),
                     status = 'pending'
-            ''', (DEFAULT_TENANT, orphan['blob_hash'], orphan['orphan_score'],
+            ''', (get_tenant_id(), orphan['blob_hash'], orphan['orphan_score'],
                   orphan['value_score'], orphan['branch'],
                   (orphan['content'] or '')[:200], orphan['commit_message']))
 
@@ -7015,70 +6985,97 @@ def discovery_pass():
 
 @app.route('/v2/nightly', methods=['POST'])
 def nightly_maintenance():
-    """Composite nightly maintenance: trails + candidates + consolidation + centroids + discovery."""
+    """Composite nightly maintenance for ALL tenants: trails + candidates + consolidation + discovery."""
     start_time = time.time()
-    results = {}
+    all_results = {}
 
-    # Step 1: Trail decay
+    # Get all active tenants
     try:
-        with app.test_request_context(method='POST', path='/v2/trails/decay'):
-            trail_result = decay_trails()
-            if isinstance(trail_result, tuple):
-                results['trail_decay'] = trail_result[0].get_json() if hasattr(trail_result[0], 'get_json') else trail_result[0]
-            elif hasattr(trail_result, 'get_json'):
-                results['trail_decay'] = trail_result.get_json()
-            else:
-                results['trail_decay'] = trail_result
+        db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, name FROM tenants")
+        tenants = cur.fetchall()
+        cur.close()
+        db.close()
     except Exception as e:
-        results['trail_decay'] = {'error': str(e)}
+        return jsonify({'error': f'Failed to fetch tenants: {str(e)}'}), 500
 
-    # Step 2: Candidate cleanup
-    try:
-        with app.test_request_context(method='POST', path='/v2/candidates/cleanup',
-                                       content_type='application/json', json={}):
-            cleanup_result = cleanup_candidates()
-            if isinstance(cleanup_result, tuple):
-                results['candidate_cleanup'] = cleanup_result[0].get_json() if hasattr(cleanup_result[0], 'get_json') else cleanup_result[0]
-            elif hasattr(cleanup_result, 'get_json'):
-                results['candidate_cleanup'] = cleanup_result.get_json()
-            else:
-                results['candidate_cleanup'] = cleanup_result
-    except Exception as e:
-        results['candidate_cleanup'] = {'error': str(e)}
+    for tenant in tenants:
+        tenant_id = str(tenant['id'])
+        tenant_name = tenant.get('name', tenant_id[:8])
+        push_tenant_override(tenant_id)
+        try:
+            results = {}
 
-    # Step 3: Consolidation (promote top 10)
-    try:
-        with app.test_request_context(method='POST', path='/v2/consolidate',
-                                       content_type='application/json',
-                                       json={'max_promotions': 10, 'cycle_type': 'nightly'}):
-            consol_result = run_consolidation()
-            if isinstance(consol_result, tuple):
-                results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
-            elif hasattr(consol_result, 'get_json'):
-                results['consolidation'] = consol_result.get_json()
-            else:
-                results['consolidation'] = consol_result
-    except Exception as e:
-        results['consolidation'] = {'error': str(e)}
+            # Step 1: Trail decay
+            try:
+                with app.test_request_context(method='POST', path='/v2/trails/decay'):
+                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+                    trail_result = decay_trails()
+                    if isinstance(trail_result, tuple):
+                        results['trail_decay'] = trail_result[0].get_json() if hasattr(trail_result[0], 'get_json') else trail_result[0]
+                    elif hasattr(trail_result, 'get_json'):
+                        results['trail_decay'] = trail_result.get_json()
+                    else:
+                        results['trail_decay'] = trail_result
+            except Exception as e:
+                results['trail_decay'] = {'error': str(e)}
 
-    # Step 4: Discovery pass (surface orphaned memories)
-    try:
-        with app.test_request_context(method='POST', path='/v2/discovery/pass'):
-            discovery_result = discovery_pass()
-            if isinstance(discovery_result, tuple):
-                results['discovery_pass'] = discovery_result[0].get_json() if hasattr(discovery_result[0], 'get_json') else discovery_result[0]
-            elif hasattr(discovery_result, 'get_json'):
-                results['discovery_pass'] = discovery_result.get_json()
-            else:
-                results['discovery_pass'] = discovery_result
-    except Exception as e:
-        results['discovery_pass'] = {'error': str(e)}
+            # Step 2: Candidate cleanup
+            try:
+                with app.test_request_context(method='POST', path='/v2/candidates/cleanup',
+                                               content_type='application/json', json={}):
+                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+                    cleanup_result = cleanup_candidates()
+                    if isinstance(cleanup_result, tuple):
+                        results['candidate_cleanup'] = cleanup_result[0].get_json() if hasattr(cleanup_result[0], 'get_json') else cleanup_result[0]
+                    elif hasattr(cleanup_result, 'get_json'):
+                        results['candidate_cleanup'] = cleanup_result.get_json()
+                    else:
+                        results['candidate_cleanup'] = cleanup_result
+            except Exception as e:
+                results['candidate_cleanup'] = {'error': str(e)}
+
+            # Step 3: Consolidation (promote top 10)
+            try:
+                with app.test_request_context(method='POST', path='/v2/consolidate',
+                                               content_type='application/json',
+                                               json={'max_promotions': 10, 'cycle_type': 'nightly'}):
+                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+                    consol_result = run_consolidation()
+                    if isinstance(consol_result, tuple):
+                        results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
+                    elif hasattr(consol_result, 'get_json'):
+                        results['consolidation'] = consol_result.get_json()
+                    else:
+                        results['consolidation'] = consol_result
+            except Exception as e:
+                results['consolidation'] = {'error': str(e)}
+
+            # Step 4: Discovery pass (surface orphaned memories)
+            try:
+                with app.test_request_context(method='POST', path='/v2/discovery/pass'):
+                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+                    discovery_result = discovery_pass()
+                    if isinstance(discovery_result, tuple):
+                        results['discovery_pass'] = discovery_result[0].get_json() if hasattr(discovery_result[0], 'get_json') else discovery_result[0]
+                    elif hasattr(discovery_result, 'get_json'):
+                        results['discovery_pass'] = discovery_result.get_json()
+                    else:
+                        results['discovery_pass'] = discovery_result
+            except Exception as e:
+                results['discovery_pass'] = {'error': str(e)}
+
+            all_results[tenant_name] = results
+        finally:
+            pop_tenant_override()
 
     duration_ms = int((time.time() - start_time) * 1000)
 
     return jsonify({
         'status': 'nightly_complete',
-        'results': results,
+        'tenants_processed': len(tenants),
+        'results': all_results,
         'duration_ms': duration_ms,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
@@ -7717,7 +7714,7 @@ def download_extension():
     cur = get_cursor()
     cur.execute(
         'SELECT id, name FROM tenants WHERE name = %s OR id::text = %s LIMIT 1',
-        (user_id, DEFAULT_TENANT)
+        (user_id, get_tenant_id())
     )
     tenant_row = cur.fetchone()
 
@@ -7790,23 +7787,30 @@ def invoke_view(view_fn, method='GET', path='/', query_string=None, json_data=No
     """
     Call Flask view function in synthetic request context.
     Returns (data_dict, status_code).
-    
+
     view_args: dict of URL path parameters (e.g., {'task_id': '...'})
     """
+    # Capture tenant from outer (real) request context
+    outer_tenant = getattr(g, 'mcp_auth', {}).get('tenant_id') if has_request_context() else None
+
     ctx_kwargs = {'method': method, 'path': path}
     if query_string:
         ctx_kwargs['query_string'] = query_string
     if json_data is not None:
         ctx_kwargs['json'] = json_data
         ctx_kwargs['content_type'] = 'application/json'
-    
+
     with app.test_request_context(**ctx_kwargs):
+        # Propagate tenant into the synthetic context
+        if outer_tenant:
+            push_tenant_override(outer_tenant)
+            g.mcp_auth = {'tenant_id': outer_tenant, 'source': 'invoke_view'}
         try:
             if view_args:
                 result = view_fn(**view_args)
             else:
                 result = view_fn()
-            
+
             # Handle tuple returns (response, status_code)
             if isinstance(result, tuple):
                 resp, code = result[0], result[1]
@@ -7822,6 +7826,9 @@ def invoke_view(view_fn, method='GET', path='/', query_string=None, json_data=No
             import traceback
             traceback.print_exc()
             return {'error': str(e)}, 500
+        finally:
+            if outer_tenant:
+                pop_tenant_override()
 
 
 # Whisper-enabled MCP_TOOLS - behavioral hints embedded in descriptions
@@ -8729,7 +8736,7 @@ def debug_routing():
         SELECT branch_name, centroid, commit_count
         FROM branch_fingerprints
         WHERE tenant_id = %s AND centroid IS NOT NULL
-    """, (DEFAULT_TENANT,))
+    """, (get_tenant_id(),))
     
     scores = []
     for row in cur.fetchall():
