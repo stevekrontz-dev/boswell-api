@@ -15,7 +15,7 @@ from flask import request, jsonify, g
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', secrets.token_hex(32))
 JWT_ALGORITHM = 'HS256'
-JWT_EXPIRY_HOURS = int(os.environ.get('JWT_EXPIRY_HOURS', 24))
+JWT_EXPIRY_HOURS = int(os.environ.get('JWT_EXPIRY_HOURS', 168))
 
 
 def generate_jwt(user_id: str, email: str, tenant_id: str = None) -> str:
