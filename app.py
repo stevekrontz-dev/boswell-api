@@ -6500,9 +6500,12 @@ def get_decay_status():
 def _compute_connectivity(embedding, branch_name, cur):
     """Compute connectivity score for a candidate embedding.
     Cross-branch neighbors weighted 1.0, same-branch neighbors 0.1.
-    Normalized to 0-1, capped at 10 neighbors."""
+    Normalized to 0-1, capped at 10 neighbors.
+    Uses batch query for branch lookups instead of N individual queries."""
     if embedding is None:
         return 0.0
+
+    tenant_id = get_tenant_id()
 
     cur.execute("""
         SELECT b.blob_hash, te.name as branch_hint,
@@ -6512,26 +6515,27 @@ def _compute_connectivity(embedding, branch_name, cur):
         WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
           AND b.embedding <=> %s::vector < 0.4
         ORDER BY distance LIMIT 20
-    """, (embedding, get_tenant_id(), embedding))
+    """, (embedding, tenant_id, embedding))
 
-    # Need to determine branch per neighbor via commit chain
-    # Simplified: use the commit's branch
+    neighbors = cur.fetchall()
+    if not neighbors:
+        return 0.0
+
+    # Batch lookup: get branch for all neighbor blob_hashes in one query
+    blob_hashes = [row['blob_hash'] for row in neighbors]
+    cur.execute("""
+        SELECT DISTINCT ON (te.blob_hash) te.blob_hash, br.name as branch_name
+        FROM tree_entries te
+        JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
+        JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
+        WHERE te.blob_hash = ANY(%s) AND te.tenant_id = %s
+    """, (blob_hashes, tenant_id))
+
+    branch_map = {row['blob_hash']: row['branch_name'] for row in cur.fetchall()}
+
     weighted_count = 0.0
-    for row in cur.fetchall():
-        # Look up which branch this blob belongs to
-        cur2 = get_cursor()
-        cur2.execute("""
-            SELECT br.name as branch_name
-            FROM tree_entries te
-            JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
-            JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
-            WHERE te.blob_hash = %s AND te.tenant_id = %s
-            LIMIT 1
-        """, (row['blob_hash'], get_tenant_id()))
-        branch_row = cur2.fetchone()
-        cur2.close()
-
-        neighbor_branch = branch_row['branch_name'] if branch_row else 'unknown'
+    for row in neighbors:
+        neighbor_branch = branch_map.get(row['blob_hash'], 'unknown')
         if neighbor_branch.lower() == branch_name.lower():
             weighted_count += 0.1  # Same-branch: low weight
         else:
@@ -6681,14 +6685,12 @@ def run_consolidation():
 
         # Step 4: Compute consolidation scores
         scored = []
+        score_updates = []
         for c in candidates:
             connectivity = _compute_connectivity(c['embedding'], c['branch'], cur)
             score = c['salience'] * (1 + math.log(c['replay_count'] + 1)) * (1 + connectivity)
 
-            # Update score on the candidate
-            cur.execute("""
-                UPDATE candidate_memories SET consolidation_score = %s WHERE id = %s
-            """, (score, str(c['id'])))
+            score_updates.append((score, str(c['id'])))
 
             if score >= min_score:
                 scored.append({
@@ -6696,6 +6698,16 @@ def run_consolidation():
                     'score': score,
                     'connectivity': connectivity
                 })
+
+        # Batch update all consolidation scores
+        if score_updates:
+            from psycopg2.extras import execute_values
+            execute_values(cur, """
+                UPDATE candidate_memories AS cm
+                SET consolidation_score = v.score
+                FROM (VALUES %s) AS v(score, id)
+                WHERE cm.id = v.id::uuid
+            """, score_updates)
 
         # Step 5: Rank and take top N
         scored.sort(key=lambda x: x['score'], reverse=True)
