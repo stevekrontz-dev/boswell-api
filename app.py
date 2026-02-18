@@ -1792,7 +1792,7 @@ def semantic_startup():
         if query_embedding:
             cur.execute("""
                 SELECT b.blob_hash, substring(b.content, 1, 300) as preview,
-                       c.message, b.embedding <=> %s::vector AS distance
+                       c.message, b.content_type, b.embedding <=> %s::vector AS distance
                 FROM blobs b
                 JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
                 JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
@@ -1804,6 +1804,7 @@ def semantic_startup():
                     'blob_hash': row['blob_hash'],
                     'preview': row['preview'],
                     'message': row['message'],
+                    'content_type': row.get('content_type', 'memory'),
                     'distance': float(row['distance'])
                 })
                 # Auto-trail: track startup relevant memories
@@ -2074,6 +2075,7 @@ def semantic_startup():
         trimmed_memories = [{
             'blob_hash': m['blob_hash'],
             'message': m['message'],
+            'content_type': m.get('content_type', 'memory'),
             'distance': m.get('distance')
         } for m in relevant_memories[:3]]
 
@@ -2094,6 +2096,16 @@ def semantic_startup():
     # v5: Discovery blobs — orphaned memories surfaced for reconnection
     if discovery_blobs and verbosity != 'minimal':
         response['discovery_blobs'] = discovery_blobs
+
+    # v6: Skills loaded — behavioral instructions surfaced via semantic search
+    source_memories = relevant_memories if verbosity == 'full' else trimmed_memories if verbosity != 'minimal' else []
+    loaded_skills = [m for m in source_memories if m.get('content_type') == 'skill']
+    if loaded_skills:
+        response['skills_loaded'] = [{
+            'blob_hash': s['blob_hash'],
+            'message': s['message'],
+            'hint': 'Behavioral skill - recall full content and follow as instructions'
+        } for s in loaded_skills]
 
     # If agent_id provided, add their specific tasks
     if agent_id:
@@ -7960,7 +7972,8 @@ MCP_TOOLS = [
                 "content": {"type": "object", "description": "Memory content as JSON object"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
-                "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"}
+                "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"},
+                "content_type": {"type": "string", "description": "Content type: 'memory' (default) or 'skill' (behavioral instruction)"}
             },
             "required": ["branch", "content", "message"]
         }
@@ -8382,7 +8395,7 @@ def dispatch_mcp_tool(tool_name, args):
             "content": args["content"],
             "message": args["message"],
             "author": "claude-web",
-            "type": "memory"
+            "type": args.get("content_type", "memory")
         }
         if "tags" in args:
             payload["tags"] = args["tags"]
