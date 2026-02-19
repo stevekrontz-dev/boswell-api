@@ -3992,9 +3992,18 @@ def work_landscape():
     include_done = request.args.get('include_done', 'false').lower() == 'true'
     tenant_id = get_tenant_id()
 
+    db = get_db()
     cur = get_cursor()
     landscape = {}
     backlog = []
+
+    # Ensure work hierarchy columns exist (idempotent)
+    try:
+        cur.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title VARCHAR(500)')
+        cur.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_blob_hash TEXT')
+        db.commit()
+    except Exception:
+        db.rollback()
 
     try:
         # 1. Get active plans (blobs with content_type='plan')
