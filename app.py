@@ -858,6 +858,17 @@ def create_commit():
     if not content:
         return jsonify({'error': 'Content required'}), 400
 
+    # Validate content_type='plan' requirements
+    if memory_type == 'plan':
+        if not isinstance(content, dict):
+            return jsonify({'error': 'Plan content must be a JSON object'}), 400
+        if not content.get('title') or not isinstance(content.get('title'), str):
+            return jsonify({'error': 'Plan content requires a "title" string field'}), 400
+        valid_plan_statuses = ['active', 'completed', 'paused', 'abandoned']
+        plan_status = content.get('status')
+        if not plan_status or plan_status not in valid_plan_statuses:
+            return jsonify({'error': f'Plan content requires "status" field, one of: {valid_plan_statuses}'}), 400
+
     # Phase 4: Check routing suggestion (warn but don't block)
     force_branch = data.get('force_branch', False)
     routing_warning = None
@@ -1931,69 +1942,126 @@ def semantic_startup():
     except Exception:
         pass  # Non-critical — don't break startup
 
-    # Get open tasks (priority 1-3 = high, show first)
-    # If agent_id provided, show: their assigned tasks + unassigned tasks
-    # If no agent_id, show all open tasks
-    open_tasks = []
-    my_tasks = []  # Tasks assigned specifically to this agent
+    # Work Landscape: branches as projects, plans with progress, orphan backlog
+    work_landscape = {}
+    backlog = []
+    my_tasks = []
+    open_tasks = []  # Kept for backward compat in minimal/normal verbosity
     try:
-        if agent_id:
-            # Get tasks assigned to this agent
+        # Get active plans (blobs with content_type='plan')
+        cur.execute("""
+            SELECT DISTINCT b.blob_hash, b.content, b.created_at
+            FROM blobs b
+            WHERE b.tenant_id = %s AND b.content_type = 'plan'
+              AND (b.content::jsonb->>'status') IN ('active', 'paused')
+            ORDER BY b.created_at DESC
+        """, (get_tenant_id(),))
+        plan_rows = cur.fetchall()
+
+        plans_by_branch = {}
+        for row in plan_rows:
+            content = row['content']
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    content = {}
+            blob_hash = row['blob_hash']
+            plan_title = content.get('title', 'Untitled Plan')
+            plan_status = content.get('status', 'active')
+
+            # Get branch from commit chain
             cur.execute("""
-                SELECT id, description, branch, assigned_to, priority, created_at, metadata
-                FROM tasks 
+                SELECT br.name
+                FROM tree_entries te
+                JOIN commits co ON co.tree_hash = te.tree_hash AND co.tenant_id = te.tenant_id
+                JOIN branches br ON br.tenant_id = co.tenant_id
+                WHERE te.blob_hash = %s AND te.tenant_id = %s
+                LIMIT 1
+            """, (blob_hash, get_tenant_id()))
+            branch_row = cur.fetchone()
+            plan_branch = branch_row['name'] if branch_row else 'unknown'
+
+            # Count tasks under this plan
+            cur.execute("""
+                SELECT COUNT(*) as total,
+                       COUNT(*) FILTER (WHERE status = 'done') as done
+                FROM tasks
+                WHERE tenant_id = %s AND plan_blob_hash = %s AND status != 'deleted'
+            """, (get_tenant_id(), blob_hash))
+            counts = cur.fetchone()
+            task_count = counts['total'] if counts else 0
+            done_count = counts['done'] if counts else 0
+
+            if plan_branch not in plans_by_branch:
+                plans_by_branch[plan_branch] = []
+            plans_by_branch[plan_branch].append({
+                'title': plan_title,
+                'status': plan_status,
+                'blob_hash': blob_hash,
+                'progress': f"{done_count}/{task_count}",
+                'task_count': task_count,
+                'done_count': done_count
+            })
+
+        # Build landscape with health scores
+        for branch_name, plans in plans_by_branch.items():
+            total_tasks = sum(p['task_count'] for p in plans)
+            done_tasks = sum(p['done_count'] for p in plans)
+            health = f"{round(done_tasks / total_tasks * 100)}%" if total_tasks > 0 else "no tasks"
+            work_landscape[branch_name] = {
+                'plans': plans,
+                'health': health
+            }
+
+        # Orphan backlog: tasks not under any plan
+        cur.execute("""
+            SELECT id, title, description, branch, priority, assigned_to, status
+            FROM tasks
+            WHERE tenant_id = %s AND (plan_blob_hash IS NULL)
+              AND status IN ('open', 'claimed', 'blocked')
+            ORDER BY priority ASC, created_at ASC
+            LIMIT 20
+        """, (get_tenant_id(),))
+        for row in cur.fetchall():
+            task_entry = {
+                'id': str(row['id']),
+                'title': row.get('title') or (row['description'][:80] if row['description'] else ''),
+                'branch': row['branch'],
+                'priority': row['priority'],
+                'assigned_to': row['assigned_to']
+            }
+            backlog.append(task_entry)
+            # Also populate open_tasks for backward compat
+            open_tasks.append({
+                'id': str(row['id']),
+                'description': row.get('title') or row['description'],
+                'branch': row['branch'],
+                'priority': row['priority'],
+                'assigned_to': row['assigned_to']
+            })
+
+        # Agent-specific tasks
+        if agent_id:
+            cur.execute("""
+                SELECT id, title, description, branch, assigned_to, priority, created_at
+                FROM tasks
                 WHERE tenant_id = %s AND status = 'open' AND assigned_to = %s
                 ORDER BY priority ASC, created_at ASC
             """, (get_tenant_id(), agent_id))
             for row in cur.fetchall():
                 my_tasks.append({
                     'id': str(row['id']),
+                    'title': row.get('title'),
                     'description': row['description'],
                     'branch': row['branch'],
                     'assigned_to': row['assigned_to'],
                     'priority': row['priority'],
-                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
-                    'metadata': row['metadata'] if row['metadata'] else {}
-                })
-            # Also get unassigned tasks (available to claim)
-            cur.execute("""
-                SELECT id, description, branch, assigned_to, priority, created_at, metadata
-                FROM tasks 
-                WHERE tenant_id = %s AND status = 'open' AND assigned_to IS NULL
-                ORDER BY priority ASC, created_at ASC
-                LIMIT 5
-            """, (get_tenant_id(),))
-            for row in cur.fetchall():
-                open_tasks.append({
-                    'id': str(row['id']),
-                    'description': row['description'],
-                    'branch': row['branch'],
-                    'assigned_to': row['assigned_to'],
-                    'priority': row['priority'],
-                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
-                    'metadata': row['metadata'] if row['metadata'] else {}
-                })
-        else:
-            # No agent_id - return all open tasks
-            cur.execute("""
-                SELECT id, description, branch, assigned_to, priority, created_at, metadata
-                FROM tasks 
-                WHERE tenant_id = %s AND status = 'open'
-                ORDER BY priority ASC, created_at ASC
-                LIMIT 10
-            """, (get_tenant_id(),))
-            for row in cur.fetchall():
-                open_tasks.append({
-                    'id': str(row['id']),
-                    'description': row['description'],
-                    'branch': row['branch'],
-                    'assigned_to': row['assigned_to'],
-                    'priority': row['priority'],
-                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
-                    'metadata': row['metadata'] if row['metadata'] else {}
+                    'created_at': row['created_at'].isoformat() if row['created_at'] else None
                 })
     except Exception as e:
-        # tasks table might not exist - that's ok
+        # tasks table or columns might not exist yet - that's ok
+        print(f"[STARTUP] Work landscape query error (non-fatal): {e}", file=sys.stderr)
         pass
 
     # v4: Recent bookmarks (working memory / RAM)
@@ -2036,21 +2104,21 @@ def semantic_startup():
 
     # Build response based on verbosity level
     if verbosity == 'minimal':
-        # Bare essentials: sacred manifest + top 3 tasks (slim)
-        slim_tasks = [{
+        # Bare essentials: sacred manifest + slim backlog
+        slim_backlog = [{
             'id': t['id'],
-            'description': t['description'][:200],  # Truncate long descriptions
+            'title': t.get('title', t.get('description', '')[:80]),
             'priority': t['priority']
-        } for t in open_tasks[:3]]
+        } for t in backlog[:3]]
 
         response = {
             'local_time': local_time,
             'sacred_manifest': sacred_manifest,
-            'open_tasks': slim_tasks,
+            'open_tasks': slim_backlog,
             'verbosity': 'minimal'
         }
     elif verbosity == 'full':
-        # Everything for debugging
+        # Everything for debugging — full landscape
         response = {
             'timestamp': timestamp_utc,
             'local_time': local_time,
@@ -2058,20 +2126,14 @@ def semantic_startup():
             'tool_registry': tool_registry,
             'relevant_memories': relevant_memories,
             'hot_memories': hot_memories,
+            'work_landscape': work_landscape,
+            'backlog': backlog,
             'open_tasks': open_tasks,
             'context_used': context,
             'verbosity': 'full'
         }
     else:
-        # normal (default): balanced payload
-        trimmed_tasks = [{
-            'id': t['id'],
-            'description': t['description'],
-            'branch': t['branch'],
-            'priority': t['priority'],
-            'assigned_to': t['assigned_to']
-        } for t in open_tasks[:5]]
-
+        # normal (default): balanced payload with landscape
         trimmed_memories = [{
             'blob_hash': m['blob_hash'],
             'message': m['message'],
@@ -2084,7 +2146,9 @@ def semantic_startup():
             'local_time': local_time,
             'sacred_manifest': sacred_manifest,
             'relevant_memories': trimmed_memories,
-            'open_tasks': trimmed_tasks,
+            'work_landscape': work_landscape,
+            'backlog': backlog,
+            'open_tasks': open_tasks,
             'context_used': context,
             'verbosity': 'normal'
         }
@@ -3600,11 +3664,13 @@ def create_task():
     """
     data = request.get_json() or {}
     description = data.get('description')
+    title = data.get('title')
     branch = data.get('branch', 'command-center')
     assigned_to = data.get('assigned_to')
     priority = data.get('priority', 5)
     deadline = data.get('deadline')
     metadata = data.get('metadata', {})
+    plan_blob_hash = data.get('plan_blob_hash')
 
     if not description:
         return jsonify({'error': 'Description required'}), 400
@@ -3614,12 +3680,30 @@ def create_task():
     now = datetime.utcnow().isoformat() + 'Z'
 
     try:
+        # Ensure work hierarchy columns exist (idempotent)
+        try:
+            cur.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title VARCHAR(500)')
+            cur.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_blob_hash TEXT')
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Validate plan_blob_hash references an existing blob
+        if plan_blob_hash:
+            cur.execute(
+                'SELECT blob_hash FROM blobs WHERE blob_hash = %s AND tenant_id = %s',
+                (plan_blob_hash, get_tenant_id())
+            )
+            if not cur.fetchone():
+                cur.close()
+                return jsonify({'error': f'plan_blob_hash {plan_blob_hash} does not reference an existing blob'}), 400
+
         # 1. Insert task into task queue
         cur.execute(
-            '''INSERT INTO tasks (tenant_id, description, branch, assigned_to, status, priority, deadline, metadata)
-               VALUES (%s, %s, %s, %s, 'open', %s, %s, %s)
+            '''INSERT INTO tasks (tenant_id, description, title, branch, assigned_to, status, priority, deadline, metadata, plan_blob_hash)
+               VALUES (%s, %s, %s, %s, %s, 'open', %s, %s, %s, %s)
                RETURNING id, created_at''',
-            (get_tenant_id(), description, branch, assigned_to, priority, deadline, json.dumps(metadata))
+            (get_tenant_id(), description, title, branch, assigned_to, priority, deadline, json.dumps(metadata), plan_blob_hash)
         )
         row = cur.fetchone()
         task_id = str(row['id'])
@@ -3629,10 +3713,12 @@ def create_task():
         memory_content = {
             'type': 'task_created',
             'task_id': task_id,
+            'title': title,
             'description': description,
             'branch': branch,
             'priority': priority,
             'assigned_to': assigned_to,
+            'plan_blob_hash': plan_blob_hash,
             'metadata': metadata
         }
         content_str = json.dumps(memory_content)
@@ -3713,17 +3799,21 @@ def create_task():
         db.commit()
         cur.close()
 
-        return jsonify({
+        response = {
             'status': 'created',
             'task_id': task_id,
             'commit_hash': commit_hash,
             'blob_hash': blob_hash,
+            'title': title,
             'description': description,
             'branch': branch,
             'assigned_to': assigned_to,
             'priority': priority,
             'created_at': created_at
-        }), 201
+        }
+        if plan_blob_hash:
+            response['plan_blob_hash'] = plan_blob_hash
+        return jsonify(response), 201
 
     except Exception as e:
         db.rollback()
@@ -3783,7 +3873,7 @@ def update_task(task_id):
     data = request.get_json() or {}
 
     # Allowed fields to update
-    allowed_fields = ['description', 'branch', 'assigned_to', 'status', 'priority', 'deadline', 'metadata']
+    allowed_fields = ['description', 'title', 'branch', 'assigned_to', 'status', 'priority', 'deadline', 'metadata', 'plan_blob_hash']
     updates = {k: v for k, v in data.items() if k in allowed_fields}
 
     if not updates:
@@ -3887,6 +3977,180 @@ def delete_task(task_id):
         db.rollback()
         cur.close()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/tasks/landscape', methods=['GET'])
+def work_landscape():
+    """Return the full work landscape — branches as projects, plans with progress,
+    cascade health scores, and unorganized backlog.
+
+    Query params:
+      - branch: filter by branch (optional)
+      - include_done: include completed plans (default: false)
+    """
+    filter_branch = request.args.get('branch')
+    include_done = request.args.get('include_done', 'false').lower() == 'true'
+    tenant_id = get_tenant_id()
+
+    cur = get_cursor()
+    landscape = {}
+    backlog = []
+
+    try:
+        # 1. Get active plans (blobs with content_type='plan')
+        plan_status_filter = "AND (b.content::jsonb->>'status') IN ('active', 'paused')"
+        if include_done:
+            plan_status_filter = ""
+
+        plan_sql = f"""
+            SELECT b.blob_hash, b.content, b.created_at,
+                   c.message AS commit_message,
+                   br.name AS branch_name
+            FROM blobs b
+            JOIN tree_entries te ON te.blob_hash = b.blob_hash AND te.tenant_id = b.tenant_id
+            JOIN commits co ON co.tree_hash = te.tree_hash AND co.tenant_id = b.tenant_id
+            JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = b.tenant_id
+            WHERE b.tenant_id = %s
+              AND b.content_type = 'plan'
+              {plan_status_filter}
+        """
+        params = [tenant_id]
+        if filter_branch:
+            plan_sql += " AND LOWER(br.name) = LOWER(%s)"
+            params.append(filter_branch)
+
+        # Simpler approach: query plans from blobs directly, get branch from commit chain
+        plan_sql = f"""
+            SELECT DISTINCT b.blob_hash, b.content, b.created_at
+            FROM blobs b
+            WHERE b.tenant_id = %s
+              AND b.content_type = 'plan'
+              {plan_status_filter}
+            ORDER BY b.created_at DESC
+        """
+        params = [tenant_id]
+        cur.execute(plan_sql, params)
+        plan_rows = cur.fetchall()
+
+        plans_by_branch = {}
+        plan_hashes = set()
+
+        for row in plan_rows:
+            content = row['content']
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    content = {}
+
+            blob_hash = row['blob_hash']
+            plan_hashes.add(blob_hash)
+            plan_title = content.get('title', 'Untitled Plan')
+            plan_status = content.get('status', 'active')
+
+            # Get branch from the commit that contains this blob
+            cur.execute("""
+                SELECT br.name
+                FROM tree_entries te
+                JOIN commits co ON co.tree_hash = te.tree_hash AND co.tenant_id = te.tenant_id
+                JOIN branches br ON br.tenant_id = co.tenant_id
+                WHERE te.blob_hash = %s AND te.tenant_id = %s
+                LIMIT 1
+            """, (blob_hash, tenant_id))
+            branch_row = cur.fetchone()
+            plan_branch = branch_row['name'] if branch_row else 'unknown'
+
+            if filter_branch and plan_branch.lower() != filter_branch.lower():
+                continue
+
+            # Count tasks under this plan
+            cur.execute("""
+                SELECT COUNT(*) as total,
+                       COUNT(*) FILTER (WHERE status = 'done') as done
+                FROM tasks
+                WHERE tenant_id = %s AND plan_blob_hash = %s
+                  AND status != 'deleted'
+            """, (tenant_id, blob_hash))
+            counts = cur.fetchone()
+            task_count = counts['total'] if counts else 0
+            done_count = counts['done'] if counts else 0
+
+            plan_entry = {
+                'title': plan_title,
+                'status': plan_status,
+                'blob_hash': blob_hash,
+                'progress': f"{done_count}/{task_count}",
+                'task_count': task_count,
+                'done_count': done_count
+            }
+
+            if plan_branch not in plans_by_branch:
+                plans_by_branch[plan_branch] = []
+            plans_by_branch[plan_branch].append(plan_entry)
+
+        # 2. Build landscape with health scores per branch
+        for branch_name, plans in plans_by_branch.items():
+            total_tasks = sum(p['task_count'] for p in plans)
+            done_tasks = sum(p['done_count'] for p in plans)
+            health = f"{round(done_tasks / total_tasks * 100)}%" if total_tasks > 0 else "no tasks"
+
+            landscape[branch_name] = {
+                'plans': plans,
+                'health': health
+            }
+
+        # 3. Orphan backlog: tasks not under any plan
+        backlog_sql = """
+            SELECT id, title, description, branch, priority, assigned_to, status, created_at
+            FROM tasks
+            WHERE tenant_id = %s
+              AND (plan_blob_hash IS NULL)
+              AND status IN ('open', 'claimed', 'blocked')
+            ORDER BY priority ASC, created_at ASC
+            LIMIT 50
+        """
+        backlog_params = [tenant_id]
+        if filter_branch:
+            backlog_sql = """
+                SELECT id, title, description, branch, priority, assigned_to, status, created_at
+                FROM tasks
+                WHERE tenant_id = %s
+                  AND (plan_blob_hash IS NULL)
+                  AND status IN ('open', 'claimed', 'blocked')
+                  AND LOWER(branch) = LOWER(%s)
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 50
+            """
+            backlog_params.append(filter_branch)
+
+        cur.execute(backlog_sql, backlog_params)
+        for row in cur.fetchall():
+            backlog.append({
+                'id': str(row['id']),
+                'title': row.get('title') or row['description'][:80],
+                'description': row['description'][:200] if row['description'] else None,
+                'branch': row['branch'],
+                'priority': row['priority'],
+                'assigned_to': row['assigned_to'],
+                'status': row['status']
+            })
+
+        cur.close()
+        return jsonify({
+            'work_landscape': landscape,
+            'backlog': backlog,
+            'summary': {
+                'total_plans': sum(len(p) for p in plans_by_branch.values()),
+                'total_branches': len(landscape),
+                'backlog_count': len(backlog)
+            }
+        })
+
+    except Exception as e:
+        cur.close()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Landscape query failed: {str(e)}'}), 500
 
 
 def ensure_task_claims_table():
@@ -7964,13 +8228,14 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_commit",
-        "description": "Preserve a decision, insight, or context to memory. ALWAYS capture WHY, not just WHAT—future instances need reasoning. Call after completing steps, solving problems, making decisions, or learning something new.",
+        "description": "Preserve a decision, insight, or context to memory. ALWAYS capture WHY, not just WHAT—future instances need reasoning. Call after completing steps, solving problems, making decisions, or learning something new. Use content_type='plan' to create persistent work plans that group tasks.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "branch": {"type": "string", "description": "Branch to commit to (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
                 "content": {"type": "object", "description": "Memory content as JSON object"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
+                "content_type": {"type": "string", "description": "Content type: 'memory' (default) or 'plan'. Plans require title and status fields in content.", "default": "memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
                 "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"},
                 "content_type": {"type": "string", "description": "Content type: 'memory' (default) or 'skill' (behavioral instruction)"}
@@ -8010,9 +8275,11 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "description": {"type": "string", "description": "What needs to be done"},
+                "title": {"type": "string", "description": "Short display name for the work item (e.g. 'Fix dropdown bug')"},
                 "branch": {"type": "string", "description": "Which branch this relates to (command-center, tint-atlanta, etc.)"},
                 "priority": {"type": "integer", "description": "Priority 1-10 (1=highest, default=5)"},
                 "assigned_to": {"type": "string", "description": "Optional: assign to specific instance"},
+                "plan_blob_hash": {"type": "string", "description": "Blob hash of the plan this task serves. Omit for unorganized backlog tasks."},
                 "metadata": {"type": "object", "description": "Optional: additional context"}
             },
             "required": ["description"]
@@ -8051,8 +8318,10 @@ MCP_TOOLS = [
             "properties": {
                 "task_id": {"type": "string", "description": "Task ID to update"},
                 "status": {"type": "string", "enum": ["open", "claimed", "blocked", "done"], "description": "New status"},
+                "title": {"type": "string", "description": "Short display name for the task"},
                 "description": {"type": "string", "description": "Updated description"},
                 "priority": {"type": "integer", "description": "Priority (1=highest)"},
+                "plan_blob_hash": {"type": "string", "description": "Blob hash of the plan this task serves"},
                 "metadata": {"type": "object", "description": "Additional metadata to merge"}
             },
             "required": ["task_id"]
@@ -8084,6 +8353,17 @@ MCP_TOOLS = [
         "name": "boswell_halt_status",
         "description": "Check if task system is halted. Call before claiming tasks if unsure.",
         "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "boswell_landscape",
+        "description": "View the full work landscape — branches as projects, plans with progress, cascade health scores, and unorganized backlog. Call when you need the big picture.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string", "description": "Optional: filter by branch"},
+                "include_done": {"type": "boolean", "description": "Include completed plans (default: false)"}
+            }
+        }
     },
     {
         "name": "boswell_record_trail",
@@ -8399,6 +8679,8 @@ def dispatch_mcp_tool(tool_name, args):
         }
         if "tags" in args:
             payload["tags"] = args["tags"]
+        if "force_branch" in args:
+            payload["force_branch"] = args["force_branch"]
         return invoke_view(create_commit, method='POST', json_data=payload)
     
     elif tool_name == "boswell_link":
@@ -8420,7 +8702,7 @@ def dispatch_mcp_tool(tool_name, args):
     
     elif tool_name == "boswell_create_task":
         payload = {"description": args["description"]}
-        for field in ["branch", "priority", "assigned_to", "metadata"]:
+        for field in ["title", "branch", "priority", "assigned_to", "metadata", "plan_blob_hash"]:
             if field in args:
                 payload[field] = args[field]
         return invoke_view(create_task, method='POST', json_data=payload)
@@ -8453,7 +8735,7 @@ def dispatch_mcp_tool(tool_name, args):
     elif tool_name == "boswell_update_task":
         task_id = args["task_id"]
         payload = {}
-        for field in ["status", "description", "priority", "metadata"]:
+        for field in ["status", "description", "title", "priority", "metadata", "plan_blob_hash"]:
             if field in args:
                 payload[field] = args[field]
         return invoke_view(
@@ -8484,7 +8766,15 @@ def dispatch_mcp_tool(tool_name, args):
     
     elif tool_name == "boswell_halt_status":
         return invoke_view(halt_status)
-    
+
+    elif tool_name == "boswell_landscape":
+        qs = {}
+        if "branch" in args:
+            qs["branch"] = args["branch"]
+        if "include_done" in args:
+            qs["include_done"] = "true" if args["include_done"] else "false"
+        return invoke_view(work_landscape, query_string=qs if qs else None)
+
     # ===== TRAIL OPERATIONS =====
     
     elif tool_name == "boswell_record_trail":
