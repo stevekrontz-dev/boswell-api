@@ -1036,6 +1036,18 @@ def create_commit():
                 # Tag already exists, ignore duplicate
                 pass
 
+        # Auto-tag plans with their branch for reliable lookups
+        if memory_type == 'plan':
+            try:
+                cur.execute(
+                    '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT DO NOTHING''',
+                    (get_tenant_id(), blob_hash, f"plan-branch:{branch}", now)
+                )
+            except Exception:
+                pass
+
         db.commit()
 
         # Auto-trail: track newly committed blob
@@ -1970,17 +1982,18 @@ def semantic_startup():
             plan_title = content.get('title', 'Untitled Plan')
             plan_status = content.get('status', 'active')
 
-            # Get branch from commit chain
+            # Get branch from plan-branch tag (auto-set at commit time)
             cur.execute("""
-                SELECT br.name
-                FROM tree_entries te
-                JOIN commits co ON co.tree_hash = te.tree_hash AND co.tenant_id = te.tenant_id
-                JOIN branches br ON br.tenant_id = co.tenant_id
-                WHERE te.blob_hash = %s AND te.tenant_id = %s
+                SELECT tag FROM tags
+                WHERE blob_hash = %s AND tenant_id = %s AND tag LIKE 'plan-branch:%%'
                 LIMIT 1
             """, (blob_hash, get_tenant_id()))
-            branch_row = cur.fetchone()
-            plan_branch = branch_row['name'] if branch_row else 'unknown'
+            tag_row = cur.fetchone()
+            if tag_row:
+                plan_branch = tag_row['tag'].replace('plan-branch:', '')
+            else:
+                # Fallback for plans created before auto-tagging: check content
+                plan_branch = content.get('_branch', 'unknown') if isinstance(content, dict) else 'unknown'
 
             # Count tasks under this plan
             cur.execute("""
@@ -4057,17 +4070,17 @@ def work_landscape():
             plan_title = content.get('title', 'Untitled Plan')
             plan_status = content.get('status', 'active')
 
-            # Get branch from the commit that contains this blob
+            # Get branch from plan-branch tag (auto-set at commit time)
             cur.execute("""
-                SELECT br.name
-                FROM tree_entries te
-                JOIN commits co ON co.tree_hash = te.tree_hash AND co.tenant_id = te.tenant_id
-                JOIN branches br ON br.tenant_id = co.tenant_id
-                WHERE te.blob_hash = %s AND te.tenant_id = %s
+                SELECT tag FROM tags
+                WHERE blob_hash = %s AND tenant_id = %s AND tag LIKE 'plan-branch:%%'
                 LIMIT 1
             """, (blob_hash, tenant_id))
-            branch_row = cur.fetchone()
-            plan_branch = branch_row['name'] if branch_row else 'unknown'
+            tag_row = cur.fetchone()
+            if tag_row:
+                plan_branch = tag_row['tag'].replace('plan-branch:', '')
+            else:
+                plan_branch = content.get('_branch', 'unknown') if isinstance(content, dict) else 'unknown'
 
             if filter_branch and plan_branch.lower() != filter_branch.lower():
                 continue
