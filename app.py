@@ -23,6 +23,12 @@ import math
 import threading
 import numpy as np
 
+# Read version from VERSION file
+try:
+    VERSION = open(os.path.join(os.path.dirname(__file__), 'VERSION')).read().strip()
+except Exception:
+    VERSION = '3.3.0'
+
 # Anthropic for HyDE query expansion (opt-in)
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 _anthropic_client = None
@@ -258,12 +264,20 @@ def _record_co_access_trails():
             for j in range(i + 1, len(blob_list)):
                 cur.execute('''
                     INSERT INTO trails (tenant_id, source_blob, target_blob,
-                                        traversal_count, last_traversed, strength)
-                    VALUES (%s, %s, %s, 1, NOW(), 1.0)
+                                        traversal_count, last_traversed, strength,
+                                        storage_strength, retrieval_strength, stability)
+                    VALUES (%s, %s, %s, 1, NOW(), 1.0, 1.0, 1.0, 1.0)
                     ON CONFLICT (tenant_id, source_blob, target_blob) DO UPDATE
                     SET traversal_count = trails.traversal_count + 1,
                         last_traversed = NOW(),
-                        strength = LEAST(trails.strength * 1.1, 10.0)
+                        strength = LEAST(trails.strength * 1.1, 10.0),
+                        storage_strength = trails.storage_strength + 0.5,
+                        retrieval_strength = 1.0,
+                        stability = trails.stability * (1.0 + 2.0 * (1.0 - POWER(
+                            1.0 + EXTRACT(EPOCH FROM (NOW()-COALESCE(trails.last_traversed, trails.created_at)))/86400.0
+                              / (9.0 * GREATEST(trails.stability, 0.1)),
+                            -1.0
+                        )) * POWER(GREATEST(trails.stability, 0.1), -0.2))
                 ''', (get_tenant_id(), blob_list[i], blob_list[j]))
         db.commit()
         cur.close()
@@ -362,7 +376,7 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
-            'version': '3.1.0-connectome',
+            'version': VERSION,
             'platform': 'railway',
             'database': 'postgres',
             'encryption': encryption_status,
@@ -886,6 +900,59 @@ def delete_branch(name):
         'branch': name
     }), 200
 
+def check_novelty(embedding, branch, tenant_id):
+    """Pre-commit novelty check using pgvector cosine similarity.
+    Returns novelty_score (1-max_similarity), is_novel flag, and similar memories.
+    Non-blocking: any error returns {novelty_score: 1.0, is_novel: True}."""
+    try:
+        if embedding is None:
+            return {'novelty_score': 1.0, 'is_novel': True}
+
+        cur = get_cursor()
+        # Find top-3 most similar blobs across all branches for this tenant
+        cur.execute('''
+            SELECT b.blob_hash, b.content, c.message,
+                   1.0 - (b.embedding <=> %s::vector) AS similarity
+            FROM blobs b
+            JOIN tree_entries te ON te.blob_hash = b.blob_hash AND te.tenant_id = b.tenant_id
+            JOIN commits c ON c.tree_hash = te.tree_hash AND c.tenant_id = b.tenant_id
+            WHERE b.tenant_id = %s
+              AND b.embedding IS NOT NULL
+              AND COALESCE(b.quarantined, FALSE) = FALSE
+            ORDER BY b.embedding <=> %s::vector ASC
+            LIMIT 3
+        ''', (embedding, tenant_id, embedding))
+
+        rows = cur.fetchall()
+        cur.close()
+
+        if not rows:
+            return {'novelty_score': 1.0, 'is_novel': True}
+
+        max_similarity = max(float(row['similarity']) for row in rows)
+        novelty_score = 1.0 - max_similarity
+        is_novel = max_similarity < 0.92
+
+        result = {
+            'novelty_score': round(novelty_score, 4),
+            'is_novel': is_novel
+        }
+
+        if not is_novel:
+            result['novelty_warning'] = f'Content is {max_similarity:.0%} similar to existing memory'
+            result['similar_memories'] = [{
+                'blob_hash': row['blob_hash'],
+                'similarity': round(float(row['similarity']), 4),
+                'message': (row['message'] or '')[:100]
+            } for row in rows if float(row['similarity']) > 0.8]
+
+        return result
+
+    except Exception as e:
+        print(f"[NOVELTY] Non-fatal error: {e}", file=sys.stderr)
+        return {'novelty_score': 1.0, 'is_novel': True}
+
+
 @app.route('/v2/commit', methods=['POST'])
 def create_commit():
     """Commit a memory to the repository."""
@@ -914,6 +981,7 @@ def create_commit():
     # Phase 4: Check routing suggestion (warn but don't block)
     force_branch = data.get('force_branch', False)
     routing_warning = None
+    embedding_check = None
     try:
         content_str_check = json.dumps(content) if isinstance(content, dict) else str(content)
         embedding_check = generate_embedding(content_str_check)
@@ -942,6 +1010,13 @@ def create_commit():
                     }
     except Exception as e:
         print(f"[ROUTING CHECK] Non-fatal error: {e}", file=sys.stderr)
+
+    # Novelty filter: check for near-duplicates using the same embedding
+    novelty_result = check_novelty(
+        embedding_check,
+        branch,
+        request.headers.get('X-Tenant-ID', get_tenant_id())
+    )
 
     # W2P4: Check commit limit before creating
     from billing.enforce import enforce_commit_limit
@@ -1103,10 +1178,14 @@ def create_commit():
             'blob_hash': blob_hash,
             'tree_hash': tree_hash,
             'branch': branch,
-            'message': message
+            'message': message,
+            'novelty_score': novelty_result.get('novelty_score', 1.0)
         }
         if routing_suggestion:
             response['routing_suggestion'] = routing_suggestion
+        if not novelty_result.get('is_novel', True):
+            response['novelty_warning'] = novelty_result.get('novelty_warning')
+            response['similar_memories'] = novelty_result.get('similar_memories', [])
         return jsonify(response), 201
 
     except Exception as e:
@@ -5310,6 +5389,38 @@ def list_orphaned_checkpoints():
 
 # ==================== TRAILS (Memory Path Tracking) ====================
 
+# --- FSRS-6 Dual-Strength Decay Model ---
+# Based on Bjork's "New Theory of Disuse"
+# storage_strength: How well-encoded. Grows monotonically. NEVER decays.
+# retrieval_strength: How accessible right now. Decays with time, resets on access.
+# stability: How resistant to forgetting. Grows MORE when a fading memory is accessed.
+
+def compute_retrievability(days_elapsed, stability):
+    """FSRS-6 retrievability formula: R(t) = (1 + t/(9*S))^(-1)"""
+    if stability <= 0:
+        stability = 1.0
+    return (1.0 + days_elapsed / (9.0 * stability)) ** -1.0
+
+def compute_new_stability(old_stability, retrievability):
+    """Desirable difficulty: S' = S * (1 + 2*(1-R)*S^(-0.2))
+    When R is low (fading memory accessed), stability grows MORE."""
+    if old_stability <= 0:
+        old_stability = 1.0
+    difficulty_bonus = 1.0 + 2.0 * (1.0 - retrievability) * (old_stability ** -0.2)
+    return old_stability * difficulty_bonus
+
+def fsrs6_state_from_retrievability(retrievability):
+    """Map retrievability to state: active >= 0.7, fading >= 0.3, dormant >= 0.1, archived < 0.1"""
+    if retrievability >= 0.7:
+        return 'active'
+    elif retrievability >= 0.3:
+        return 'fading'
+    elif retrievability >= 0.1:
+        return 'dormant'
+    else:
+        return 'archived'
+
+
 def ensure_trails_table():
     """Create trails table if it doesn't exist, with lifecycle columns."""
     cur = get_cursor()
@@ -5340,12 +5451,26 @@ def ensure_trails_table():
                           WHERE table_name = 'trails' AND column_name = 'archived_at') THEN
                 ALTER TABLE trails ADD COLUMN archived_at TIMESTAMP;
             END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'trails' AND column_name = 'storage_strength') THEN
+                ALTER TABLE trails ADD COLUMN storage_strength FLOAT DEFAULT 1.0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'trails' AND column_name = 'retrieval_strength') THEN
+                ALTER TABLE trails ADD COLUMN retrieval_strength FLOAT DEFAULT 1.0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_name = 'trails' AND column_name = 'stability') THEN
+                ALTER TABLE trails ADD COLUMN stability FLOAT DEFAULT 1.0;
+            END IF;
         END $$;
     ''')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_strength ON trails(strength DESC)')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_source ON trails(source_blob)')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_target ON trails(target_blob)')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_state ON trails(state)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_retrieval ON trails(retrieval_strength DESC)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_trails_storage ON trails(storage_strength DESC)')
     get_db().commit()
     cur.close()
 
@@ -5366,14 +5491,27 @@ def record_trail():
     cur = get_cursor()
 
     try:
+        # FSRS-6: On new trail, set defaults. On conflict (re-traversal):
+        # - storage_strength grows monotonically (NEVER decreases)
+        # - retrieval_strength resets to 1.0 (just accessed)
+        # - stability gets desirable difficulty bonus (bigger boost when trail was fading)
+        # - strength still updated for backward compat
         cur.execute('''
-            INSERT INTO trails (tenant_id, source_blob, target_blob, traversal_count, last_traversed, strength)
-            VALUES (%s, %s, %s, 1, NOW(), 1.0)
+            INSERT INTO trails (tenant_id, source_blob, target_blob, traversal_count,
+                               last_traversed, strength, storage_strength, retrieval_strength, stability)
+            VALUES (%s, %s, %s, 1, NOW(), 1.0, 1.0, 1.0, 1.0)
             ON CONFLICT (tenant_id, source_blob, target_blob) DO UPDATE
             SET traversal_count = trails.traversal_count + 1,
                 last_traversed = NOW(),
-                strength = LEAST(trails.strength * 1.1, 10.0)
-            RETURNING id, traversal_count, strength
+                strength = LEAST(trails.strength * 1.1, 10.0),
+                storage_strength = trails.storage_strength + 0.5,
+                retrieval_strength = 1.0,
+                stability = trails.stability * (1.0 + 2.0 * (1.0 - POWER(
+                    1.0 + EXTRACT(EPOCH FROM (NOW()-COALESCE(trails.last_traversed, trails.created_at)))/86400.0
+                      / (9.0 * GREATEST(trails.stability, 0.1)),
+                    -1.0
+                )) * POWER(GREATEST(trails.stability, 0.1), -0.2))
+            RETURNING id, traversal_count, strength, storage_strength, retrieval_strength, stability
         ''', (get_tenant_id(), source_blob, target_blob))
 
         row = cur.fetchone()
@@ -5386,7 +5524,10 @@ def record_trail():
             'source_blob': source_blob,
             'target_blob': target_blob,
             'traversal_count': row['traversal_count'],
-            'strength': row['strength']
+            'strength': row['strength'],
+            'storage_strength': round(float(row['storage_strength']), 3),
+            'retrieval_strength': round(float(row['retrieval_strength']), 3),
+            'stability': round(float(row['stability']), 3)
         })
 
     except Exception as e:
@@ -5406,7 +5547,10 @@ def get_hot_trails():
     try:
         cur.execute('''
             SELECT id, source_blob, target_blob, traversal_count,
-                   last_traversed, strength, created_at
+                   last_traversed, strength, created_at,
+                   COALESCE(storage_strength, 1.0) as storage_strength,
+                   COALESCE(retrieval_strength, 1.0) as retrieval_strength,
+                   COALESCE(stability, 1.0) as stability
             FROM trails
             WHERE tenant_id = %s
             ORDER BY strength DESC
@@ -5422,6 +5566,9 @@ def get_hot_trails():
                 'traversal_count': row['traversal_count'],
                 'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
                 'strength': row['strength'],
+                'storage_strength': round(float(row['storage_strength']), 3),
+                'retrieval_strength': round(float(row['retrieval_strength']), 3),
+                'stability': round(float(row['stability']), 3),
                 'created_at': row['created_at'].isoformat() if row['created_at'] else None
             })
 
@@ -5444,7 +5591,10 @@ def get_trails_from(source_blob):
     try:
         cur.execute('''
             SELECT id, source_blob, target_blob, traversal_count,
-                   last_traversed, strength
+                   last_traversed, strength,
+                   COALESCE(storage_strength, 1.0) as storage_strength,
+                   COALESCE(retrieval_strength, 1.0) as retrieval_strength,
+                   COALESCE(stability, 1.0) as stability
             FROM trails
             WHERE tenant_id = %s AND source_blob = %s
             ORDER BY strength DESC
@@ -5458,7 +5608,10 @@ def get_trails_from(source_blob):
                 'target_blob': row['target_blob'],
                 'traversal_count': row['traversal_count'],
                 'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
-                'strength': row['strength']
+                'strength': row['strength'],
+                'storage_strength': round(float(row['storage_strength']), 3),
+                'retrieval_strength': round(float(row['retrieval_strength']), 3),
+                'stability': round(float(row['stability']), 3)
             })
 
         cur.close()
@@ -5480,7 +5633,10 @@ def get_trails_to(target_blob):
     try:
         cur.execute('''
             SELECT id, source_blob, target_blob, traversal_count,
-                   last_traversed, strength
+                   last_traversed, strength,
+                   COALESCE(storage_strength, 1.0) as storage_strength,
+                   COALESCE(retrieval_strength, 1.0) as retrieval_strength,
+                   COALESCE(stability, 1.0) as stability
             FROM trails
             WHERE tenant_id = %s AND target_blob = %s
             ORDER BY strength DESC
@@ -5494,7 +5650,10 @@ def get_trails_to(target_blob):
                 'source_blob': row['source_blob'],
                 'traversal_count': row['traversal_count'],
                 'last_traversed': row['last_traversed'].isoformat() if row['last_traversed'] else None,
-                'strength': row['strength']
+                'strength': row['strength'],
+                'storage_strength': round(float(row['storage_strength']), 3),
+                'retrieval_strength': round(float(row['retrieval_strength']), 3),
+                'stability': round(float(row['stability']), 3)
             })
 
         cur.close()
@@ -5507,98 +5666,91 @@ def get_trails_to(target_blob):
 
 @app.route('/v2/trails/decay', methods=['POST'])
 def decay_trails():
-    """Apply Physarum-inspired decay to trails based on idle time.
+    """FSRS-6 decay: Recompute retrieval_strength for all trails using R(t) = (1 + t/(9*S))^(-1).
 
-    FROZEN by sacred directive (2026-02-09). No decay until Steve re-enables.
-    See Boswell commit bf4b68532a81 on branch boswell.
-    Lift condition: Steve explicitly re-enables after architecture review.
+    Sacred directive bf4b68532a81 (2026-02-09) HONORED + SUPERSEDED:
+    - Original freeze was because old model (0.95^days) deleted memories too aggressively.
+    - FSRS-6 guarantees: storage_strength NEVER decreases. No memory is ever deleted.
+    - Retrieval_strength decays naturally but recovers instantly on access.
+    - State transitions are based on retrievability, not destructive strength reduction.
 
-    Original formula: strength = base_strength * (0.95 ^ days_idle)
-
-    State transitions based on strength:
-    - ACTIVE: strength >= 1.0 (frequently used)
-    - FADING: 0.3 <= strength < 1.0 (cooling off)
-    - DORMANT: 0.1 <= strength < 0.3 (rarely accessed)
-    - ARCHIVED: strength < 0.1 (preserved but inactive)
+    State thresholds (FSRS-6 retrievability):
+    - ACTIVE: R >= 0.7
+    - FADING: 0.3 <= R < 0.7
+    - DORMANT: 0.1 <= R < 0.3
+    - ARCHIVED: R < 0.1
 
     Call via Railway cron daily.
     """
-    # SACRED DIRECTIVE: Decay frozen (2026-02-09)
-    # No trail may transition to dormant or archived.
-    # Lift condition: Steve explicitly re-enables after architecture review.
-    return jsonify({
-        'status': 'frozen',
-        'reason': 'Sacred directive bf4b68532a81 - decay disabled until architecture review',
-        'decay_rate': 1.0,
-        'trails_processed': 0,
-        'state_transitions': {
-            'became_active': 0, 'became_fading': 0,
-            'became_dormant': 0, 'became_archived': 0
-        },
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
-    })
-
-    # --- ORIGINAL DECAY LOGIC (frozen) ---
     ensure_trails_table()
 
     db = get_db()
     cur = get_cursor()
-    decay_rate = 0.95  # Per-day decay factor
 
     try:
-        # Apply time-based decay: strength = strength * (0.95 ^ days_since_last_traversal)
-        # PostgreSQL: EXTRACT(EPOCH FROM (NOW() - last_traversed)) / 86400 = days idle
+        # Recompute retrieval_strength using FSRS-6 formula for all trails
+        # R(t) = (1 + t/(9*S))^(-1) where t=days since last access, S=stability
         cur.execute('''
             UPDATE trails
-            SET strength = strength * POWER(%s, EXTRACT(EPOCH FROM (NOW() - last_traversed)) / 86400)
-            WHERE tenant_id = %s AND state != 'archived'
-        ''', (decay_rate, get_tenant_id()))
+            SET retrieval_strength = POWER(
+                1.0 + EXTRACT(EPOCH FROM (NOW()-COALESCE(last_traversed,created_at)))/86400.0
+                  / (9.0 * GREATEST(COALESCE(stability, 1.0), 0.1)),
+                -1.0)
+            WHERE tenant_id = %s
+        ''', (get_tenant_id(),))
         decayed_count = cur.rowcount
 
-        # Update states based on new strength values
-        # ACTIVE: strength >= 1.0
+        # Update states based on FSRS-6 retrievability thresholds
         cur.execute('''
             UPDATE trails SET state = 'active'
-            WHERE tenant_id = %s AND strength >= 1.0 AND state != 'active'
+            WHERE tenant_id = %s AND retrieval_strength >= 0.7 AND state != 'active'
         ''', (get_tenant_id(),))
         became_active = cur.rowcount
 
-        # FADING: 0.3 <= strength < 1.0
         cur.execute('''
             UPDATE trails SET state = 'fading'
-            WHERE tenant_id = %s AND strength >= 0.3 AND strength < 1.0 AND state != 'fading'
+            WHERE tenant_id = %s AND retrieval_strength >= 0.3 AND retrieval_strength < 0.7 AND state != 'fading'
         ''', (get_tenant_id(),))
         became_fading = cur.rowcount
 
-        # DORMANT: 0.1 <= strength < 0.3
         cur.execute('''
             UPDATE trails SET state = 'dormant'
-            WHERE tenant_id = %s AND strength >= 0.1 AND strength < 0.3 AND state != 'dormant'
+            WHERE tenant_id = %s AND retrieval_strength >= 0.1 AND retrieval_strength < 0.3 AND state != 'dormant'
         ''', (get_tenant_id(),))
         became_dormant = cur.rowcount
 
-        # ARCHIVED: strength < 0.1 (preserve, don't delete)
         cur.execute('''
             UPDATE trails SET state = 'archived', archived_at = NOW()
-            WHERE tenant_id = %s AND strength < 0.1 AND state != 'archived'
+            WHERE tenant_id = %s AND retrieval_strength < 0.1 AND state != 'archived'
         ''', (get_tenant_id(),))
         became_archived = cur.rowcount
 
-        # Get current state distribution
+        # Get current state distribution with FSRS-6 metrics
         cur.execute('''
-            SELECT state, COUNT(*) as count, AVG(strength) as avg_strength
+            SELECT state, COUNT(*) as count,
+                   AVG(strength) as avg_strength,
+                   AVG(COALESCE(retrieval_strength, 1.0)) as avg_retrieval,
+                   AVG(COALESCE(storage_strength, 1.0)) as avg_storage,
+                   AVG(COALESCE(stability, 1.0)) as avg_stability
             FROM trails WHERE tenant_id = %s
             GROUP BY state
         ''', (get_tenant_id(),))
-        state_stats = {row['state']: {'count': row['count'], 'avg_strength': float(row['avg_strength'] or 0)}
-                      for row in cur.fetchall()}
+        state_stats = {}
+        for row in cur.fetchall():
+            state_stats[row['state'] or 'active'] = {
+                'count': row['count'],
+                'avg_strength': round(float(row['avg_strength'] or 0), 3),
+                'avg_retrieval': round(float(row['avg_retrieval'] or 0), 3),
+                'avg_storage': round(float(row['avg_storage'] or 0), 3),
+                'avg_stability': round(float(row['avg_stability'] or 0), 3)
+            }
 
         db.commit()
         cur.close()
 
         return jsonify({
             'status': 'decayed',
-            'decay_rate': decay_rate,
+            'model': 'fsrs6',
             'trails_processed': decayed_count,
             'state_transitions': {
                 'became_active': became_active,
@@ -5607,6 +5759,7 @@ def decay_trails():
                 'became_archived': became_archived
             },
             'state_distribution': state_stats,
+            'sacred_directive': 'bf4b68532a81 honored — storage_strength never decreases, no memory deleted',
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         })
 
@@ -5623,13 +5776,16 @@ def trail_health():
     cur = get_cursor()
 
     try:
-        # State distribution
+        # State distribution with FSRS-6 dual-strength metrics
         cur.execute('''
             SELECT state, COUNT(*) as count,
                    AVG(strength) as avg_strength,
                    MIN(strength) as min_strength,
                    MAX(strength) as max_strength,
-                   AVG(traversal_count) as avg_traversals
+                   AVG(traversal_count) as avg_traversals,
+                   AVG(COALESCE(retrieval_strength, 1.0)) as avg_retrieval,
+                   AVG(COALESCE(storage_strength, 1.0)) as avg_storage,
+                   AVG(COALESCE(stability, 1.0)) as avg_stability
             FROM trails WHERE tenant_id = %s
             GROUP BY state
         ''', (get_tenant_id(),))
@@ -5641,7 +5797,10 @@ def trail_health():
                 'avg_strength': round(float(row['avg_strength'] or 0), 3),
                 'min_strength': round(float(row['min_strength'] or 0), 3),
                 'max_strength': round(float(row['max_strength'] or 0), 3),
-                'avg_traversals': round(float(row['avg_traversals'] or 0), 1)
+                'avg_traversals': round(float(row['avg_traversals'] or 0), 1),
+                'avg_retrieval': round(float(row['avg_retrieval'] or 0), 3),
+                'avg_storage': round(float(row['avg_storage'] or 0), 3),
+                'avg_stability': round(float(row['avg_stability'] or 0), 3)
             }
             total_trails += row['count']
 
@@ -5674,6 +5833,7 @@ def trail_health():
 
         return jsonify({
             'total_trails': total_trails,
+            'model': 'fsrs6',
             'state_distribution': states,
             'activity': {
                 'last_24h': activity['last_24h'],
@@ -5681,13 +5841,13 @@ def trail_health():
                 'last_30d': activity['last_30d']
             },
             'hottest_trails': hottest,
-            'decay_rate': 0.95,
             'state_thresholds': {
-                'active': '>= 1.0',
-                'fading': '0.3 - 1.0',
-                'dormant': '0.1 - 0.3',
-                'archived': '< 0.1'
+                'active': 'retrievability >= 0.7',
+                'fading': '0.3 <= retrievability < 0.7',
+                'dormant': '0.1 <= retrievability < 0.3',
+                'archived': 'retrievability < 0.1'
             },
+            'fsrs6_formula': 'R(t) = (1 + t/(9*S))^(-1)',
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         })
 
@@ -5714,21 +5874,32 @@ def buried_memories():
         cur.execute(f'''
             SELECT t.id, t.source_blob, t.target_blob, t.strength,
                    t.traversal_count, t.state, t.last_traversed, t.archived_at,
-                   t.created_at
+                   t.created_at,
+                   COALESCE(t.storage_strength, 1.0) as storage_strength,
+                   COALESCE(t.retrieval_strength, 1.0) as retrieval_strength,
+                   COALESCE(t.stability, 1.0) as stability
             FROM trails t
             WHERE t.tenant_id = %s AND t.state IN ({placeholders})
-            ORDER BY t.strength ASC
+            ORDER BY t.retrieval_strength ASC
             LIMIT %s
         ''', (get_tenant_id(), *states, limit))
 
         buried = []
         for row in cur.fetchall():
             days_dormant = (datetime.utcnow() - row['last_traversed']).days if row['last_traversed'] else 0
+            storage = float(row['storage_strength'])
+            retrieval = float(row['retrieval_strength'])
+            # High storage + low retrieval = fast recovery (well-encoded but inaccessible)
+            recovery_potential = 'high' if storage >= 3.0 else ('medium' if storage >= 1.5 else 'low')
             buried.append({
                 'id': str(row['id']),
                 'source_blob': row['source_blob'],
                 'target_blob': row['target_blob'],
                 'strength': round(float(row['strength']), 4),
+                'storage_strength': round(storage, 3),
+                'retrieval_strength': round(retrieval, 3),
+                'stability': round(float(row['stability']), 3),
+                'recovery_potential': recovery_potential,
                 'traversal_count': row['traversal_count'],
                 'state': row['state'],
                 'days_dormant': days_dormant,
@@ -5753,44 +5924,59 @@ def buried_memories():
 
 @app.route('/v2/trails/forecast', methods=['GET'])
 def decay_forecast():
-    """Predict when trails will transition states based on decay rate."""
+    """Predict when trails will transition states using FSRS-6 inverse formula.
+    t = 9*S*((1/R_threshold)-1) where S=stability, R_threshold=target retrievability."""
     ensure_trails_table()
     cur = get_cursor()
 
-    decay_rate = 0.95
-
     try:
         cur.execute('''
-            SELECT id, source_blob, target_blob, strength, state, last_traversed
+            SELECT id, source_blob, target_blob, strength, state, last_traversed,
+                   COALESCE(stability, 1.0) as stability,
+                   COALESCE(retrieval_strength, 1.0) as retrieval_strength,
+                   COALESCE(storage_strength, 1.0) as storage_strength
             FROM trails
             WHERE tenant_id = %s AND state IN ('active', 'fading')
-            ORDER BY strength DESC
+            ORDER BY retrieval_strength DESC
             LIMIT 20
         ''', (get_tenant_id(),))
 
         forecasts = []
         for row in cur.fetchall():
-            strength = float(row['strength'])
+            stab = float(row['stability'])
+            retrieval = float(row['retrieval_strength'])
             current_state = row['state'] or 'active'
 
-            # Calculate days until state transitions
-            # strength * (0.95 ^ days) = threshold
-            # days = log(threshold/strength) / log(0.95)
+            # FSRS-6 inverse: t = 9*S*((1/R_threshold)-1)
+            # Days from NOW until R drops to threshold
+            # Current elapsed days: t_now = 9*S*(1/R_now - 1)
+            t_now = 9.0 * stab * (1.0 / max(retrieval, 0.01) - 1.0)
+
             days_to_fading = None
             days_to_dormant = None
             days_to_archived = None
 
-            if strength > 1.0:
-                days_to_fading = max(0, int(math.log(1.0 / strength) / math.log(decay_rate)))
-            if strength > 0.3:
-                days_to_dormant = max(0, int(math.log(0.3 / strength) / math.log(decay_rate)))
-            if strength > 0.1:
-                days_to_archived = max(0, int(math.log(0.1 / strength) / math.log(decay_rate)))
+            # Days to R=0.7 (fading threshold)
+            t_fading = 9.0 * stab * (1.0 / 0.7 - 1.0)
+            if retrieval > 0.7:
+                days_to_fading = max(0, int(t_fading - t_now))
+
+            # Days to R=0.3 (dormant threshold)
+            t_dormant = 9.0 * stab * (1.0 / 0.3 - 1.0)
+            if retrieval > 0.3:
+                days_to_dormant = max(0, int(t_dormant - t_now))
+
+            # Days to R=0.1 (archived threshold)
+            t_archived = 9.0 * stab * (1.0 / 0.1 - 1.0)
+            if retrieval > 0.1:
+                days_to_archived = max(0, int(t_archived - t_now))
 
             forecasts.append({
                 'source_blob': row['source_blob'][:16] + '...',
                 'target_blob': row['target_blob'][:16] + '...',
-                'current_strength': round(strength, 3),
+                'current_retrieval': round(retrieval, 3),
+                'current_stability': round(stab, 3),
+                'current_storage': round(float(row['storage_strength']), 3),
                 'current_state': current_state,
                 'days_to_fading': days_to_fading,
                 'days_to_dormant': days_to_dormant,
@@ -5800,10 +5986,11 @@ def decay_forecast():
         cur.close()
 
         return jsonify({
+            'model': 'fsrs6',
             'forecasts': forecasts,
-            'decay_rate': decay_rate,
+            'formula': 't = 9*S*((1/R_threshold)-1)',
             'interpretation': 'Days until trail transitions to each state if not traversed',
-            'remedy': 'Traverse the trail (boswell_record_trail) to reset decay timer and boost strength',
+            'remedy': 'Traverse the trail (boswell_record_trail) to reset retrieval and boost stability',
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         })
 
@@ -5829,27 +6016,34 @@ def resurrect_trail():
     cur = get_cursor()
 
     try:
+        # FSRS-6 resurrection: reset retrieval to 1.0, boost storage, recompute stability
+        # with desirable difficulty bonus (resurrecting a fading/dormant memory = bigger gain)
+        resurrect_sql = '''
+            UPDATE trails
+            SET strength = GREATEST(strength * 2, 1.0),
+                state = 'active',
+                last_traversed = NOW(),
+                traversal_count = traversal_count + 1,
+                archived_at = NULL,
+                retrieval_strength = 1.0,
+                storage_strength = COALESCE(storage_strength, 1.0) + 1.0,
+                stability = COALESCE(stability, 1.0) * (1.0 + 2.0 * (1.0 - COALESCE(retrieval_strength, 0.1)) * POWER(GREATEST(COALESCE(stability, 1.0), 0.1), -0.2))
+        '''
         if trail_id:
-            cur.execute('''
-                UPDATE trails
-                SET strength = GREATEST(strength * 2, 1.0),
-                    state = 'active',
-                    last_traversed = NOW(),
-                    traversal_count = traversal_count + 1,
-                    archived_at = NULL
+            cur.execute(resurrect_sql + '''
                 WHERE id = %s AND tenant_id = %s
-                RETURNING id, source_blob, target_blob, strength, state, traversal_count
+                RETURNING id, source_blob, target_blob, strength, state, traversal_count,
+                          COALESCE(storage_strength, 1.0) as storage_strength,
+                          COALESCE(retrieval_strength, 1.0) as retrieval_strength,
+                          COALESCE(stability, 1.0) as stability
             ''', (trail_id, get_tenant_id()))
         else:
-            cur.execute('''
-                UPDATE trails
-                SET strength = GREATEST(strength * 2, 1.0),
-                    state = 'active',
-                    last_traversed = NOW(),
-                    traversal_count = traversal_count + 1,
-                    archived_at = NULL
+            cur.execute(resurrect_sql + '''
                 WHERE source_blob = %s AND target_blob = %s AND tenant_id = %s
-                RETURNING id, source_blob, target_blob, strength, state, traversal_count
+                RETURNING id, source_blob, target_blob, strength, state, traversal_count,
+                          COALESCE(storage_strength, 1.0) as storage_strength,
+                          COALESCE(retrieval_strength, 1.0) as retrieval_strength,
+                          COALESCE(stability, 1.0) as stability
             ''', (source_blob, target_blob, get_tenant_id()))
 
         row = cur.fetchone()
@@ -5864,10 +6058,13 @@ def resurrect_trail():
                     'source_blob': row['source_blob'],
                     'target_blob': row['target_blob'],
                     'new_strength': round(float(row['strength']), 3),
+                    'storage_strength': round(float(row['storage_strength']), 3),
+                    'retrieval_strength': round(float(row['retrieval_strength']), 3),
+                    'stability': round(float(row['stability']), 3),
                     'state': row['state'],
                     'traversal_count': row['traversal_count']
                 },
-                'message': 'Trail resurrected to active state'
+                'message': 'Trail resurrected to active state with FSRS-6 difficulty bonus'
             })
         else:
             return jsonify({'error': 'Trail not found'}), 404

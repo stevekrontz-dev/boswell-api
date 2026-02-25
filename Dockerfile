@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all Python source files
+COPY VERSION .
 COPY app.py .
 COPY audit_service.py .
 COPY encryption_service.py .
