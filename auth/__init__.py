@@ -142,9 +142,15 @@ def validate_auth0_token(token: str) -> dict:
             audience=AUTH0_AUDIENCE,
             issuer=f'https://{AUTH0_DOMAIN}/'
         )
+        tenant_id = payload.get('https://boswell.app/tenant_id')
+        if not tenant_id:
+            # Auth0 token without tenant claim — deny, don't fall through to Steve's data
+            import sys
+            print(f'[AUTH] Auth0 token valid but missing tenant_id claim for {payload.get("email")}', file=sys.stderr)
+            return None  # Will fall through to denial in check_mcp_auth
         return {
             'user_id': payload['sub'],
-            'tenant_id': payload.get('https://boswell.app/tenant_id', DEFAULT_TENANT),
+            'tenant_id': tenant_id,
             'scope': payload.get('scope', ''),
             'email': payload.get('email'),
             'source': 'auth0'
@@ -172,8 +178,14 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         g.mcp_auth = {'source': 'disabled', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Skip discovery/health (including daemon health cron)
-    if request.path in ['/', '/health', '/v2/health', '/v2/health/daemon', '/v2/health/ping', '/api/health', '/.well-known/oauth-protected-resource']:
+    # Skip discovery/health/public endpoints
+    PUBLIC_PATHS = [
+        '/', '/health', '/v2/health', '/v2/health/daemon', '/v2/health/ping',
+        '/api/health', '/.well-known/oauth-protected-resource',
+        '/v2/onboard/provision',  # Public signup — no auth required
+        '/v2/auth/register',      # Public registration
+    ]
+    if request.path in PUBLIC_PATHS:
         return None
 
     # Internal request (stdio) - CRITICAL: protects CC/Desktop
@@ -187,9 +199,14 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         from auth.api_keys import validate_api_key
         key_info = validate_api_key(api_key, get_cursor_func, get_db_func)
         if key_info:
+            tenant_id = key_info.get('tenant_id')
+            if not tenant_id:
+                # API key exists but has no tenant — deny, don't fall through to Steve's data
+                print(f'[AUTH] API key valid but missing tenant_id, denying', file=sys.stderr)
+                return jsonify({'error': 'forbidden', 'error_description': 'API key not associated with a tenant'}), 403
             g.mcp_auth = {
                 'source': 'api_key',
-                'tenant_id': key_info.get('tenant_id') or DEFAULT_TENANT,
+                'tenant_id': tenant_id,
                 'user_id': key_info.get('user_id'),
             }
             return None

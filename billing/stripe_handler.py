@@ -79,17 +79,14 @@ def stripe_webhook():
 def handle_checkout_completed(session):
     """
     Handle successful checkout session.
-    AUTO-PROVISIONS everything for self-service:
-    1. Creates tenant
-    2. Generates API key
-    3. Creates default branches
+    AUTO-PROVISIONS everything for self-service using shared provisioning logic:
+    1. Creates tenant (via provision_tenant)
+    2. Generates API key (via provision_tenant)
+    3. Creates default branches (via provision_tenant)
     4. Updates user status to active
     5. Creates subscription record
     """
-    import uuid
-    import secrets
-    import hashlib
-    from auth import encrypt_api_key
+    from billing.provisioning import provision_tenant
     get_db, get_cursor, DEFAULT_TENANT = get_db_functions()
 
     customer_id = session.get('customer')
@@ -129,42 +126,29 @@ def handle_checkout_completed(session):
         email = user['email']
         existing_tenant_id = user.get('tenant_id')
 
-        # Only create tenant if user doesn't already have one
+        # Only provision tenant+branches if user doesn't already have one
         if existing_tenant_id:
             tenant_id = existing_tenant_id
             print(f"[STRIPE] User {user_id} already has tenant {tenant_id}", flush=True)
+            # Still need to generate a new API key for this checkout
+            import secrets
+            import hashlib
+            import uuid
+            from auth import encrypt_api_key
+            api_key = 'bos_' + secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+            key_id = str(uuid.uuid4())
+            cur.execute(
+                '''INSERT INTO api_keys (id, tenant_id, user_id, key_hash, name, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s)''',
+                (key_id, tenant_id, user_id, key_hash, 'Auto-generated', now)
+            )
+            api_key_encrypted = encrypt_api_key(api_key)
         else:
-            # CREATE TENANT
-            tenant_id = str(uuid.uuid4())
-            cur.execute('''
-                INSERT INTO tenants (id, name, created_at)
-                VALUES (%s, %s, %s)
-            ''', (tenant_id, email, now))
-            print(f"[STRIPE] Created tenant {tenant_id} for {email}", flush=True)
-
-            # CREATE DEFAULT BRANCHES
-            default_branches = ['command-center', 'work', 'personal', 'research']
-            for branch_name in default_branches:
-                cur.execute('''
-                    INSERT INTO branches (tenant_id, name, head_commit, created_at)
-                    VALUES (%s, %s, 'GENESIS', %s)
-                ''', (tenant_id, branch_name, now))
-            print(f"[STRIPE] Created {len(default_branches)} default branches", flush=True)
-
-        # GENERATE API KEY
-        api_key = 'bos_' + secrets.token_urlsafe(32)
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-
-        # Store API key hash in api_keys table
-        key_id = str(uuid.uuid4())
-        cur.execute('''
-            INSERT INTO api_keys (id, tenant_id, user_id, key_hash, name, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        ''', (key_id, tenant_id, user_id, key_hash, 'Auto-generated', now))
-        print(f"[STRIPE] Created API key for user {user_id}", flush=True)
-
-        # Encrypt API key for display in dashboard
-        api_key_encrypted = encrypt_api_key(api_key)
+            # Use shared provisioning for tenant + branches + API key
+            result = provision_tenant(cur, email, user_id=user_id)
+            tenant_id = result['tenant_id']
+            api_key_encrypted = result['api_key_encrypted']
 
         # UPDATE USER with tenant, subscription, status, and encrypted API key
         cur.execute('''

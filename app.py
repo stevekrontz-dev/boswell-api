@@ -23,6 +23,48 @@ import math
 import threading
 import numpy as np
 
+# Anthropic for HyDE query expansion (opt-in)
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+_anthropic_client = None
+
+def get_anthropic_client():
+    """Lazy init Anthropic client for HyDE."""
+    global _anthropic_client
+    if _anthropic_client is None and ANTHROPIC_API_KEY:
+        try:
+            import anthropic
+            _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        except ImportError:
+            print("[HYDE] anthropic package not installed", file=sys.stderr)
+    return _anthropic_client
+
+def generate_hyde_document(query: str) -> str:
+    """Generate a Hypothetical Document Embedding (HyDE) for a search query.
+
+    Asks Haiku to write a short paragraph that would be a perfect answer
+    to the query, then we embed THAT instead of the raw query.
+    This improves recall for conceptual/fuzzy queries.
+
+    Returns the hypothetical document text, or None if unavailable.
+    """
+    client = get_anthropic_client()
+    if not client:
+        return None
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": f"Generate a short paragraph (2-3 sentences) that would be a perfect memory entry answering this query. Write it as if it's a factual record, not a question. Query: {query}"
+            }]
+        )
+        return response.content[0].text
+    except Exception as e:
+        import sys
+        print(f"[HYDE] Error generating hypothetical document: {e}", file=sys.stderr)
+        return None
+
 # OpenAI for embeddings (v3)
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 openai_client = None
@@ -1293,18 +1335,264 @@ def get_log():
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
+def reciprocal_rank_fusion(keyword_results, semantic_results, k=60):
+    """Merge two ranked lists using Reciprocal Rank Fusion.
+
+    RRF score = sum(1 / (k + rank_i)) for each list where item appears.
+    k=60 is the standard constant from the original RRF paper.
+    """
+    scores = {}
+
+    for rank, item in enumerate(keyword_results):
+        blob_hash = item['blob_hash']
+        scores[blob_hash] = scores.get(blob_hash, 0) + 1 / (k + rank + 1)
+
+    for rank, item in enumerate(semantic_results):
+        blob_hash = item['blob_hash']
+        scores[blob_hash] = scores.get(blob_hash, 0) + 1 / (k + rank + 1)
+
+    # Merge results, keeping full data from whichever list had the item
+    all_items = {}
+    for item in keyword_results + semantic_results:
+        if item['blob_hash'] not in all_items:
+            all_items[item['blob_hash']] = item
+
+    # Sort by RRF score descending
+    sorted_hashes = sorted(scores.keys(), key=lambda h: scores[h], reverse=True)
+    return [
+        {**all_items[h], 'rrf_score': round(scores[h], 6)}
+        for h in sorted_hashes if h in all_items
+    ]
+
+
+def bm25_search(cur, query, tenant_id, limit=20):
+    """Full-text search using PostgreSQL ts_rank (BM25-like scoring).
+
+    Uses plainto_tsquery for robust query parsing (handles special characters).
+    Returns results as list of dicts matching the search result format.
+    Tenant-scoped via explicit WHERE clause.
+    """
+    ensure_deprecated_commits_table()
+
+    cur.execute("""
+        SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
+               c.commit_hash, c.message, c.author,
+               ts_rank(b.search_vector, plainto_tsquery('english', %s)) as rank
+        FROM blobs b
+        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+        LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+        WHERE b.tenant_id = %s
+          AND dc.commit_hash IS NULL
+          AND b.search_vector IS NOT NULL
+          AND b.search_vector @@ plainto_tsquery('english', %s)
+        ORDER BY rank DESC
+        LIMIT %s
+    """, (query, tenant_id, query, limit))
+
+    results = []
+    for row in cur.fetchall():
+        content = row['content']
+        results.append({
+            'blob_hash': row['blob_hash'],
+            'content': content[:500] + '...' if len(content) > 500 else content,
+            'content_type': row['content_type'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'commit_hash': row['commit_hash'],
+            'message': row['message'],
+            'author': row['author'],
+            'source': 'permanent',
+            'bm25_rank': float(row['rank'])
+        })
+    return results
+
+
+def _semantic_search_internal(cur, query, tenant_id, limit=20):
+    """Internal semantic search returning results as list of dicts.
+
+    Separated from the /v2/semantic-search endpoint so hybrid search
+    can reuse it without going through Flask request/response cycle.
+    """
+    if not OPENAI_API_KEY:
+        return []
+
+    query_embedding = generate_embedding(query)
+    if not query_embedding:
+        return []
+
+    ensure_deprecated_commits_table()
+
+    if HIPPOCAMPAL_ENABLED:
+        cur.execute("""
+            SELECT * FROM (
+                SELECT b.blob_hash, b.content, b.content_type, b.created_at,
+                       c.commit_hash, c.message, c.author,
+                       b.embedding <=> %s::vector AS distance,
+                       'permanent' as source
+                FROM blobs b
+                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+                WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
+
+                UNION ALL
+
+                SELECT cm.id::text as blob_hash, cm.summary as content, 'staged' as content_type,
+                       cm.created_at, NULL as commit_hash, cm.message,
+                       cm.source_instance as author,
+                       (cm.embedding <=> %s::vector) -
+                         CASE WHEN cm.created_at > NOW() - INTERVAL '24 hours' THEN 0.1
+                              WHEN cm.created_at > NOW() - INTERVAL '72 hours' THEN 0.05
+                              ELSE 0 END AS distance,
+                       'staged' as source
+                FROM candidate_memories cm
+                WHERE cm.embedding IS NOT NULL AND cm.tenant_id = %s
+                  AND cm.status IN ('active', 'cooling')
+            ) combined
+            ORDER BY distance
+            LIMIT %s
+        """, (query_embedding, tenant_id, query_embedding, tenant_id, limit))
+    else:
+        cur.execute("""
+            SELECT b.blob_hash, b.content, b.content_type, b.created_at,
+                   c.commit_hash, c.message, c.author,
+                   b.embedding <=> %s::vector AS distance,
+                   'permanent' as source
+            FROM blobs b
+            JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+            JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+            LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+            WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
+            ORDER BY distance
+            LIMIT %s
+        """, (query_embedding, tenant_id, limit))
+
+    results = []
+    for row in cur.fetchall():
+        content = row['content']
+        source = 'permanent'
+        try:
+            source = row['source']
+        except (KeyError, TypeError):
+            pass
+        results.append({
+            'blob_hash': row['blob_hash'],
+            'content': content[:500] + '...' if len(content) > 500 else content,
+            'content_type': row['content_type'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'commit_hash': row['commit_hash'],
+            'message': row['message'],
+            'author': row['author'],
+            'distance': float(row['distance']),
+            'source': source
+        })
+    return results
+
+
 @app.route('/v2/search', methods=['GET'])
 def search_memories():
-    """Search memories across branches."""
+    """Search memories across branches.
+
+    Query params:
+    - q: Search query (required)
+    - type: Filter by content_type
+    - limit: Max results (default: 20)
+    - mode: Search mode - 'keyword' (default, LIKE), 'semantic', 'hybrid' (BM25 + vector RRF)
+    """
     if HIPPOCAMPAL_ENABLED:
         ensure_hippocampal_tables()
     query = request.args.get('q', '')
     memory_type = request.args.get('type')
     limit = request.args.get('limit', 20, type=int)
+    mode = request.args.get('mode', 'keyword')
 
     if not query:
         return jsonify({'error': 'Search query required'}), 400
 
+    # --- HYBRID MODE: BM25 + semantic via Reciprocal Rank Fusion ---
+    if mode == 'hybrid':
+        ensure_deprecated_commits_table()
+        cur = get_cursor()
+        tenant_id = get_tenant_id()
+
+        # Run both searches with 2x limit to get good fusion candidates
+        try:
+            keyword_results = bm25_search(cur, query, tenant_id, limit=limit * 2)
+        except Exception as e:
+            print(f"[HYBRID] BM25 search error (falling back to empty): {e}", file=sys.stderr)
+            keyword_results = []
+
+        try:
+            semantic_results = _semantic_search_internal(cur, query, tenant_id, limit=limit * 2)
+        except Exception as e:
+            print(f"[HYBRID] Semantic search error (falling back to empty): {e}", file=sys.stderr)
+            semantic_results = []
+
+        # Fuse and trim
+        results = reciprocal_rank_fusion(keyword_results, semantic_results)[:limit]
+
+        # Also search staged candidates if hippocampal enabled
+        if HIPPOCAMPAL_ENABLED:
+            try:
+                remaining = limit - len(results)
+                if remaining > 0:
+                    cur.execute("""
+                        SELECT id, branch, summary, content, message, source_instance,
+                               created_at
+                        FROM candidate_memories
+                        WHERE tenant_id = %s AND status IN ('active', 'cooling')
+                          AND (summary ILIKE %s OR content::text ILIKE %s)
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                    """, (tenant_id, f'%{query}%', f'%{query}%', remaining))
+
+                    for row in cur.fetchall():
+                        content = row['summary']
+                        if row['content']:
+                            content_str = json.dumps(row['content'], default=str) if isinstance(row['content'], dict) else str(row['content'])
+                            content = f"{row['summary']}\n{content_str}"
+                        results.append({
+                            'blob_hash': str(row['id']),
+                            'content': content[:500] + '...' if len(content) > 500 else content,
+                            'content_type': 'staged',
+                            'created_at': str(row['created_at']) if row['created_at'] else None,
+                            'commit_hash': None,
+                            'message': row['message'],
+                            'author': row['source_instance'],
+                            'source': 'staged'
+                        })
+            except Exception as e:
+                print(f"[HYBRID] Candidate search error: {e}", file=sys.stderr)
+
+        # Auto-trail
+        for r in results[:3]:
+            if r.get('blob_hash') and r.get('source') != 'staged':
+                g.accessed_blobs.add(r['blob_hash'])
+
+        cur.close()
+        return jsonify({'query': query, 'mode': 'hybrid', 'results': results, 'count': len(results)})
+
+    # --- SEMANTIC MODE: vector search via internal helper ---
+    if mode == 'semantic':
+        ensure_deprecated_commits_table()
+        cur = get_cursor()
+        tenant_id = get_tenant_id()
+
+        if not OPENAI_API_KEY:
+            cur.close()
+            return jsonify({'error': 'Semantic search not available - OpenAI not configured'}), 503
+
+        results = _semantic_search_internal(cur, query, tenant_id, limit=limit)
+
+        # Auto-trail
+        for r in results[:3]:
+            if r.get('blob_hash') and r.get('source') != 'staged':
+                g.accessed_blobs.add(r['blob_hash'])
+
+        cur.close()
+        return jsonify({'query': query, 'mode': 'semantic', 'results': results, 'count': len(results)})
+
+    # --- KEYWORD MODE (default): existing LIKE-based search, unchanged ---
     ensure_deprecated_commits_table()
     cur = get_cursor()
 
@@ -1397,6 +1685,7 @@ def semantic_search():
 
     query = request.args.get('q', '')
     limit = request.args.get('limit', 10, type=int)
+    use_hyde = request.args.get('hyde', 'false').lower() == 'true'
 
     if not query:
         return jsonify({'error': 'Search query required'}), 400
@@ -1404,8 +1693,16 @@ def semantic_search():
     if not OPENAI_API_KEY:
         return jsonify({'error': 'Semantic search not available - OpenAI not configured'}), 503
 
-    # Generate embedding for the query
-    query_embedding = generate_embedding(query)
+    # HyDE: Generate hypothetical document and embed that instead
+    hyde_doc = None
+    search_text = query
+    if use_hyde:
+        hyde_doc = generate_hyde_document(query)
+        if hyde_doc:
+            search_text = hyde_doc
+
+    # Generate embedding for the query (or HyDE document)
+    query_embedding = generate_embedding(search_text)
     if not query_embedding:
         return jsonify({'error': 'Failed to generate query embedding'}), 500
 
@@ -1570,7 +1867,11 @@ def semantic_search():
             g.accessed_blobs.add(r['blob_hash'])
 
     cur.close()
-    return jsonify({'query': query, 'results': results, 'count': len(results)})
+    response = {'query': query, 'results': results, 'count': len(results)}
+    if use_hyde and hyde_doc:
+        response['hyde'] = True
+        response['hyde_document'] = hyde_doc[:200]  # Truncate for response size
+    return jsonify(response)
 
 
 def decrypt_blob_content(blob):
@@ -8003,6 +8304,15 @@ app.register_blueprint(billing_bp)
 
 
 # =============================================================================
+# ONBOARDING (CLI Signup + Seed Manifest)
+# =============================================================================
+
+from onboarding.routes import init_onboarding
+onboarding_bp = init_onboarding(get_db, get_cursor)
+app.register_blueprint(onboarding_bp)
+
+
+# =============================================================================
 # EXTENSION DOWNLOAD (W4P2 - CC4)
 # =============================================================================
 
@@ -8199,7 +8509,8 @@ MCP_TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
                 "branch": {"type": "string", "description": "Optional: limit search to specific branch"},
-                "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10}
+                "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10},
+                "mode": {"type": "string", "description": "Search mode: 'keyword' (default, LIKE), 'semantic' (vector), 'hybrid' (BM25 + vector via Reciprocal Rank Fusion)", "default": "keyword", "enum": ["keyword", "semantic", "hybrid"]}
             },
             "required": ["query"]
         }
@@ -8211,7 +8522,8 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Conceptual search query"},
-                "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10}
+                "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10},
+                "hyde": {"type": "boolean", "description": "Enable HyDE (Hypothetical Document Embedding) for better conceptual retrieval. Generates a hypothetical answer via Haiku, then searches with that embedding. Costs ~$0.001 per query.", "default": False}
             },
             "required": ["query"]
         }
@@ -8651,12 +8963,16 @@ def dispatch_mcp_tool(tool_name, args):
             qs["branch"] = args["branch"]
         if "limit" in args:
             qs["limit"] = args["limit"]
+        if "mode" in args:
+            qs["mode"] = args["mode"]
         return invoke_view(search_memories, query_string=qs)
     
     elif tool_name == "boswell_semantic_search":
         qs = {"q": args["query"]}
         if "limit" in args:
             qs["limit"] = args["limit"]
+        if args.get("hyde"):
+            qs["hyde"] = "true"
         return invoke_view(semantic_search, query_string=qs)
     
     elif tool_name == "boswell_recall":
