@@ -8898,7 +8898,7 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_record_trail",
-        "description": "Record a traversal between memories. Strengthens the path for future recall. Trails that aren't traversed decay over time.",
+        "description": "Record a traversal between memories. FSRS-6 model: bumps storage_strength (never decays), resets retrieval_strength to 1.0, and recomputes stability with desirable difficulty bonus (bigger gain when trail was fading). Returns storage_strength, retrieval_strength, stability.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8910,7 +8910,7 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_hot_trails",
-        "description": "Get strongest memory trails—frequently traversed paths. Shows what's top of mind.",
+        "description": "Get strongest memory trails—frequently traversed paths. Returns FSRS-6 fields: storage_strength, retrieval_strength, stability alongside legacy strength.",
         "inputSchema": {
             "type": "object",
             "properties": {"limit": {"type": "integer", "description": "Max trails to return (default: 20)"}}
@@ -8936,7 +8936,7 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_trail_health",
-        "description": "Trail system health—state distribution (ACTIVE/FADING/DORMANT/ARCHIVED), activity metrics. Use to monitor memory decay.",
+        "description": "Trail system health (FSRS-6 model). State distribution (ACTIVE/FADING/DORMANT/ARCHIVED) with dual-strength metrics: avg_retrieval, avg_storage, avg_stability per state. Thresholds based on retrievability R(t)=(1+t/9S)^-1.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -8944,7 +8944,7 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_buried_memories",
-        "description": "Find dormant and archived trails—memory paths fading from recall. These can be resurrected by traversing them.",
+        "description": "Find dormant and archived trails—memory paths fading from recall. Includes recovery_potential (high storage + low retrieval = fast recovery). Resurrect by traversing them.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -8955,7 +8955,7 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_decay_forecast",
-        "description": "Predict when trails will decay. Use to identify memories at risk of fading.",
+        "description": "Predict when trails will transition states using FSRS-6 inverse formula: t=9*S*((1/R_threshold)-1). Shows days until each trail reaches fading/dormant/archived. Higher stability = slower decay.",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -8963,7 +8963,7 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_resurrect",
-        "description": "Resurrect a dormant trail by traversing it. Doubles strength, resets to ACTIVE. Use to save important paths from decay.",
+        "description": "Resurrect a dormant or archived trail. FSRS-6: resets retrieval_strength to 1.0, boosts storage_strength +1.0, and applies desirable difficulty bonus to stability (bigger gain when trail was deeply faded). Use to save important paths from decay.",
         "inputSchema": {
             "type": "object",
             "properties": {
