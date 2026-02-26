@@ -7495,26 +7495,32 @@ def _compute_activation(candidate, cur, tenant_id):
     try:
         embedding = candidate.get('embedding')
         if embedding is not None:
-            # Find trails touching blobs near this candidate
-            cur.execute("""
-                SELECT COALESCE(t.stability, 1.0) as stability, t.last_traversed
-                FROM trails t
-                JOIN blobs b ON (t.source_blob = b.blob_hash OR t.target_blob = b.blob_hash)
-                    AND t.tenant_id = b.tenant_id
-                WHERE b.tenant_id = %s AND t.state != 'archived'
-                  AND b.embedding IS NOT NULL
-                  AND b.embedding <=> %s::vector < 0.3
-                LIMIT 10
-            """, (tenant_id, embedding))
+            # Use savepoint to prevent transaction poisoning on SQL error
+            cur.execute("SAVEPOINT activation_sp")
+            try:
+                cur.execute("""
+                    SELECT COALESCE(t.stability, 1.0) as stability, t.last_traversed
+                    FROM trails t
+                    JOIN blobs b ON (t.source_blob = b.blob_hash OR t.target_blob = b.blob_hash)
+                        AND t.tenant_id = b.tenant_id
+                    WHERE b.tenant_id = %s AND t.state != 'archived'
+                      AND b.embedding IS NOT NULL
+                      AND b.embedding <=> %s::vector < 0.3
+                    LIMIT 10
+                """, (tenant_id, embedding))
 
-            rows = cur.fetchall()
-            if rows:
-                now = datetime.utcnow()
-                rs = []
-                for row in rows:
-                    days = max(0, (now - row['last_traversed']).total_seconds() / 86400) if row['last_traversed'] else 30
-                    rs.append(compute_retrievability(days, float(row['stability'])))
-                avg_r = sum(rs) / len(rs)
+                rows = cur.fetchall()
+                cur.execute("RELEASE SAVEPOINT activation_sp")
+                if rows:
+                    now = datetime.utcnow()
+                    rs = []
+                    for row in rows:
+                        days = max(0, (now - row['last_traversed']).total_seconds() / 86400) if row['last_traversed'] else 30
+                        rs.append(compute_retrievability(days, float(row['stability'])))
+                    avg_r = sum(rs) / len(rs)
+            except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT activation_sp")
+                print(f"[DREAM] Activation FSRS query error (non-fatal): {e}", file=sys.stderr)
     except Exception as e:
         print(f"[DREAM] Activation FSRS error (non-fatal): {e}", file=sys.stderr)
 
@@ -7590,50 +7596,61 @@ def _compute_connectivity(embedding, branch_name, cur):
 
     tenant_id = get_tenant_id()
 
-    cur.execute("""
-        SELECT b.blob_hash, te.name as branch_hint,
-               b.embedding <=> %s::vector AS distance
-        FROM blobs b
-        JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
-        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
-          AND b.embedding <=> %s::vector < 0.4
-        ORDER BY distance LIMIT 20
-    """, (embedding, tenant_id, embedding))
+    try:
+        cur.execute("SAVEPOINT connectivity_sp")
+        cur.execute("""
+            SELECT b.blob_hash, te.name as branch_hint,
+                   b.embedding <=> %s::vector AS distance
+            FROM blobs b
+            JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
+            WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+              AND b.embedding <=> %s::vector < 0.4
+            ORDER BY distance LIMIT 20
+        """, (embedding, tenant_id, embedding))
 
-    neighbors = cur.fetchall()
-    if not neighbors:
+        neighbors = cur.fetchall()
+        if not neighbors:
+            cur.execute("RELEASE SAVEPOINT connectivity_sp")
+            return (0.0, 0.0)
+
+        # Batch lookup: get branch for all neighbor blob_hashes in one query
+        blob_hashes = [row['blob_hash'] for row in neighbors]
+        cur.execute("""
+            SELECT DISTINCT ON (te.blob_hash) te.blob_hash, br.name as branch_name
+            FROM tree_entries te
+            JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
+            JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
+            WHERE te.blob_hash = ANY(%s) AND te.tenant_id = %s
+        """, (blob_hashes, tenant_id))
+
+        branch_map = {row['blob_hash']: row['branch_name'] for row in cur.fetchall()}
+        cur.execute("RELEASE SAVEPOINT connectivity_sp")
+
+        weighted_count = 0.0
+        unique_branches = set()
+        for row in neighbors:
+            neighbor_branch = branch_map.get(row['blob_hash'], 'unknown')
+            unique_branches.add(neighbor_branch.lower())
+            if neighbor_branch.lower() == branch_name.lower():
+                weighted_count += 0.1  # Same-branch: low weight
+            else:
+                weighted_count += 1.0  # Cross-branch: full weight
+
+        # Normalize: cap at 10 neighbors worth of weight
+        connectivity = min(weighted_count / 10.0, 1.0)
+
+        # Resonance bonus: 0.2 per additional branch beyond own (cap 0.6)
+        other_branches = len(unique_branches - {branch_name.lower()})
+        resonance_bonus = min(other_branches * 0.2, 0.6)
+
+        return (connectivity, resonance_bonus)
+    except Exception as e:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT connectivity_sp")
+        except Exception:
+            pass
+        print(f"[CONNECTIVITY] Error (non-fatal): {e}", file=sys.stderr)
         return (0.0, 0.0)
-
-    # Batch lookup: get branch for all neighbor blob_hashes in one query
-    blob_hashes = [row['blob_hash'] for row in neighbors]
-    cur.execute("""
-        SELECT DISTINCT ON (te.blob_hash) te.blob_hash, br.name as branch_name
-        FROM tree_entries te
-        JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
-        JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
-        WHERE te.blob_hash = ANY(%s) AND te.tenant_id = %s
-    """, (blob_hashes, tenant_id))
-
-    branch_map = {row['blob_hash']: row['branch_name'] for row in cur.fetchall()}
-
-    weighted_count = 0.0
-    unique_branches = set()
-    for row in neighbors:
-        neighbor_branch = branch_map.get(row['blob_hash'], 'unknown')
-        unique_branches.add(neighbor_branch.lower())
-        if neighbor_branch.lower() == branch_name.lower():
-            weighted_count += 0.1  # Same-branch: low weight
-        else:
-            weighted_count += 1.0  # Cross-branch: full weight
-
-    # Normalize: cap at 10 neighbors worth of weight
-    connectivity = min(weighted_count / 10.0, 1.0)
-
-    # Resonance bonus: 0.2 per additional branch beyond own (cap 0.6)
-    other_branches = len(unique_branches - {branch_name.lower()})
-    resonance_bonus = min(other_branches * 0.2, 0.6)
-
-    return (connectivity, resonance_bonus)
 
 
 def _promote_candidate_to_commit(candidate_row, cur, db):
