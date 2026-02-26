@@ -109,9 +109,8 @@ CORS(app)
 # Hippocampal memory staging (v4.0)
 HIPPOCAMPAL_ENABLED = os.environ.get('HIPPOCAMPAL_ENABLED', 'true').lower() == 'true'
 
-# Encryption support (Phase 2)
+# Encryption support (Phase 2 — local AES-256-GCM master key)
 ENCRYPTION_ENABLED = os.environ.get('ENCRYPTION_ENABLED', 'false').lower() == 'true'
-CREDENTIALS_PATH = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'service-account-key.json')
 
 # Auth0 OAuth 2.1 Configuration
 AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', '')
@@ -126,8 +125,8 @@ def get_encryption_service():
     if _encryption_service is None and ENCRYPTION_ENABLED:
         try:
             from encryption_service import get_encryption_service as init_service
-            _encryption_service = init_service(CREDENTIALS_PATH)
-            print(f"[STARTUP] Encryption service initialized", file=sys.stderr)
+            _encryption_service = init_service()
+            print(f"[STARTUP] Encryption service initialized (local AES-256-GCM)", file=sys.stderr)
         except Exception as e:
             print(f"[STARTUP] WARNING: Encryption service failed to initialize: {e}", file=sys.stderr)
     return _encryption_service
@@ -351,6 +350,24 @@ def get_branch_for_project(project):
 
 # ==================== API ENDPOINTS ====================
 
+# Encryption canary — runs once on first health check post-boot
+_encryption_canary_passed = False
+
+def _run_encryption_canary() -> str:
+    """Run encryption round-trip canary test. Returns encryption status string."""
+    global _encryption_canary_passed
+    try:
+        svc = get_encryption_service()
+        if svc and svc.canary_test():
+            _encryption_canary_passed = True
+            return 'active'
+        else:
+            print("[ENCRYPTION] Canary test FAILED — encryption is broken", file=sys.stderr)
+            return 'failed_canary'
+    except Exception as e:
+        print(f"[ENCRYPTION] Canary test error: {e}", file=sys.stderr)
+        return 'failed_canary'
+
 @app.route('/api/health', methods=['GET'])
 @app.route('/v2/health', methods=['GET'])
 def health_check():
@@ -362,12 +379,21 @@ def health_check():
         cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (get_tenant_id(),))
         commit_count = cur.fetchone()['count']
         cur.close()
-        # Check encryption status
+        # Check encryption status — report the truth
         encryption_status = 'disabled'
         if ENCRYPTION_ENABLED:
-            encryption_status = 'enabled'
-            if get_active_dek():
+            from encryption_service import EncryptionService as _ES
+            if not _ES.master_key_configured():
+                encryption_status = 'enabled_no_key'
+            elif get_encryption_service() is None:
+                encryption_status = 'enabled_no_key'
+            elif get_active_dek():
                 encryption_status = 'active'
+                # Run canary test on first health check post-boot
+                if not _encryption_canary_passed:
+                    encryption_status = _run_encryption_canary()
+            else:
+                encryption_status = 'configured'
 
         # Debug: Check runtime env var
         runtime_key = os.environ.get('OPENAI_API_KEY', '')
@@ -7987,13 +8013,29 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
     tags = candidate_row['tags'] or []
 
     # Insert blob (copy embedding from candidate — zero API cost)
-    cur.execute(
-        '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size, embedding)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (blob_hash) DO NOTHING''',
-        (blob_hash, get_tenant_id(), content, 'memory', now, len(content),
-         candidate_row['embedding'])
-    )
+    # Encrypt content if encryption is active
+    encryption_service = get_encryption_service()
+    dek_info = get_active_dek()
+
+    if ENCRYPTION_ENABLED and encryption_service and dek_info:
+        key_id, wrapped_dek = dek_info
+        plaintext_dek = encryption_service.unwrap_dek(key_id, wrapped_dek)
+        ciphertext, nonce = encryption_service.encrypt(content, plaintext_dek)
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_encrypted, nonce, encryption_key_id, content_type, created_at, byte_size, embedding)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, get_tenant_id(), content, psycopg2.Binary(ciphertext), psycopg2.Binary(nonce), key_id, 'memory', now, len(content),
+             candidate_row['embedding'])
+        )
+    else:
+        cur.execute(
+            '''INSERT INTO blobs (blob_hash, tenant_id, content, content_type, created_at, byte_size, embedding)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (blob_hash) DO NOTHING''',
+            (blob_hash, get_tenant_id(), content, 'memory', now, len(content),
+             candidate_row['embedding'])
+        )
 
     # Create tree entry
     tree_hash = compute_hash(f"{branch}:{blob_hash}:{now}")
