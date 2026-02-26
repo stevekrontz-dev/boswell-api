@@ -192,8 +192,10 @@ MCP_TOOLS = [
             "properties": {
                 "task_id": {"type": "string", "description": "Task ID to update"},
                 "status": {"type": "string", "enum": ["open", "claimed", "blocked", "done"], "description": "New status"},
+                "title": {"type": "string", "description": "Short display name for the task"},
                 "description": {"type": "string", "description": "Updated description"},
                 "priority": {"type": "integer", "description": "Priority (1=highest)"},
+                "plan_blob_hash": {"type": "string", "description": "Blob hash of the plan this task serves"},
                 "metadata": {"type": "object", "description": "Additional metadata to merge"}
             },
             "required": ["task_id"]

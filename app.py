@@ -27,7 +27,7 @@ import numpy as np
 try:
     VERSION = open(os.path.join(os.path.dirname(__file__), 'VERSION')).read().strip()
 except Exception:
-    VERSION = '3.3.0'
+    VERSION = '3.4.0'
 
 # Anthropic for HyDE query expansion (opt-in)
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
@@ -1035,6 +1035,32 @@ def create_commit():
         content_str = json.dumps(content) if isinstance(content, dict) else str(content)
         blob_hash = compute_hash(content_str)
 
+        # Tier 1 Dedup: Content hash check — reuse existing blob if exact match
+        dedup_method = 'new_blob'
+        cur.execute('SELECT blob_hash FROM blobs WHERE blob_hash = %s AND tenant_id = %s',
+                    (blob_hash, get_tenant_id()))
+        if cur.fetchone():
+            dedup_method = 'exact_match'
+
+        # Tier 2 Dedup: Auto-link on semantic novelty match (>= 0.92 similarity)
+        if not novelty_result.get('is_novel', True) and novelty_result.get('similar_memories'):
+            try:
+                most_similar = novelty_result['similar_memories'][0]
+                cur.execute('''
+                    INSERT INTO cross_references
+                    (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                     link_type, weight, reasoning, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    get_tenant_id(), blob_hash, most_similar['blob_hash'],
+                    branch, branch, 'elaboration',
+                    round(most_similar.get('similarity', 0.92), 4),
+                    f"Auto-linked: {most_similar.get('similarity', 0.92):.0%} semantic similarity at commit-time",
+                    now
+                ))
+            except Exception as e:
+                print(f"[DEDUP] Auto-link failed (non-fatal): {e}", file=sys.stderr)
+
         # Insert blob with encryption if enabled
         encryption_service = get_encryption_service()
         dek_info = get_active_dek()
@@ -1179,7 +1205,8 @@ def create_commit():
             'tree_hash': tree_hash,
             'branch': branch,
             'message': message,
-            'novelty_score': novelty_result.get('novelty_score', 1.0)
+            'novelty_score': novelty_result.get('novelty_score', 1.0),
+            'dedup_method': dedup_method
         }
         if routing_suggestion:
             response['routing_suggestion'] = routing_suggestion
@@ -1444,6 +1471,163 @@ def reciprocal_rank_fusion(keyword_results, semantic_results, k=60):
     ]
 
 
+def _compute_trail_boost(blob_hashes, cur, tenant_id):
+    """Compute trail boost for each blob based on trail connections to other result blobs.
+    Memories connected by strong trails (high storage_strength) are contextually important."""
+    if not blob_hashes or len(blob_hashes) < 2:
+        return {}
+
+    try:
+        cur.execute("""
+            SELECT source_blob, target_blob, COALESCE(storage_strength, strength, 1.0) as ss
+            FROM trails
+            WHERE tenant_id = %s
+              AND source_blob = ANY(%s) AND target_blob = ANY(%s)
+              AND state != 'archived'
+        """, (tenant_id, list(blob_hashes), list(blob_hashes)))
+
+        boosts = {h: 0.0 for h in blob_hashes}
+        for row in cur.fetchall():
+            ss = float(row['ss'])
+            boosts[row['source_blob']] = boosts.get(row['source_blob'], 0.0) + ss * 0.02
+            boosts[row['target_blob']] = boosts.get(row['target_blob'], 0.0) + ss * 0.02
+
+        # Cap at 15%
+        return {h: min(v, 0.15) for h, v in boosts.items()}
+    except Exception as e:
+        print(f"[RERANK] Trail boost error: {e}", file=sys.stderr)
+        return {}
+
+
+def _compute_retrievability_boost(blob_hashes, cur, tenant_id):
+    """Compute FSRS-6 retrievability boost for each blob.
+    Recently accessed memories (high R) rank slightly higher."""
+    if not blob_hashes:
+        return {}
+
+    try:
+        cur.execute("""
+            SELECT source_blob as blob, COALESCE(stability, 1.0) as stability,
+                   last_traversed, COALESCE(storage_strength, strength, 1.0) as ss
+            FROM trails
+            WHERE tenant_id = %s
+              AND (source_blob = ANY(%s) OR target_blob = ANY(%s))
+              AND state != 'archived'
+        """, (tenant_id, list(blob_hashes), list(blob_hashes)))
+
+        blob_retrievabilities = {h: [] for h in blob_hashes}
+        now = datetime.utcnow()
+        for row in cur.fetchall():
+            blob = row['blob']
+            if blob in blob_retrievabilities:
+                days = max(0, (now - row['last_traversed']).total_seconds() / 86400) if row['last_traversed'] else 30
+                r = compute_retrievability(days, float(row['stability']))
+                blob_retrievabilities[blob].append(r)
+
+        boosts = {}
+        for h in blob_hashes:
+            rs = blob_retrievabilities.get(h, [])
+            avg_r = sum(rs) / len(rs) if rs else 0.0
+            boosts[h] = avg_r * 0.05  # max 5%
+        return boosts
+    except Exception as e:
+        print(f"[RERANK] Retrievability boost error: {e}", file=sys.stderr)
+        return {}
+
+
+def _rerank_results(rrf_results, cur, tenant_id):
+    """Post-RRF multi-signal reranking pipeline.
+
+    4 signals applied after RRF fusion:
+    1. Trail Boost: memories connected by strong trails to other results (+up to 15%)
+    2. FSRS-6 Retrievability: recently accessed memories rank higher (+up to 5%)
+    3. Recency Boost: newer memories get slight edge, decaying over 30 days (+up to 5%)
+    4. MMR Diversity: penalize results too similar to already-selected results
+    """
+    if not rrf_results:
+        return rrf_results
+
+    blob_hashes = [r['blob_hash'] for r in rrf_results if r.get('blob_hash')]
+
+    # Compute signal boosts in batch
+    trail_boosts = _compute_trail_boost(blob_hashes, cur, tenant_id)
+    retrievability_boosts = _compute_retrievability_boost(blob_hashes, cur, tenant_id)
+
+    now = datetime.utcnow()
+
+    # Phase 1: Apply multiplicative boosts to RRF scores
+    for result in rrf_results:
+        bh = result.get('blob_hash', '')
+        rrf_score = result.get('rrf_score', 0.0)
+
+        trail_b = trail_boosts.get(bh, 0.0)
+        retrievability_b = retrievability_boosts.get(bh, 0.0)
+
+        # Recency boost: 5% for today, 0% after 30 days
+        recency_b = 0.0
+        if result.get('created_at'):
+            try:
+                created = datetime.fromisoformat(str(result['created_at']).replace('Z', '+00:00').replace('+00:00', ''))
+                days_old = max(0, (now - created).total_seconds() / 86400)
+                recency_b = max(0, 0.05 * (1 - days_old / 30))
+            except Exception:
+                pass
+
+        result['reranked_score'] = rrf_score * (1 + trail_b + retrievability_b + recency_b)
+        result['_rerank_signals'] = {
+            'trail_boost': round(trail_b, 4),
+            'retrievability_boost': round(retrievability_b, 4),
+            'recency_boost': round(recency_b, 4)
+        }
+
+    # Phase 2: MMR diversity pass — greedy selection penalizing near-duplicates
+    # Load embeddings for MMR
+    embeddings = {}
+    try:
+        if blob_hashes:
+            cur.execute("""
+                SELECT blob_hash, embedding FROM blobs
+                WHERE blob_hash = ANY(%s) AND tenant_id = %s AND embedding IS NOT NULL
+            """, (list(blob_hashes), tenant_id))
+            for row in cur.fetchall():
+                embeddings[row['blob_hash']] = row['embedding']
+    except Exception as e:
+        print(f"[RERANK] Embedding fetch error: {e}", file=sys.stderr)
+
+    # Sort by reranked score first
+    rrf_results.sort(key=lambda r: r.get('reranked_score', 0), reverse=True)
+
+    if embeddings:
+        selected = []
+        remaining = list(rrf_results)
+        while remaining:
+            candidate = remaining.pop(0)
+            bh = candidate.get('blob_hash', '')
+            cand_emb = embeddings.get(bh)
+
+            if cand_emb is not None and selected:
+                max_sim = 0.0
+                for sel in selected:
+                    sel_emb = embeddings.get(sel.get('blob_hash', ''))
+                    if sel_emb is not None:
+                        try:
+                            sim = cosine_similarity(cand_emb, sel_emb)
+                            max_sim = max(max_sim, sim)
+                        except Exception:
+                            pass
+                if max_sim > 0.90:
+                    candidate['reranked_score'] *= 0.5
+                    candidate['_rerank_signals']['mmr_penalty'] = round(max_sim, 4)
+
+            selected.append(candidate)
+
+        # Re-sort after MMR penalties
+        selected.sort(key=lambda r: r.get('reranked_score', 0), reverse=True)
+        return selected
+
+    return rrf_results
+
+
 def bm25_search(cur, query, tenant_id, limit=20):
     """Full-text search using PostgreSQL ts_rank (BM25-like scoring).
 
@@ -1607,8 +1791,9 @@ def search_memories():
             print(f"[HYBRID] Semantic search error (falling back to empty): {e}", file=sys.stderr)
             semantic_results = []
 
-        # Fuse and trim
-        results = reciprocal_rank_fusion(keyword_results, semantic_results)[:limit]
+        # Fuse via RRF, then apply multi-signal reranking
+        rrf_results = reciprocal_rank_fusion(keyword_results, semantic_results)
+        results = _rerank_results(rrf_results, cur, tenant_id)[:limit]
 
         # Also search staged candidates if hippocampal enabled
         if HIPPOCAMPAL_ENABLED:
@@ -1649,7 +1834,13 @@ def search_memories():
                 g.accessed_blobs.add(r['blob_hash'])
 
         cur.close()
-        return jsonify({'query': query, 'mode': 'hybrid', 'results': results, 'count': len(results)})
+        return jsonify({
+            'query': query, 'mode': 'hybrid', 'results': results, 'count': len(results),
+            'reranking': {
+                'model': 'multi-signal-v1',
+                'signals': ['trail_boost', 'retrievability_boost', 'recency_boost', 'mmr_diversity']
+            }
+        })
 
     # --- SEMANTIC MODE: vector search via internal helper ---
     if mode == 'semantic':
@@ -6318,7 +6509,7 @@ def patrol_isolated_clusters() -> list:
     return findings
 
 
-def patrol_duplicate_embeddings(threshold: float = 0.02) -> list:
+def patrol_duplicate_embeddings(threshold: float = 0.05) -> list:
     """Detect near-identical embeddings (possible duplicates)."""
     findings = []
     cur = get_cursor()
@@ -7293,13 +7484,109 @@ def get_decay_status():
     return jsonify({'expiring': expiring, 'count': len(expiring), 'within_days': days})
 
 
+def _compute_activation(candidate, cur, tenant_id):
+    """Phase 1: FSRS-6 activation decay scoring.
+    activation = salience * (0.3 + 0.7 * avg_trail_retrievability) * (1 + log(replay_count + 1))"""
+    salience = candidate.get('salience', 0.3) or 0.3
+    replay_count = candidate.get('replay_count', 0) or 0
+
+    # Get average trail retrievability for this candidate's embedding
+    avg_r = 0.0
+    try:
+        embedding = candidate.get('embedding')
+        if embedding is not None:
+            # Find trails touching blobs near this candidate
+            cur.execute("""
+                SELECT COALESCE(t.stability, 1.0) as stability, t.last_traversed
+                FROM trails t
+                JOIN blobs b ON (t.source_blob = b.blob_hash OR t.target_blob = b.blob_hash)
+                    AND t.tenant_id = b.tenant_id
+                WHERE b.tenant_id = %s AND t.state != 'archived'
+                  AND b.embedding IS NOT NULL
+                  AND b.embedding <=> %s::vector < 0.3
+                LIMIT 10
+            """, (tenant_id, embedding))
+
+            rows = cur.fetchall()
+            if rows:
+                now = datetime.utcnow()
+                rs = []
+                for row in rows:
+                    days = max(0, (now - row['last_traversed']).total_seconds() / 86400) if row['last_traversed'] else 30
+                    rs.append(compute_retrievability(days, float(row['stability'])))
+                avg_r = sum(rs) / len(rs)
+    except Exception as e:
+        print(f"[DREAM] Activation FSRS error (non-fatal): {e}", file=sys.stderr)
+
+    activation = salience * (0.3 + 0.7 * avg_r) * (1 + math.log(replay_count + 1))
+    return activation
+
+
+def _temporal_cluster(scored_candidates):
+    """Phase 2: Group candidates within 2h + embedding distance < 0.3.
+    Returns list of clusters, each a list of candidate dicts with activation scores."""
+    if not scored_candidates:
+        return []
+
+    # Sort by created_at
+    sorted_cands = sorted(scored_candidates, key=lambda c: str(c['candidate'].get('created_at', '')))
+
+    clusters = []
+    used = set()
+
+    for i, item in enumerate(sorted_cands):
+        if i in used:
+            continue
+
+        cluster = [item]
+        used.add(i)
+
+        cand_i = item['candidate']
+        emb_i = cand_i.get('embedding')
+        created_i = cand_i.get('created_at')
+
+        for j, other in enumerate(sorted_cands):
+            if j in used:
+                continue
+
+            cand_j = other['candidate']
+            created_j = cand_j.get('created_at')
+
+            # Check temporal proximity (2 hours)
+            time_close = False
+            if created_i and created_j:
+                try:
+                    diff = abs((created_j - created_i).total_seconds())
+                    time_close = diff < 7200  # 2 hours
+                except Exception:
+                    pass
+
+            # Check embedding proximity
+            emb_close = False
+            emb_j = cand_j.get('embedding')
+            if emb_i is not None and emb_j is not None:
+                try:
+                    dist = 1.0 - cosine_similarity(emb_i, emb_j)
+                    emb_close = dist < 0.3
+                except Exception:
+                    pass
+
+            if time_close and emb_close:
+                cluster.append(other)
+                used.add(j)
+
+        clusters.append(cluster)
+
+    return clusters
+
+
 def _compute_connectivity(embedding, branch_name, cur):
-    """Compute connectivity score for a candidate embedding.
+    """Compute connectivity score and cross-branch resonance bonus.
     Cross-branch neighbors weighted 1.0, same-branch neighbors 0.1.
-    Normalized to 0-1, capped at 10 neighbors.
-    Uses batch query for branch lookups instead of N individual queries."""
+    Returns (connectivity, resonance_bonus) tuple.
+    Resonance bonus = 0.2 per additional branch (cap 0.6)."""
     if embedding is None:
-        return 0.0
+        return (0.0, 0.0)
 
     tenant_id = get_tenant_id()
 
@@ -7315,7 +7602,7 @@ def _compute_connectivity(embedding, branch_name, cur):
 
     neighbors = cur.fetchall()
     if not neighbors:
-        return 0.0
+        return (0.0, 0.0)
 
     # Batch lookup: get branch for all neighbor blob_hashes in one query
     blob_hashes = [row['blob_hash'] for row in neighbors]
@@ -7330,15 +7617,23 @@ def _compute_connectivity(embedding, branch_name, cur):
     branch_map = {row['blob_hash']: row['branch_name'] for row in cur.fetchall()}
 
     weighted_count = 0.0
+    unique_branches = set()
     for row in neighbors:
         neighbor_branch = branch_map.get(row['blob_hash'], 'unknown')
+        unique_branches.add(neighbor_branch.lower())
         if neighbor_branch.lower() == branch_name.lower():
             weighted_count += 0.1  # Same-branch: low weight
         else:
             weighted_count += 1.0  # Cross-branch: full weight
 
     # Normalize: cap at 10 neighbors worth of weight
-    return min(weighted_count / 10.0, 1.0)
+    connectivity = min(weighted_count / 10.0, 1.0)
+
+    # Resonance bonus: 0.2 per additional branch beyond own (cap 0.6)
+    other_branches = len(unique_branches - {branch_name.lower()})
+    resonance_bonus = min(other_branches * 0.2, 0.6)
+
+    return (connectivity, resonance_bonus)
 
 
 def _promote_candidate_to_commit(candidate_row, cur, db):
@@ -7472,19 +7767,29 @@ def run_consolidation():
 
         cur.execute(f"""
             SELECT id, branch, summary, content, message, tags, salience,
-                   replay_count, embedding, status
+                   replay_count, embedding, status, created_at
             FROM candidate_memories
             WHERE tenant_id = %s AND status IN ('active', 'cooling'){filter_sql}
         """, filter_params)
 
         candidates = cur.fetchall()
 
-        # Step 4: Compute consolidation scores
+        # === DREAM-CYCLE CONSOLIDATION (v3.4.0 4-phase pipeline) ===
+        is_dream = cycle_type == 'dream'
+        dream_stats = {'clusters_formed': 0, 'resonance_links_created': 0, 'cross_branch_clusters': 0}
+        tenant_id = get_tenant_id()
+
+        # Phase 1: Activation Decay (FSRS-6)
         scored = []
         score_updates = []
         for c in candidates:
-            connectivity = _compute_connectivity(c['embedding'], c['branch'], cur)
-            score = c['salience'] * (1 + math.log(c['replay_count'] + 1)) * (1 + connectivity)
+            if is_dream:
+                activation = _compute_activation(c, cur, tenant_id)
+            else:
+                activation = (c['salience'] or 0.3) * (1 + math.log((c['replay_count'] or 0) + 1))
+
+            connectivity, resonance_bonus = _compute_connectivity(c['embedding'], c['branch'], cur)
+            score = activation * (1 + connectivity) * (1 + resonance_bonus)
 
             score_updates.append((score, str(c['id'])))
 
@@ -7492,8 +7797,47 @@ def run_consolidation():
                 scored.append({
                     'candidate': c,
                     'score': score,
-                    'connectivity': connectivity
+                    'activation': activation,
+                    'connectivity': connectivity,
+                    'resonance_bonus': resonance_bonus
                 })
+
+        # Phase 2: Temporal Clustering (dream cycle only)
+        if is_dream and scored:
+            clusters = _temporal_cluster(scored)
+            dream_stats['clusters_formed'] = len(clusters)
+
+            # Score clusters: max(member_activation) + 0.1*(size-1)
+            clustered_scored = []
+            for cluster in clusters:
+                max_activation = max(item['activation'] for item in cluster)
+                cluster_bonus = 0.1 * (len(cluster) - 1)
+
+                # Check if cross-branch cluster
+                branches_in_cluster = set(item['candidate']['branch'] for item in cluster)
+                is_cross_branch = len(branches_in_cluster) > 1
+                cross_branch_mult = 1.3 if is_cross_branch else 1.0
+                if is_cross_branch:
+                    dream_stats['cross_branch_clusters'] += 1
+
+                # Apply cluster score to best candidate in cluster
+                best = max(cluster, key=lambda x: x['score'])
+                cluster_score = (max_activation + cluster_bonus) * cross_branch_mult
+                best['score'] = cluster_score * (1 + best['connectivity']) * (1 + best['resonance_bonus'])
+                clustered_scored.append(best)
+
+                # Keep remaining cluster members at their original scores
+                for item in cluster:
+                    if item is not best:
+                        clustered_scored.append(item)
+
+            scored = clustered_scored
+
+        # Phase 3.5: LLM Reasoning Hook (no-op by default, activated by cycle_type="deep")
+        if cycle_type == 'deep':
+            # Pluggable hook — future sprint will call Haiku for cross-branch insight evaluation
+            # Architecture is ready: top-N candidates would be sent for LLM scoring
+            pass
 
         # Batch update all consolidation scores
         if score_updates:
@@ -7505,18 +7849,64 @@ def run_consolidation():
                 WHERE cm.id = v.id::uuid
             """, score_updates)
 
-        # Step 5: Rank and take top N
+        # Phase 4: Rank and Promote top N
         scored.sort(key=lambda x: x['score'], reverse=True)
         to_promote = scored[:max_promotions]
 
         promoted_commits = []
+        promoted_blob_hashes = []
         if not dry_run:
-            # Step 6: Promote winners
+            # Promote winners
             affected_branches = set()
             for item in to_promote:
                 commit_hash, blob_hash = _promote_candidate_to_commit(item['candidate'], cur, db)
                 promoted_commits.append(commit_hash)
+                promoted_blob_hashes.append(blob_hash)
                 affected_branches.add(item['candidate']['branch'])
+
+            # Phase 4 auto-link: create resonance cross-references to top-3 nearest blobs in other branches
+            for i, item in enumerate(to_promote):
+                try:
+                    blob_hash = promoted_blob_hashes[i]
+                    candidate_branch = item['candidate']['branch']
+                    emb = item['candidate'].get('embedding')
+                    if emb is None:
+                        continue
+
+                    cur.execute("""
+                        SELECT b.blob_hash, te.name as tree_name,
+                               b.embedding <=> %s::vector AS distance
+                        FROM blobs b
+                        JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
+                        JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
+                        JOIN branches br ON br.name != %s AND br.tenant_id = c.tenant_id
+                            AND br.head_commit IS NOT NULL
+                        WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+                          AND b.blob_hash != %s
+                          AND b.embedding <=> %s::vector < 0.4
+                        ORDER BY distance LIMIT 3
+                    """, (emb, candidate_branch, tenant_id, blob_hash, emb))
+
+                    link_now = datetime.utcnow().isoformat() + 'Z'
+                    for row in cur.fetchall():
+                        try:
+                            cur.execute("""
+                                INSERT INTO cross_references
+                                (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                                 link_type, weight, reasoning, created_at)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                tenant_id, blob_hash, row['blob_hash'],
+                                candidate_branch, 'unknown', 'resonance',
+                                round(1.0 - float(row['distance']), 4),
+                                'Dream-cycle auto-link: promoted memory to nearest cross-branch blob',
+                                link_now
+                            ))
+                            dream_stats['resonance_links_created'] += 1
+                        except Exception:
+                            pass  # Duplicate link, skip
+                except Exception as e:
+                    print(f"[DREAM] Auto-link error (non-fatal): {e}", file=sys.stderr)
 
             # Step 7: Hard-delete expired candidates older than 30 days
             cur.execute("""
@@ -7525,6 +7915,49 @@ def run_consolidation():
                   AND expires_at < NOW() - INTERVAL '30 days'
             """, (get_tenant_id(),))
             hard_deleted = cur.rowcount
+
+            # Step 7.5: Tier 3 dedup sweep — link near-duplicates at 0.12 distance
+            dedup_links_created = 0
+            try:
+                cur.execute("""
+                    SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
+                           b1.embedding <=> b2.embedding AS distance
+                    FROM blobs b1
+                    JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
+                    WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
+                      AND b1.tenant_id = %s
+                      AND COALESCE(b1.quarantined, FALSE) = FALSE
+                      AND COALESCE(b2.quarantined, FALSE) = FALSE
+                      AND b1.embedding <=> b2.embedding < 0.12
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cross_references cr
+                          WHERE cr.tenant_id = b1.tenant_id
+                            AND ((cr.source_blob = b1.blob_hash AND cr.target_blob = b2.blob_hash)
+                              OR (cr.source_blob = b2.blob_hash AND cr.target_blob = b1.blob_hash))
+                      )
+                    LIMIT 50
+                """, (get_tenant_id(),))
+
+                dedup_now = datetime.utcnow().isoformat() + 'Z'
+                for row in cur.fetchall():
+                    try:
+                        cur.execute("""
+                            INSERT INTO cross_references
+                            (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                             link_type, weight, reasoning, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            get_tenant_id(), row['blob1'], row['blob2'],
+                            'unknown', 'unknown', 'elaboration',
+                            round(1.0 - float(row['distance']), 4),
+                            f"Consolidation dedup sweep: distance {row['distance']:.4f}",
+                            dedup_now
+                        ))
+                        dedup_links_created += 1
+                    except Exception:
+                        pass  # Duplicate link, skip
+            except Exception as e:
+                print(f"[CONSOLIDATION] Dedup sweep error (non-fatal): {e}", file=sys.stderr)
 
             db.commit()
 
@@ -7571,18 +8004,24 @@ def run_consolidation():
 
         report = {
             'status': 'dry_run' if dry_run else 'consolidated',
+            'cycle_type': cycle_type,
             'candidates_evaluated': len(candidates),
             'candidates_promoted': len(promoted_commits) if not dry_run else 0,
             'candidates_expired': expired,
             'candidates_cooled': cooled,
             'top_scores': [{'id': str(s['candidate']['id']), 'summary': s['candidate']['summary'][:80],
-                           'score': round(s['score'], 4), 'connectivity': round(s['connectivity'], 4)}
+                           'score': round(s['score'], 4), 'connectivity': round(s['connectivity'], 4),
+                           'resonance_bonus': round(s.get('resonance_bonus', 0), 4),
+                           'activation': round(s.get('activation', 0), 4)}
                           for s in scored[:max_promotions]],
             'promoted_commits': promoted_commits,
             'duration_ms': duration_ms
         }
+        if is_dream:
+            report['dream_cycle_stats'] = dream_stats
         if not dry_run:
             report['hard_deleted'] = hard_deleted
+            report['dedup_links_created'] = dedup_links_created
 
         return jsonify(report)
 
