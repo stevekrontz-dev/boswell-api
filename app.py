@@ -953,6 +953,39 @@ def check_novelty(embedding, branch, tenant_id):
         return {'novelty_score': 1.0, 'is_novel': True}
 
 
+def _screen_content(content) -> tuple:
+    """Write screening gate — structural validation only.
+
+    Returns (error_response, status_code) if rejected, or (None, None) if OK.
+    Checks: JSON structure, empty content, bare primitives, size limit (8KB).
+    """
+    # Must be a dict or list (no bare primitives)
+    if not isinstance(content, (dict, list)):
+        try:
+            json.dumps(content)
+            return jsonify({'error': 'Content must be a JSON object or array, not a bare primitive'}), 400
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Content is not valid JSON'}), 400
+
+    # Empty object/array
+    if isinstance(content, dict) and len(content) == 0:
+        return jsonify({'error': 'Content cannot be an empty object'}), 400
+    if isinstance(content, list) and len(content) == 0:
+        return jsonify({'error': 'Content cannot be an empty array'}), 400
+
+    # Size limit: 8KB
+    content_str = json.dumps(content)
+    if len(content_str.encode('utf-8')) > 8192:
+        size_kb = len(content_str.encode('utf-8')) / 1024
+        return jsonify({
+            'error': f'Content too large ({size_kb:.1f}KB). Maximum is 8KB.',
+            'size_bytes': len(content_str.encode('utf-8')),
+            'limit_bytes': 8192
+        }), 413
+
+    return None, None
+
+
 @app.route('/v2/commit', methods=['POST'])
 def create_commit():
     """Commit a memory to the repository."""
@@ -966,6 +999,11 @@ def create_commit():
 
     if not content:
         return jsonify({'error': 'Content required'}), 400
+
+    # Write screening gate (v3.5.0)
+    screen_error, screen_status = _screen_content(content)
+    if screen_error:
+        return screen_error, screen_status
 
     # Validate content_type='plan' requirements
     if memory_type == 'plan':
@@ -1535,14 +1573,41 @@ def _compute_retrievability_boost(blob_hashes, cur, tenant_id):
         return {}
 
 
+def _compute_supersession_penalty(blob_hashes, cur, tenant_id):
+    """Find blobs that have been superseded (target of a 'supersedes' link).
+
+    Superseded memories get a 0.3x multiplicative penalty — they're stale
+    but not deleted, so they still appear but rank much lower.
+    """
+    penalties = {}
+    if not blob_hashes:
+        return penalties
+    try:
+        cur.execute("""
+            SELECT DISTINCT target_blob, source_blob
+            FROM cross_references
+            WHERE target_blob = ANY(%s) AND tenant_id = %s
+              AND link_type = 'supersedes'
+        """, (list(blob_hashes), tenant_id))
+        for row in cur.fetchall():
+            penalties[row['target_blob']] = {
+                'penalty': 0.3,
+                'superseded_by': row['source_blob']
+            }
+    except Exception as e:
+        print(f"[RERANK] Supersession penalty error: {e}", file=sys.stderr)
+    return penalties
+
+
 def _rerank_results(rrf_results, cur, tenant_id):
     """Post-RRF multi-signal reranking pipeline.
 
-    4 signals applied after RRF fusion:
+    5 signals applied after RRF fusion:
     1. Trail Boost: memories connected by strong trails to other results (+up to 15%)
     2. FSRS-6 Retrievability: recently accessed memories rank higher (+up to 5%)
     3. Recency Boost: newer memories get slight edge, decaying over 30 days (+up to 5%)
-    4. MMR Diversity: penalize results too similar to already-selected results
+    4. Supersession Penalty: superseded memories get 0.3x penalty
+    5. MMR Diversity: penalize results too similar to already-selected results
     """
     if not rrf_results:
         return rrf_results
@@ -1552,6 +1617,7 @@ def _rerank_results(rrf_results, cur, tenant_id):
     # Compute signal boosts in batch
     trail_boosts = _compute_trail_boost(blob_hashes, cur, tenant_id)
     retrievability_boosts = _compute_retrievability_boost(blob_hashes, cur, tenant_id)
+    supersession_penalties = _compute_supersession_penalty(blob_hashes, cur, tenant_id)
 
     now = datetime.utcnow()
 
@@ -1574,10 +1640,18 @@ def _rerank_results(rrf_results, cur, tenant_id):
                 pass
 
         result['reranked_score'] = rrf_score * (1 + trail_b + retrievability_b + recency_b)
+
+        # Supersession penalty: 0.3x for memories that have been superseded
+        supersession = supersession_penalties.get(bh)
+        if supersession:
+            result['reranked_score'] *= supersession['penalty']
+            result['superseded_by'] = supersession['superseded_by']
+
         result['_rerank_signals'] = {
             'trail_boost': round(trail_b, 4),
             'retrievability_boost': round(retrievability_b, 4),
-            'recency_boost': round(recency_b, 4)
+            'recency_boost': round(recency_b, 4),
+            'supersession_penalty': supersession['penalty'] if supersession else None
         }
 
     # Phase 2: MMR diversity pass — greedy selection penalizing near-duplicates
@@ -2221,6 +2295,32 @@ def recall_memory():
             except Exception as e:
                 print(f"[RECALL] Semantic neighbors error: {e}", file=sys.stderr)
 
+        # Supersession chain: find what supersedes this memory and what it supersedes
+        supersession = {}
+        try:
+            # What supersedes this blob (newer version)
+            cur.execute("""
+                SELECT source_blob, reasoning FROM cross_references
+                WHERE target_blob = %s AND tenant_id = %s AND link_type = 'supersedes'
+                ORDER BY created_at DESC LIMIT 1
+            """, (blob_hash, get_tenant_id()))
+            row = cur.fetchone()
+            if row:
+                supersession['superseded_by'] = row['source_blob']
+                supersession['reason'] = row['reasoning']
+
+            # What this blob supersedes (older version)
+            cur.execute("""
+                SELECT target_blob FROM cross_references
+                WHERE source_blob = %s AND tenant_id = %s AND link_type = 'supersedes'
+                ORDER BY created_at DESC
+            """, (blob_hash, get_tenant_id()))
+            supersedes_list = [r['target_blob'] for r in cur.fetchall()]
+            if supersedes_list:
+                supersession['supersedes'] = supersedes_list
+        except Exception as e:
+            print(f"[RECALL] Supersession chain error: {e}", file=sys.stderr)
+
         cur.close()
 
         # Decrypt content if needed
@@ -2236,6 +2336,8 @@ def recall_memory():
         }
         if neighbors:
             response_data['semantic_neighbors'] = neighbors
+        if supersession:
+            response_data['supersession'] = supersession
         return jsonify(response_data)
 
     elif commit_hash:
@@ -2791,7 +2893,7 @@ def create_link():
     if not all([source_blob, target_blob, source_branch, target_branch]):
         return jsonify({'error': 'source_blob, target_blob, source_branch, target_branch required'}), 400
 
-    valid_types = ['resonance', 'causal', 'contradiction', 'elaboration', 'application']
+    valid_types = ['resonance', 'causal', 'contradiction', 'elaboration', 'application', 'supersedes', 'drift']
     if link_type not in valid_types:
         return jsonify({'error': f'Invalid link_type. Must be one of: {valid_types}'}), 400
 
@@ -6573,6 +6675,219 @@ def patrol_stale_checkpoints(days: int = 30) -> list:
     return findings
 
 
+def patrol_contradictions() -> list:
+    """Detect contradictory memories using Haiku LLM pairwise analysis.
+
+    Finds blob pairs in the 0.05-0.50 cosine distance zone (similar enough
+    to potentially conflict, but different enough to not be duplicates).
+    Incremental: only checks pairs involving blobs created since last patrol.
+    Categories: contradiction, update, complementary, drift.
+    """
+    findings = []
+    tenant_id = get_tenant_id()
+    cur = get_cursor()
+
+    client = get_anthropic_client()
+    if not client:
+        print("[CONTRADICTION] Anthropic client unavailable, skipping", file=sys.stderr)
+        return findings
+
+    # Get last contradiction patrol timestamp
+    try:
+        cur.execute("""
+            SELECT MAX(created_at) as last_patrol
+            FROM immune_log
+            WHERE tenant_id = %s AND action = 'PATROL_END'
+              AND details::text LIKE '%%CONTRADICTION%%'
+        """, (tenant_id,))
+        row = cur.fetchone()
+        last_patrol = row['last_patrol'] if row and row['last_patrol'] else None
+    except Exception:
+        last_patrol = None
+
+    # Find candidate pairs: cosine distance 0.05-0.50, at least one blob is new
+    if last_patrol:
+        cur.execute("""
+            SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
+                   b1.embedding <=> b2.embedding AS distance,
+                   substring(b1.content, 1, 500) as content1,
+                   substring(b2.content, 1, 500) as content2,
+                   b1.created_at as created1, b2.created_at as created2
+            FROM blobs b1
+            JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
+            WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
+              AND b1.tenant_id = %s
+              AND COALESCE(b1.quarantined, FALSE) = FALSE
+              AND COALESCE(b2.quarantined, FALSE) = FALSE
+              AND b1.embedding <=> b2.embedding BETWEEN 0.05 AND 0.50
+              AND (b1.created_at > %s OR b2.created_at > %s)
+            ORDER BY b1.embedding <=> b2.embedding ASC
+            LIMIT 20
+        """, (tenant_id, last_patrol, last_patrol))
+    else:
+        # First run: sample across the full graph
+        cur.execute("""
+            SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
+                   b1.embedding <=> b2.embedding AS distance,
+                   substring(b1.content, 1, 500) as content1,
+                   substring(b2.content, 1, 500) as content2,
+                   b1.created_at as created1, b2.created_at as created2
+            FROM blobs b1
+            JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
+            WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
+              AND b1.tenant_id = %s
+              AND COALESCE(b1.quarantined, FALSE) = FALSE
+              AND COALESCE(b2.quarantined, FALSE) = FALSE
+              AND b1.embedding <=> b2.embedding BETWEEN 0.05 AND 0.50
+            ORDER BY b1.embedding <=> b2.embedding ASC
+            LIMIT 20
+        """, (tenant_id,))
+
+    pairs = cur.fetchall()
+
+    for pair in pairs:
+        try:
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Compare these two memory entries and classify their relationship.\n\n"
+                        f"MEMORY A (created {pair['created1']}):\n{pair['content1']}\n\n"
+                        f"MEMORY B (created {pair['created2']}):\n{pair['content2']}\n\n"
+                        "Respond with EXACTLY one line in this format:\n"
+                        "CATEGORY: <contradiction|update|complementary|drift>\n"
+                        "CONFIDENCE: <0.0-1.0>\n"
+                        "REASON: <one sentence explanation>\n\n"
+                        "- contradiction: they assert incompatible facts\n"
+                        "- update: B replaces/supersedes A with newer information\n"
+                        "- complementary: they cover different aspects of the same topic\n"
+                        "- drift: same topic but subtle meaning shift over time"
+                    )
+                }]
+            )
+
+            result_text = response.content[0].text.strip()
+
+            # Parse Haiku response
+            category = None
+            confidence = 0.0
+            reason = ""
+            for line in result_text.split('\n'):
+                line = line.strip()
+                if line.startswith('CATEGORY:'):
+                    category = line.split(':', 1)[1].strip().lower()
+                elif line.startswith('CONFIDENCE:'):
+                    try:
+                        confidence = float(line.split(':', 1)[1].strip())
+                    except ValueError:
+                        confidence = 0.5
+                elif line.startswith('REASON:'):
+                    reason = line.split(':', 1)[1].strip()
+
+            if category not in ('contradiction', 'update', 'complementary', 'drift'):
+                continue
+
+            # Skip complementary — that's normal
+            if category == 'complementary':
+                continue
+
+            # Determine action based on category + confidence
+            if category == 'contradiction' and confidence >= 0.9:
+                # High-confidence contradiction: supersedes link + quarantine older
+                older_blob = pair['blob1'] if pair['created1'] < pair['created2'] else pair['blob2']
+                newer_blob = pair['blob2'] if older_blob == pair['blob1'] else pair['blob1']
+                findings.append({
+                    'blob_hash': older_blob,
+                    'reason': f"Contradiction (confidence {confidence:.0%}): {reason}",
+                    'category': category,
+                    'confidence': confidence,
+                    'contradicted_by': newer_blob,
+                    'action': 'quarantine'
+                })
+                # Create supersedes link
+                try:
+                    link_cur = get_cursor()
+                    now = datetime.utcnow().isoformat() + 'Z'
+                    link_cur.execute(
+                        """INSERT INTO cross_references
+                           (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                            link_type, weight, reasoning, created_at)
+                           VALUES (%s, %s, %s, 'auto', 'auto', 'supersedes', %s, %s, %s)
+                           ON CONFLICT DO NOTHING""",
+                        (tenant_id, newer_blob, older_blob, confidence, reason, now)
+                    )
+                    get_db().commit()
+                    link_cur.close()
+                except Exception as le:
+                    print(f"[CONTRADICTION] Link creation error: {le}", file=sys.stderr)
+
+            elif category == 'contradiction' and confidence >= 0.8:
+                # Medium-confidence contradiction: supersedes link only, no quarantine
+                older_blob = pair['blob1'] if pair['created1'] < pair['created2'] else pair['blob2']
+                newer_blob = pair['blob2'] if older_blob == pair['blob1'] else pair['blob1']
+                findings.append({
+                    'blob_hash': older_blob,
+                    'reason': f"Likely contradiction (confidence {confidence:.0%}): {reason}",
+                    'category': category,
+                    'confidence': confidence,
+                    'contradicted_by': newer_blob,
+                    'action': 'link_only'
+                })
+                try:
+                    link_cur = get_cursor()
+                    now = datetime.utcnow().isoformat() + 'Z'
+                    link_cur.execute(
+                        """INSERT INTO cross_references
+                           (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                            link_type, weight, reasoning, created_at)
+                           VALUES (%s, %s, %s, 'auto', 'auto', 'supersedes', %s, %s, %s)
+                           ON CONFLICT DO NOTHING""",
+                        (tenant_id, newer_blob, older_blob, confidence, reason, now)
+                    )
+                    get_db().commit()
+                    link_cur.close()
+                except Exception as le:
+                    print(f"[CONTRADICTION] Link creation error: {le}", file=sys.stderr)
+
+            elif category in ('update', 'drift') and confidence >= 0.8:
+                # Update or drift: create appropriate link type
+                older_blob = pair['blob1'] if pair['created1'] < pair['created2'] else pair['blob2']
+                newer_blob = pair['blob2'] if older_blob == pair['blob1'] else pair['blob1']
+                link_type = 'supersedes' if category == 'update' else 'drift'
+                findings.append({
+                    'blob_hash': older_blob,
+                    'reason': f"{category.title()} detected (confidence {confidence:.0%}): {reason}",
+                    'category': category,
+                    'confidence': confidence,
+                    'related_blob': newer_blob,
+                    'action': 'link_only'
+                })
+                try:
+                    link_cur = get_cursor()
+                    now = datetime.utcnow().isoformat() + 'Z'
+                    link_cur.execute(
+                        """INSERT INTO cross_references
+                           (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                            link_type, weight, reasoning, created_at)
+                           VALUES (%s, %s, %s, 'auto', 'auto', %s, %s, %s, %s)
+                           ON CONFLICT DO NOTHING""",
+                        (tenant_id, newer_blob, older_blob, link_type, confidence, reason, now)
+                    )
+                    get_db().commit()
+                    link_cur.close()
+                except Exception as le:
+                    print(f"[CONTRADICTION] Link creation error: {le}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[CONTRADICTION] Haiku analysis error for pair {pair['blob1'][:8]}../{pair['blob2'][:8]}..: {e}", file=sys.stderr)
+            continue
+
+    cur.close()
+    return findings
+
+
 # Define patrol routes
 PATROL_ROUTES = [
     {'name': 'CENTROID_DRIFT', 'detector': patrol_centroid_drift},
@@ -6581,6 +6896,7 @@ PATROL_ROUTES = [
     {'name': 'ISOLATED_CLUSTER', 'detector': patrol_isolated_clusters},
     {'name': 'DUPLICATE_EMBEDDING', 'detector': patrol_duplicate_embeddings},
     {'name': 'STALE_CHECKPOINT', 'detector': patrol_stale_checkpoints},
+    {'name': 'CONTRADICTION', 'detector': patrol_contradictions},
 ]
 
 
