@@ -9624,7 +9624,7 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "branch": {"type": "string", "description": "Branch to commit to (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
-                "content": {"type": "object", "description": "Memory content as JSON object"},
+                "content": {"oneOf": [{"type": "object"}, {"type": "string"}], "description": "Memory content as JSON object or JSON string"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
                 "content_type": {"type": "string", "description": "Content type: 'memory' (default) or 'plan'. Plans require title and status fields in content.", "default": "memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
@@ -10088,11 +10088,19 @@ def dispatch_mcp_tool(tool_name, args):
         err = _require(args, "branch", "content", "message")
         if err:
             return err
+        content = args["content"]
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+                if not isinstance(content, dict):
+                    return json.dumps({"error": "Content must parse to a JSON object, not " + type(content).__name__})
+            except (json.JSONDecodeError, TypeError):
+                return json.dumps({"error": "Content string is not valid JSON: " + content[:100]})
         payload = {
             "branch": args["branch"],
-            "content": args["content"],
+            "content": content,
             "message": args["message"],
-            "author": "claude-web",
+            "author": "claude",
             "type": args.get("content_type", "memory")
         }
         if "tags" in args:
