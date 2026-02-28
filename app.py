@@ -810,10 +810,16 @@ def oauth_token():
     import urllib.request, sys
     from urllib.parse import urlencode
 
-    # Forward all form data, inject audience
-    form_data = dict(request.form)
+    # Accept both form-encoded and JSON bodies
+    if request.is_json:
+        form_data = dict(request.get_json())
+    else:
+        form_data = dict(request.form)
+
     if 'audience' not in form_data:
         form_data['audience'] = AUTH0_AUDIENCE
+
+    print(f'[OAUTH-PROXY] Token request keys: {list(form_data.keys())}, grant_type={form_data.get("grant_type")}', file=sys.stderr)
 
     # Also forward Authorization header (for client_secret_basic)
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
