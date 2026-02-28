@@ -754,6 +754,7 @@ def oauth_authorization_server():
         'issuer': base_url,
         'authorization_endpoint': f'{base_url}/oauth/authorize',
         'token_endpoint': f'{base_url}/oauth/token',
+        'registration_endpoint': f'{base_url}/oauth/register',
         'scopes_supported': ['boswell:read', 'boswell:write', 'boswell:admin'],
         'response_types_supported': ['code'],
         'code_challenge_methods_supported': ['S256', 'plain'],

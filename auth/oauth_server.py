@@ -33,6 +33,8 @@ oauth_bp = Blueprint('oauth', __name__)
 _auth_codes = {}
 # In-memory refresh token store: token -> {user_id, email, tenant_id, client_id}
 _refresh_tokens = {}
+# In-memory client registration store: client_id -> {client_secret, redirect_uris, ...}
+_registered_clients = {}
 
 CODE_TTL = 300  # 5 minutes
 
@@ -288,5 +290,37 @@ def init_oauth(get_db, get_cursor):
             'expires_in': 168 * 3600,
             'refresh_token': new_refresh,
         })
+
+    @oauth_bp.route('/oauth/register', methods=['POST'])
+    def register_client():
+        """RFC 7591 - Dynamic Client Registration.
+        MCP clients register themselves to get a client_id."""
+        data = request.get_json() or {}
+
+        client_id = secrets.token_urlsafe(24)
+        client_secret = secrets.token_urlsafe(32)
+
+        _registered_clients[client_id] = {
+            'client_secret': client_secret,
+            'redirect_uris': data.get('redirect_uris', []),
+            'client_name': data.get('client_name', 'MCP Client'),
+            'grant_types': data.get('grant_types', ['authorization_code', 'refresh_token']),
+            'response_types': data.get('response_types', ['code']),
+            'token_endpoint_auth_method': data.get('token_endpoint_auth_method', 'client_secret_post'),
+        }
+
+        print(f'[OAUTH] Registered client: {client_id} name={_registered_clients[client_id]["client_name"]}', file=sys.stderr)
+
+        return jsonify({
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'client_id_issued_at': int(time.time()),
+            'client_secret_expires_at': 0,  # never expires
+            'redirect_uris': _registered_clients[client_id]['redirect_uris'],
+            'client_name': _registered_clients[client_id]['client_name'],
+            'grant_types': _registered_clients[client_id]['grant_types'],
+            'response_types': _registered_clients[client_id]['response_types'],
+            'token_endpoint_auth_method': _registered_clients[client_id]['token_endpoint_auth_method'],
+        }), 201
 
     return oauth_bp
