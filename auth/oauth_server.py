@@ -66,8 +66,9 @@ LOGIN_HTML = """<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Boswell — Sign In</title>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0a; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 2rem; width: 100%; max-width: 380px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; justify-content: center; align-items: center; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 2rem; width: 340px; }
   h1 { font-size: 1.5rem; margin: 0 0 0.5rem; color: #fff; }
   p { color: #888; font-size: 0.9rem; margin: 0 0 1.5rem; }
   label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }
