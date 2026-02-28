@@ -25,6 +25,9 @@ from datetime import datetime
 
 from flask import Blueprint, request, jsonify, redirect, make_response
 
+import hmac
+import base64
+
 from auth import (
     verify_password, generate_jwt, hash_password,
     JWT_SECRET, JWT_ALGORITHM
@@ -37,20 +40,45 @@ GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID', '')
 GITHUB_CLIENT_SECRET = os.environ.get('GITHUB_CLIENT_SECRET', '')
 
 # In-memory stores (persist across requests, cleared on redeploy)
+# NOTE: these are per-worker in gunicorn. Auth codes and refresh tokens
+# are short-lived enough that hitting a different worker causes a retry.
+# GitHub state is encoded in the state param itself (no server-side storage).
 _auth_codes = {}       # code -> {user_id, email, tenant_id, redirect_uri, client_id, expires, ...}
 _refresh_tokens = {}   # token -> {user_id, email, tenant_id, client_id}
 _registered_clients = {}  # client_id -> {client_secret, ...}
-_github_states = {}    # state -> {mcp_state, redirect_uri, client_id, code_challenge, ..., expires}
 
 CODE_TTL = 300  # 5 minutes
 
 
 def _cleanup_expired():
     now = time.time()
-    for store in [_auth_codes, _github_states]:
+    for store in [_auth_codes]:
         expired = [k for k, v in store.items() if v.get('expires', 0) < now]
         for k in expired:
             del store[k]
+
+
+def _encode_state(params):
+    """Encode MCP OAuth params into a signed state string (no server-side storage)."""
+    payload = _json.dumps(params, separators=(',', ':')).encode()
+    sig = hmac.new(JWT_SECRET.encode(), payload, hashlib.sha256).hexdigest()[:16]
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip('=')
+    return f'{sig}.{encoded}'
+
+
+def _decode_state(state):
+    """Decode and verify a signed state string. Returns params dict or None."""
+    try:
+        sig, encoded = state.split('.', 1)
+        # Restore base64 padding
+        padded = encoded + '=' * (4 - len(encoded) % 4)
+        payload = base64.urlsafe_b64decode(padded)
+        expected_sig = hmac.new(JWT_SECRET.encode(), payload, hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        return _json.loads(payload)
+    except Exception:
+        return None
 
 
 def _verify_pkce(code_verifier, code_challenge, method):
@@ -125,23 +153,19 @@ GITHUB_BTN_HTML = """<a href="$github_url" class="gh-btn">
 def _render_login(params, error=''):
     """Render login page with optional GitHub button."""
     if GITHUB_CLIENT_ID:
-        # Build GitHub OAuth URL, stashing MCP OAuth params in state
-        gh_state = secrets.token_urlsafe(24)
-        _github_states[gh_state] = {
-            'mcp_state': params.get('state', ''),
-            'redirect_uri': params.get('redirect_uri', ''),
-            'client_id': params.get('client_id', ''),
-            'code_challenge': params.get('code_challenge', ''),
-            'code_challenge_method': params.get('code_challenge_method', 'S256'),
-            'scope': params.get('scope', ''),
-            'expires': time.time() + CODE_TTL,
-        }
+        # Encode MCP OAuth params into signed state (no server-side storage needed)
+        gh_state = _encode_state({
+            's': params.get('state', ''),
+            'r': params.get('redirect_uri', ''),
+            'c': params.get('client_id', ''),
+            'ch': params.get('code_challenge', ''),
+            'cm': params.get('code_challenge_method', 'S256'),
+            'sc': params.get('scope', ''),
+        })
+        callback_url = _get_base_url() + '/oauth/callback/github'
         github_url = (
             f'https://github.com/login/oauth/authorize?'
-            f'client_id={GITHUB_CLIENT_ID}&'
-            f'redirect_uri={urlencode({"": _get_base_url() + "/oauth/callback/github"})[1:]}&'
-            f'scope=user:email&'
-            f'state={gh_state}'
+            f'{urlencode({"client_id": GITHUB_CLIENT_ID, "redirect_uri": callback_url, "scope": "user:email", "state": gh_state})}'
         )
         github_btn = Template(GITHUB_BTN_HTML).safe_substitute(github_url=github_url)
     else:
@@ -277,12 +301,11 @@ def init_oauth(get_db, get_cursor):
     def github_callback():
         """GitHub OAuth callback — exchange code for user email, provision if needed."""
         gh_code = request.args.get('code', '')
-        gh_state = request.args.get('state', '')
+        gh_state_raw = request.args.get('state', '')
 
-        if not gh_state or gh_state not in _github_states:
+        stashed = _decode_state(gh_state_raw) if gh_state_raw else None
+        if not stashed:
             return make_response('Invalid or expired state. Please try connecting again.', 400)
-
-        stashed = _github_states.pop(gh_state)
 
         if not gh_code:
             return make_response('GitHub authorization was denied.', 400)
@@ -346,11 +369,11 @@ def init_oauth(get_db, get_cursor):
             user_id=user_id,
             email=user_email,
             tenant_id=tenant_id,
-            redirect_uri=stashed['redirect_uri'],
-            client_id=stashed['client_id'],
-            code_challenge=stashed['code_challenge'],
-            code_challenge_method=stashed['code_challenge_method'],
-            mcp_state=stashed['mcp_state'],
+            redirect_uri=stashed['r'],
+            client_id=stashed['c'],
+            code_challenge=stashed['ch'],
+            code_challenge_method=stashed['cm'],
+            mcp_state=stashed['s'],
         )
 
     @oauth_bp.route('/oauth/token', methods=['POST'])
