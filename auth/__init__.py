@@ -193,8 +193,8 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         g.mcp_auth = {'source': 'internal', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Check API key auth (X-API-Key header) via database validation
-    api_key = request.headers.get('X-API-Key')
+    # Check API key auth (X-API-Key header or ?api_key= query param)
+    api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
     if api_key and api_key.startswith('bos_'):
         from auth.api_keys import validate_api_key
         key_info = validate_api_key(api_key, get_cursor_func, get_db_func)
