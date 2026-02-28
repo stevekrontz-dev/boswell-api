@@ -18,6 +18,7 @@ import os
 import secrets
 import time
 import sys
+from string import Template
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from flask import Blueprint, request, jsonify, redirect, make_response
@@ -65,14 +66,14 @@ LOGIN_HTML = """<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Boswell — Sign In</title>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0a; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 2rem; width: 100%%; max-width: 380px; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0a; color: #e0e0e0; display: flex; justify-content; align-items: center; min-height: 100vh; margin: 0; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 2rem; width: 100%; max-width: 380px; }
   h1 { font-size: 1.5rem; margin: 0 0 0.5rem; color: #fff; }
   p { color: #888; font-size: 0.9rem; margin: 0 0 1.5rem; }
   label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }
-  input { width: 100%%; padding: 0.6rem; background: #111; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 1rem; margin-bottom: 1rem; box-sizing: border-box; }
+  input { width: 100%; padding: 0.6rem; background: #111; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 1rem; margin-bottom: 1rem; box-sizing: border-box; }
   input:focus { outline: none; border-color: #4a9eff; }
-  button { width: 100%%; padding: 0.7rem; background: #4a9eff; color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+  button { width: 100%; padding: 0.7rem; background: #4a9eff; color: #fff; border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }
   button:hover { background: #3a8eef; }
   .error { color: #ff6b6b; font-size: 0.85rem; margin-bottom: 1rem; }
 </style>
@@ -80,14 +81,14 @@ LOGIN_HTML = """<!DOCTYPE html>
 <div class="card">
   <h1>Boswell</h1>
   <p>Sign in to connect your memory system</p>
-  {error}
+  $error
   <form method="POST">
-    <input type="hidden" name="state" value="{state}">
-    <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-    <input type="hidden" name="client_id" value="{client_id}">
-    <input type="hidden" name="code_challenge" value="{code_challenge}">
-    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
-    <input type="hidden" name="scope" value="{scope}">
+    <input type="hidden" name="state" value="$state">
+    <input type="hidden" name="redirect_uri" value="$redirect_uri">
+    <input type="hidden" name="client_id" value="$client_id">
+    <input type="hidden" name="code_challenge" value="$code_challenge">
+    <input type="hidden" name="code_challenge_method" value="$code_challenge_method">
+    <input type="hidden" name="scope" value="$scope">
     <label>Email</label>
     <input type="email" name="email" required autofocus>
     <label>Password</label>
@@ -111,7 +112,7 @@ def init_oauth(get_db, get_cursor):
         code_challenge_method = request.args.get('code_challenge_method', 'S256')
         scope = request.args.get('scope', '')
 
-        html = LOGIN_HTML.format(
+        html = Template(LOGIN_HTML).safe_substitute(
             state=state,
             redirect_uri=redirect_uri,
             client_id=client_id,
@@ -135,7 +136,7 @@ def init_oauth(get_db, get_cursor):
         scope = request.form.get('scope', '')
 
         def _error(msg):
-            html = LOGIN_HTML.format(
+            html = Template(LOGIN_HTML).safe_substitute(
                 state=state,
                 redirect_uri=redirect_uri,
                 client_id=client_id,
