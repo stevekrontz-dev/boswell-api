@@ -243,6 +243,8 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
     PUBLIC_PATHS = [
         '/', '/health', '/v2/health', '/v2/health/daemon', '/v2/health/ping',
         '/api/health', '/.well-known/oauth-protected-resource',
+        '/.well-known/oauth-authorization-server',
+        '/oauth/authorize', '/oauth/token',
         '/v2/onboard/provision',  # Public signup — no auth required
         '/v2/auth/register',      # Public registration
     ]
