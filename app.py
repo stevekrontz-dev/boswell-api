@@ -724,9 +724,9 @@ def health_daemon():
         return jsonify(response), 200
 
 
-# ==================== OAUTH DISCOVERY + PROXY ====================
-# Auth0 expects 'audience' param but MCP clients send 'resource' (RFC 8707).
-# We proxy OAuth endpoints, injecting 'audience' so Auth0 returns JWTs.
+# ==================== OAUTH DISCOVERY ====================
+# Boswell is its own OAuth Authorization Server. Auth0 proxy approach
+# failed because Auth0 returns opaque JWE tokens regardless of audience.
 
 def _get_base_url():
     """Get our public base URL."""
@@ -738,111 +738,28 @@ def _get_base_url():
 @app.route('/.well-known/oauth-protected-resource', methods=['GET'])
 def oauth_protected_resource():
     """RFC 9728 - Protected Resource Metadata for MCP Connectors."""
-    if not AUTH0_DOMAIN:
-        return jsonify({
-            'error': 'auth_not_configured',
-            'message': 'AUTH0_DOMAIN not set'
-        }), 503
-
     base_url = _get_base_url()
     return jsonify({
-        'resource': AUTH0_AUDIENCE,
+        'resource': base_url,
         'authorization_servers': [base_url],
-        'scopes_supported': ['openid', 'email', 'boswell:read', 'boswell:write', 'boswell:admin'],
+        'scopes_supported': ['boswell:read', 'boswell:write', 'boswell:admin'],
         'bearer_methods_supported': ['header']
     })
 
 @app.route('/.well-known/oauth-authorization-server', methods=['GET'])
 def oauth_authorization_server():
-    """RFC 8414 - Authorization Server Metadata (proxy to Auth0)."""
-    import urllib.request, json as _json
+    """RFC 8414 - Authorization Server Metadata."""
     base_url = _get_base_url()
-
-    # Fetch Auth0's metadata and override endpoints with our proxy
-    try:
-        req = urllib.request.Request(f'https://{AUTH0_DOMAIN}/.well-known/openid-configuration')
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            auth0_meta = _json.loads(resp.read().decode())
-    except Exception:
-        auth0_meta = {}
-
     return jsonify({
-        'issuer': f'https://{AUTH0_DOMAIN}/',
+        'issuer': base_url,
         'authorization_endpoint': f'{base_url}/oauth/authorize',
         'token_endpoint': f'{base_url}/oauth/token',
-        'registration_endpoint': f'https://{AUTH0_DOMAIN}/oidc/register',
-        'jwks_uri': f'https://{AUTH0_DOMAIN}/.well-known/jwks.json',
-        'scopes_supported': ['openid', 'email', 'profile', 'boswell:read', 'boswell:write', 'boswell:admin'],
-        'response_types_supported': auth0_meta.get('response_types_supported', ['code']),
-        'code_challenge_methods_supported': auth0_meta.get('code_challenge_methods_supported', ['S256']),
-        'token_endpoint_auth_methods_supported': auth0_meta.get('token_endpoint_auth_methods_supported', ['client_secret_basic', 'client_secret_post']),
+        'scopes_supported': ['boswell:read', 'boswell:write', 'boswell:admin'],
+        'response_types_supported': ['code'],
+        'code_challenge_methods_supported': ['S256', 'plain'],
+        'token_endpoint_auth_methods_supported': ['client_secret_basic', 'client_secret_post', 'none'],
         'grant_types_supported': ['authorization_code', 'refresh_token'],
     })
-
-@app.route('/oauth/authorize', methods=['GET'])
-def oauth_authorize():
-    """Proxy authorize to Auth0, injecting audience + openid scope."""
-    from urllib.parse import urlencode, parse_qs, urlparse
-    import sys
-
-    params = dict(request.args)
-
-    # Inject audience (Auth0's name for RFC 8707 'resource')
-    if 'audience' not in params:
-        params['audience'] = AUTH0_AUDIENCE
-
-    # Ensure openid + email scopes are included
-    scope = params.get('scope', '')
-    scopes = set(scope.split()) if scope else set()
-    scopes.add('openid')
-    scopes.add('email')
-    params['scope'] = ' '.join(scopes)
-
-    auth0_url = f'https://{AUTH0_DOMAIN}/authorize?{urlencode(params)}'
-    print(f'[OAUTH-PROXY] Redirecting authorize → Auth0 (audience={params["audience"]}, scope={params["scope"]})', file=sys.stderr)
-
-    from flask import redirect
-    return redirect(auth0_url)
-
-@app.route('/oauth/token', methods=['POST'])
-def oauth_token():
-    """Proxy token request to Auth0, injecting audience."""
-    import urllib.request, sys
-    from urllib.parse import urlencode
-
-    # Accept both form-encoded and JSON bodies
-    if request.is_json:
-        form_data = dict(request.get_json())
-    else:
-        form_data = dict(request.form)
-
-    if 'audience' not in form_data:
-        form_data['audience'] = AUTH0_AUDIENCE
-
-    print(f'[OAUTH-PROXY] Token request keys: {list(form_data.keys())}, grant_type={form_data.get("grant_type")}', file=sys.stderr)
-
-    # Also forward Authorization header (for client_secret_basic)
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    auth_header = request.headers.get('Authorization')
-    if auth_header:
-        headers['Authorization'] = auth_header
-
-    auth0_url = f'https://{AUTH0_DOMAIN}/oauth/token'
-
-    try:
-        encoded = urlencode(form_data).encode()
-        req = urllib.request.Request(auth0_url, data=encoded, headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode()
-            print(f'[OAUTH-PROXY] Token exchange OK, response {len(body)} chars', file=sys.stderr)
-            return app.response_class(body, status=200, content_type='application/json')
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        print(f'[OAUTH-PROXY] Token exchange failed HTTP {e.code}: {error_body[:300]}', file=sys.stderr)
-        return app.response_class(error_body, status=e.code, content_type='application/json')
-    except Exception as e:
-        print(f'[OAUTH-PROXY] Token exchange error: {e}', file=sys.stderr)
-        return jsonify({'error': 'server_error', 'error_description': str(e)}), 500
 
 @app.route('/v2/head', methods=['GET'])
 def get_head():
@@ -9303,6 +9220,15 @@ app.register_blueprint(login_bp)
 from auth.api_keys import init_api_keys
 api_keys_bp = init_api_keys(get_db, get_cursor)
 app.register_blueprint(api_keys_bp)
+
+
+# =============================================================================
+# OAUTH SERVER (Boswell's own OAuth 2.1 Authorization Server for MCP)
+# =============================================================================
+
+from auth.oauth_server import init_oauth
+oauth_bp = init_oauth(get_db, get_cursor)
+app.register_blueprint(oauth_bp)
 
 
 # =============================================================================

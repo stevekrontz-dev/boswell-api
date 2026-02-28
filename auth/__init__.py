@@ -275,10 +275,29 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
             return None
         # Invalid API key — fall through to denial
 
-    # Check Bearer token (Auth0)
+    # Check Bearer token (our own JWT first, then Auth0 fallback)
     auth_header = request.headers.get('Authorization', '')
     if auth_header.startswith('Bearer '):
         token = auth_header[7:]
+
+        # Try our own JWT first (from Boswell OAuth server)
+        try:
+            payload = verify_jwt(token)
+            tenant_id = payload.get('tenant_id')
+            if tenant_id:
+                print(f'[AUTH] Boswell JWT valid for {payload.get("email")} tenant={tenant_id}', file=sys.stderr)
+                g.mcp_auth = {
+                    'source': 'boswell_jwt',
+                    'tenant_id': tenant_id,
+                    'user_id': payload.get('sub'),
+                    'email': payload.get('email'),
+                    'scope': '',
+                }
+                return None
+        except ValueError:
+            pass  # Not our JWT, try Auth0
+
+        # Auth0 token fallback
         auth_info = validate_auth0_token(token)
         if auth_info:
             # Resolve tenant_id from DB if missing (opaque tokens, JWT without claim)
