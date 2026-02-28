@@ -9364,6 +9364,10 @@ from onboarding.routes import init_onboarding
 onboarding_bp = init_onboarding(get_db, get_cursor)
 app.register_blueprint(onboarding_bp)
 
+from party.routes import init_party
+party_bp = init_party(get_db, get_cursor)
+app.register_blueprint(party_bp)
+
 
 # =============================================================================
 # EXTENSION DOWNLOAD (W4P2 - CC4)
@@ -10573,7 +10577,7 @@ def serve_assets(filename):
 def serve_spa(path):
     """Catch-all route for SPA - return index.html for client-side routing."""
     # Don't catch API routes
-    if path.startswith('v2/') or path.startswith('api/') or path.startswith('auth/') or path.startswith('mcp'):
+    if path.startswith('v2/') or path.startswith('api/') or path.startswith('auth/') or path.startswith('mcp') or path.startswith('party'):
         return jsonify({'error': 'Not found'}), 404
     # Check if it's a static file
     static_path = os.path.join(DASHBOARD_DIR, path)

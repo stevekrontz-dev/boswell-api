@@ -18,6 +18,7 @@ COPY passkey_auth.py .
 COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY onboarding/ ./onboarding/
+COPY party/ ./party/
 COPY extension/ ./extension/
 
 # Copy database migrations (needed for ensure_hippocampal_tables)

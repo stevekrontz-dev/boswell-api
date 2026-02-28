@@ -249,7 +249,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/onboard/provision',  # Public signup — no auth required
         '/v2/auth/register',      # Public registration
     ]
-    if request.path in PUBLIC_PATHS:
+    if request.path in PUBLIC_PATHS or request.path.startswith('/party'):
         return None
 
     # Internal request (stdio) - CRITICAL: protects CC/Desktop

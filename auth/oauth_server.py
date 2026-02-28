@@ -143,14 +143,18 @@ def _render_login(params, error=''):
     """Render login page with optional GitHub button."""
     if GITHUB_CLIENT_ID:
         # Encode MCP OAuth params into signed state (no server-side storage needed)
-        gh_state = _encode_state({
+        state_data = {
             's': params.get('state', ''),
             'r': params.get('redirect_uri', ''),
             'c': params.get('client_id', ''),
             'ch': params.get('code_challenge', ''),
             'cm': params.get('code_challenge_method', 'S256'),
             'sc': params.get('scope', ''),
-        })
+        }
+        # Thread invite code through OAuth flow (party beta)
+        if params.get('invite_code'):
+            state_data['ic'] = params['invite_code']
+        gh_state = _encode_state(state_data)
         callback_url = _get_base_url() + '/oauth/callback/github'
         github_url = (
             f'https://github.com/login/oauth/authorize?'
@@ -195,9 +199,13 @@ def _issue_auth_code(user_id, email, tenant_id, redirect_uri, client_id, code_ch
 def init_oauth(get_db, get_cursor):
     """Initialize OAuth blueprint with database access."""
 
-    def _find_or_create_user(email, github_id=None):
-        """Find existing user by email, or auto-provision a new free-tier account."""
+    def _find_or_create_user(email, github_id=None, invite_code=None):
+        """Find existing user by email, or auto-provision a new account.
+        If invite_code matches PARTY_INVITE_CODE, user gets plan='pro'."""
         from billing.provisioning import provision_tenant
+
+        party_code = os.environ.get('PARTY_INVITE_CODE', '')
+        plan = 'pro' if (invite_code and party_code and invite_code == party_code) else 'free'
 
         cur = get_cursor()
         db = get_db()
@@ -206,6 +214,13 @@ def init_oauth(get_db, get_cursor):
             user = cur.fetchone()
 
             if user:
+                # Upgrade existing free user to pro if they have a valid invite
+                if plan == 'pro':
+                    cur.execute(
+                        'UPDATE users SET plan = %s, updated_at = %s WHERE id = %s',
+                        ('pro', datetime.utcnow().isoformat() + 'Z', user['id'])
+                    )
+                    print(f'[OAUTH] Upgraded {email} to pro via party invite', file=sys.stderr)
                 if not user.get('tenant_id'):
                     # Existing user without tenant — provision one
                     result = provision_tenant(cur, email, user_id=str(user['id']))
@@ -215,8 +230,9 @@ def init_oauth(get_db, get_cursor):
                     )
                     db.commit()
                     print(f'[OAUTH] Provisioned tenant for existing user {email}', file=sys.stderr)
-                    return str(user['id']), email, result['tenant_id']
-                return str(user['id']), email, str(user['tenant_id'])
+                    return str(user['id']), email, result['tenant_id'], result.get('api_key')
+                db.commit()
+                return str(user['id']), email, str(user['tenant_id']), None
 
             # New user — auto-provision
             user_id = str(uuid.uuid4())
@@ -224,8 +240,8 @@ def init_oauth(get_db, get_cursor):
             # No password for GitHub users (they auth via GitHub)
             cur.execute(
                 '''INSERT INTO users (id, email, password_hash, status, plan, created_at)
-                   VALUES (%s, %s, %s, 'active', 'free', %s)''',
-                (user_id, email, '', now)
+                   VALUES (%s, %s, %s, 'active', %s, %s)''',
+                (user_id, email, '', plan, now)
             )
             result = provision_tenant(cur, email, user_id=user_id)
             cur.execute(
@@ -233,8 +249,8 @@ def init_oauth(get_db, get_cursor):
                 (result['tenant_id'], result['api_key_encrypted'], now, user_id)
             )
             db.commit()
-            print(f'[OAUTH] Auto-provisioned new user {email}: tenant={result["tenant_id"]}', file=sys.stderr)
-            return user_id, email, result['tenant_id']
+            print(f'[OAUTH] Auto-provisioned new user {email}: tenant={result["tenant_id"]} plan={plan}', file=sys.stderr)
+            return user_id, email, result['tenant_id'], result['api_key']
 
         except Exception as e:
             db.rollback()
@@ -344,14 +360,40 @@ def init_oauth(get_db, get_cursor):
             print(f'[OAUTH] GitHub email fetch error: {e}', file=sys.stderr)
             return make_response('Failed to get GitHub profile.', 500)
 
+        # Extract invite code from state (party beta flow)
+        invite_code = stashed.get('ic', '')
+        is_party_flow = stashed.get('party', False)
+
         # Find or create user
         try:
-            user_id, user_email, tenant_id = _find_or_create_user(email)
+            user_id, user_email, tenant_id, api_key = _find_or_create_user(email, invite_code=invite_code)
         except Exception as e:
             return make_response(f'Account setup failed: {e}', 500)
 
         print(f'[OAUTH] GitHub login: {email} → tenant={tenant_id}', file=sys.stderr)
 
+        # Party flow: redirect to /party/success with signed API key
+        if is_party_flow and invite_code:
+            if not api_key:
+                # Existing user — look up their API key
+                try:
+                    from auth import decrypt_api_key
+                    cur = get_cursor()
+                    cur.execute('SELECT api_key_encrypted FROM users WHERE id = %s', (user_id,))
+                    row = cur.fetchone()
+                    cur.close()
+                    if row and row.get('api_key_encrypted'):
+                        api_key = decrypt_api_key(row['api_key_encrypted'])
+                except Exception as e:
+                    print(f'[OAUTH] Could not retrieve API key for {email}: {e}', file=sys.stderr)
+
+            if api_key:
+                success_state = _encode_state({'ak': api_key})
+                return redirect(f'{_get_base_url()}/party/success?s={success_state}')
+            else:
+                return make_response('Account created but could not retrieve API key. Contact Steve.', 500)
+
+        # Normal MCP OAuth flow
         return _issue_auth_code(
             user_id=user_id,
             email=user_email,
