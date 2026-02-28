@@ -127,8 +127,60 @@ def get_jwks_client():
     return _jwks_client
 
 
+def _is_jwt_format(token: str) -> bool:
+    """Check if token looks like a JWT (three dot-separated base64url parts)."""
+    parts = token.split('.')
+    return len(parts) == 3 and all(len(p) > 0 for p in parts)
+
+
+def _validate_via_userinfo(token: str) -> dict:
+    """Validate opaque token via Auth0 /userinfo endpoint.
+    Returns partial auth info (tenant_id=None, needs DB lookup)."""
+    import sys
+    import urllib.request
+    import json as _json
+
+    if not AUTH0_DOMAIN:
+        return None
+
+    try:
+        url = f'https://{AUTH0_DOMAIN}/userinfo'
+        req = urllib.request.Request(url, headers={
+            'Authorization': f'Bearer {token}'
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            userinfo = _json.loads(resp.read().decode())
+
+        sub = userinfo.get('sub')
+        email = userinfo.get('email')
+
+        if not sub:
+            print(f'[AUTH] /userinfo returned no sub', file=sys.stderr)
+            return None
+
+        print(f'[AUTH] Opaque token validated via /userinfo: sub={sub} email={email}', file=sys.stderr)
+        return {
+            'user_id': sub,
+            'tenant_id': None,  # Resolved in check_mcp_auth via DB
+            'scope': '',
+            'email': email,
+            'source': 'auth0_userinfo'
+        }
+    except Exception as e:
+        print(f'[AUTH] /userinfo failed: {e}', file=sys.stderr)
+        return None
+
+
 def validate_auth0_token(token: str) -> dict:
-    """Validate Auth0 JWT. Returns claims or None."""
+    """Validate Auth0 token. Tries JWT first, falls back to /userinfo for opaque tokens."""
+    import sys
+
+    # Opaque token — skip JWT decode, go straight to /userinfo
+    if not _is_jwt_format(token):
+        print(f'[AUTH] Token is opaque ({len(token)} chars), trying /userinfo', file=sys.stderr)
+        return _validate_via_userinfo(token)
+
+    # JWT path
     jwks = get_jwks_client()
     if not jwks:
         return None
@@ -144,10 +196,14 @@ def validate_auth0_token(token: str) -> dict:
         )
         tenant_id = payload.get('https://boswell.app/tenant_id')
         if not tenant_id:
-            # Auth0 token without tenant claim — deny, don't fall through to Steve's data
-            import sys
-            print(f'[AUTH] Auth0 token valid but missing tenant_id claim for {payload.get("email")}', file=sys.stderr)
-            return None  # Will fall through to denial in check_mcp_auth
+            print(f'[AUTH] Auth0 JWT valid but missing tenant_id claim for {payload.get("email")}', file=sys.stderr)
+            return {
+                'user_id': payload['sub'],
+                'tenant_id': None,  # Resolved in check_mcp_auth via DB
+                'scope': payload.get('scope', ''),
+                'email': payload.get('email'),
+                'source': 'auth0'
+            }
         return {
             'user_id': payload['sub'],
             'tenant_id': tenant_id,
@@ -156,9 +212,8 @@ def validate_auth0_token(token: str) -> dict:
             'source': 'auth0'
         }
     except Exception as e:
-        import sys
-        print(f'[AUTH] Auth0 token validation failed: {e}', file=sys.stderr)
-        return None
+        print(f'[AUTH] Auth0 JWT decode failed: {e}, trying /userinfo fallback', file=sys.stderr)
+        return _validate_via_userinfo(token)
 
 
 def is_internal_request():
@@ -193,8 +248,8 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         g.mcp_auth = {'source': 'internal', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Check API key auth (X-API-Key header or ?api_key= query param)
-    api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
+    # Check API key auth (X-API-Key header)
+    api_key = request.headers.get('X-API-Key')
     if api_key and api_key.startswith('bos_'):
         from auth.api_keys import validate_api_key
         key_info = validate_api_key(api_key, get_cursor_func, get_db_func)
@@ -218,6 +273,24 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         token = auth_header[7:]
         auth_info = validate_auth0_token(token)
         if auth_info:
+            # Resolve tenant_id from DB if missing (opaque tokens, JWT without claim)
+            if not auth_info.get('tenant_id') and auth_info.get('email'):
+                try:
+                    cur = get_cursor_func()
+                    cur.execute('SELECT tenant_id FROM users WHERE email = %s', (auth_info['email'],))
+                    row = cur.fetchone()
+                    cur.close()
+                    if row and row.get('tenant_id'):
+                        auth_info['tenant_id'] = str(row['tenant_id'])
+                        print(f'[AUTH] Resolved tenant {auth_info["tenant_id"]} from DB for {auth_info["email"]}', file=sys.stderr)
+                except Exception as e:
+                    print(f'[AUTH] Tenant DB lookup failed: {e}', file=sys.stderr)
+            if not auth_info.get('tenant_id'):
+                print(f'[AUTH] Auth0 user {auth_info.get("email")} has no tenant — denying', file=sys.stderr)
+                return jsonify({
+                    'error': 'forbidden',
+                    'error_description': 'No tenant associated with this account. Register at /v2/onboard/provision first.'
+                }), 403
             g.mcp_auth = auth_info
             return None
 
