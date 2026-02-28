@@ -149,13 +149,15 @@ def _validate_via_userinfo(token: str) -> dict:
             'Authorization': f'Bearer {token}'
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
-            userinfo = _json.loads(resp.read().decode())
+            raw_body = resp.read().decode()
+            print(f'[AUTH] /userinfo raw response ({len(raw_body)} chars): {raw_body[:500]}', file=sys.stderr)
+            userinfo = _json.loads(raw_body)
 
         sub = userinfo.get('sub')
         email = userinfo.get('email')
 
         if not sub:
-            print(f'[AUTH] /userinfo returned no sub', file=sys.stderr)
+            print(f'[AUTH] /userinfo returned no sub. Keys: {list(userinfo.keys())}', file=sys.stderr)
             return None
 
         print(f'[AUTH] Opaque token validated via /userinfo: sub={sub} email={email}', file=sys.stderr)
@@ -175,9 +177,13 @@ def validate_auth0_token(token: str) -> dict:
     """Validate Auth0 token. Tries JWT first, falls back to /userinfo for opaque tokens."""
     import sys
 
+    # Log token structure for debugging
+    dot_count = token.count('.')
+    print(f'[AUTH] Token: {len(token)} chars, {dot_count} dots, first20={token[:20]}...', file=sys.stderr)
+
     # Opaque token — skip JWT decode, go straight to /userinfo
     if not _is_jwt_format(token):
-        print(f'[AUTH] Token is opaque ({len(token)} chars), trying /userinfo', file=sys.stderr)
+        print(f'[AUTH] Token is opaque, trying /userinfo', file=sys.stderr)
         return _validate_via_userinfo(token)
 
     # JWT path
