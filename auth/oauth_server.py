@@ -58,13 +58,15 @@ def _decode_state(state):
     try:
         sig, encoded = state.split('.', 1)
         # Restore base64 padding
-        padded = encoded + '=' * (4 - len(encoded) % 4)
+        padded = encoded + '=' * (-len(encoded) % 4)
         payload = base64.urlsafe_b64decode(padded)
         expected_sig = hmac.new(JWT_SECRET.encode(), payload, hashlib.sha256).hexdigest()[:16]
         if not hmac.compare_digest(sig, expected_sig):
+            print(f'[OAUTH] State sig mismatch: got={sig} expected={expected_sig}', file=sys.stderr)
             return None
         return _json.loads(payload)
-    except Exception:
+    except Exception as e:
+        print(f'[OAUTH] State decode error: {e}', file=sys.stderr)
         return None
 
 
@@ -183,7 +185,7 @@ def _issue_auth_code(user_id, email, tenant_id, redirect_uri, client_id, code_ch
         'cm': code_challenge_method,
         'x': int(time.time()) + CODE_TTL,
     })
-    print(f'[OAUTH] Issued auth code for {email} → {redirect_uri[:60]}...', file=sys.stderr)
+    print(f'[OAUTH] Issued auth code for {email}: {len(code)} chars, first40={code[:40]}...', file=sys.stderr)
 
     sep = '&' if '?' in redirect_uri else '?'
     callback = f'{redirect_uri}{sep}{urlencode({"code": code, "state": mcp_state})}'
@@ -383,9 +385,11 @@ def init_oauth(get_db, get_cursor):
         redirect_uri = data.get('redirect_uri', '')
         code_verifier = data.get('code_verifier', '')
 
+        print(f'[OAUTH] Token exchange: code={len(code_raw)} chars, first40={code_raw[:40]}...', file=sys.stderr)
+
         code_data = _decode_state(code_raw) if code_raw else None
         if not code_data:
-            print(f'[OAUTH] Invalid auth code (bad signature)', file=sys.stderr)
+            print(f'[OAUTH] Invalid auth code (decode failed). Raw code: {code_raw[:80]}...', file=sys.stderr)
             return jsonify({'error': 'invalid_grant', 'error_description': 'Invalid or expired authorization code'}), 400
 
         if code_data.get('x', 0) < time.time():
