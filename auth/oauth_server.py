@@ -39,23 +39,10 @@ oauth_bp = Blueprint('oauth', __name__)
 GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID', '')
 GITHUB_CLIENT_SECRET = os.environ.get('GITHUB_CLIENT_SECRET', '')
 
-# In-memory stores (persist across requests, cleared on redeploy)
-# NOTE: these are per-worker in gunicorn. Auth codes and refresh tokens
-# are short-lived enough that hitting a different worker causes a retry.
-# GitHub state is encoded in the state param itself (no server-side storage).
-_auth_codes = {}       # code -> {user_id, email, tenant_id, redirect_uri, client_id, expires, ...}
-_refresh_tokens = {}   # token -> {user_id, email, tenant_id, client_id}
-_registered_clients = {}  # client_id -> {client_secret, ...}
+# All OAuth state (auth codes, refresh tokens, client registrations) is encoded
+# as HMAC-signed tokens. No server-side dicts needed — works across gunicorn workers.
 
 CODE_TTL = 300  # 5 minutes
-
-
-def _cleanup_expired():
-    now = time.time()
-    for store in [_auth_codes]:
-        expired = [k for k, v in store.items() if v.get('expires', 0) < now]
-        for k in expired:
-            del store[k]
 
 
 def _encode_state(params):
@@ -185,19 +172,17 @@ def _render_login(params, error=''):
 
 
 def _issue_auth_code(user_id, email, tenant_id, redirect_uri, client_id, code_challenge, code_challenge_method, mcp_state):
-    """Issue an auth code and redirect to the MCP client callback."""
-    _cleanup_expired()
-    code = secrets.token_urlsafe(32)
-    _auth_codes[code] = {
-        'user_id': user_id,
-        'email': email,
-        'tenant_id': tenant_id,
-        'redirect_uri': redirect_uri,
-        'client_id': client_id,
-        'code_challenge': code_challenge,
-        'code_challenge_method': code_challenge_method,
-        'expires': time.time() + CODE_TTL,
-    }
+    """Issue a self-contained signed auth code and redirect to the MCP client callback."""
+    code = _encode_state({
+        'u': user_id,
+        'e': email,
+        't': tenant_id,
+        'r': redirect_uri,
+        'c': client_id,
+        'ch': code_challenge,
+        'cm': code_challenge_method,
+        'x': int(time.time()) + CODE_TTL,
+    })
     print(f'[OAUTH] Issued auth code for {email} → {redirect_uri[:60]}...', file=sys.stderr)
 
     sep = '&' if '?' in redirect_uri else '?'
@@ -394,44 +379,46 @@ def init_oauth(get_db, get_cursor):
             return jsonify({'error': 'unsupported_grant_type'}), 400
 
     def _handle_auth_code(data):
-        code = data.get('code')
+        code_raw = data.get('code', '')
         redirect_uri = data.get('redirect_uri', '')
         code_verifier = data.get('code_verifier', '')
 
-        _cleanup_expired()
-
-        if not code or code not in _auth_codes:
-            print(f'[OAUTH] Invalid/expired auth code', file=sys.stderr)
+        code_data = _decode_state(code_raw) if code_raw else None
+        if not code_data:
+            print(f'[OAUTH] Invalid auth code (bad signature)', file=sys.stderr)
             return jsonify({'error': 'invalid_grant', 'error_description': 'Invalid or expired authorization code'}), 400
 
-        code_data = _auth_codes.pop(code)
+        if code_data.get('x', 0) < time.time():
+            print(f'[OAUTH] Expired auth code', file=sys.stderr)
+            return jsonify({'error': 'invalid_grant', 'error_description': 'Invalid or expired authorization code'}), 400
 
-        if redirect_uri and redirect_uri != code_data['redirect_uri']:
+        if redirect_uri and redirect_uri != code_data['r']:
             print(f'[OAUTH] redirect_uri mismatch', file=sys.stderr)
             return jsonify({'error': 'invalid_grant', 'error_description': 'redirect_uri mismatch'}), 400
 
-        if code_data['code_challenge']:
+        if code_data.get('ch'):
             if not code_verifier:
                 return jsonify({'error': 'invalid_grant', 'error_description': 'code_verifier required'}), 400
-            if not _verify_pkce(code_verifier, code_data['code_challenge'], code_data['code_challenge_method']):
+            if not _verify_pkce(code_verifier, code_data['ch'], code_data.get('cm', 'S256')):
                 print(f'[OAUTH] PKCE verification failed', file=sys.stderr)
                 return jsonify({'error': 'invalid_grant', 'error_description': 'PKCE verification failed'}), 400
 
         access_token = generate_jwt(
-            user_id=code_data['user_id'],
-            email=code_data['email'],
-            tenant_id=code_data['tenant_id']
+            user_id=code_data['u'],
+            email=code_data['e'],
+            tenant_id=code_data['t']
         )
 
-        refresh = secrets.token_urlsafe(48)
-        _refresh_tokens[refresh] = {
-            'user_id': code_data['user_id'],
-            'email': code_data['email'],
-            'tenant_id': code_data['tenant_id'],
-            'client_id': code_data['client_id'],
-        }
+        # Refresh token is also a signed token (no server-side storage)
+        refresh = _encode_state({
+            'u': code_data['u'],
+            'e': code_data['e'],
+            't': code_data['t'],
+            'c': code_data['c'],
+            'k': 'refresh',
+        })
 
-        print(f'[OAUTH] Issued JWT for {code_data["email"]} (tenant={code_data["tenant_id"]})', file=sys.stderr)
+        print(f'[OAUTH] Issued JWT for {code_data["e"]} (tenant={code_data["t"]})', file=sys.stderr)
 
         return jsonify({
             'access_token': access_token,
@@ -441,24 +428,28 @@ def init_oauth(get_db, get_cursor):
         })
 
     def _handle_refresh_token(data):
-        refresh = data.get('refresh_token')
+        refresh_raw = data.get('refresh_token', '')
 
-        if not refresh or refresh not in _refresh_tokens:
+        token_data = _decode_state(refresh_raw) if refresh_raw else None
+        if not token_data or token_data.get('k') != 'refresh':
             return jsonify({'error': 'invalid_grant', 'error_description': 'Invalid refresh token'}), 400
 
-        token_data = _refresh_tokens[refresh]
-
         access_token = generate_jwt(
-            user_id=token_data['user_id'],
-            email=token_data['email'],
-            tenant_id=token_data['tenant_id']
+            user_id=token_data['u'],
+            email=token_data['e'],
+            tenant_id=token_data['t']
         )
 
-        new_refresh = secrets.token_urlsafe(48)
-        _refresh_tokens[new_refresh] = token_data
-        del _refresh_tokens[refresh]
+        # Issue new refresh token (same data, new signature timestamp not needed since HMAC is deterministic on same data)
+        new_refresh = _encode_state({
+            'u': token_data['u'],
+            'e': token_data['e'],
+            't': token_data['t'],
+            'c': token_data.get('c', ''),
+            'k': 'refresh',
+        })
 
-        print(f'[OAUTH] Refreshed JWT for {token_data["email"]}', file=sys.stderr)
+        print(f'[OAUTH] Refreshed JWT for {token_data["e"]}', file=sys.stderr)
 
         return jsonify({
             'access_token': access_token,
@@ -469,33 +460,32 @@ def init_oauth(get_db, get_cursor):
 
     @oauth_bp.route('/oauth/register', methods=['POST'])
     def register_client():
-        """RFC 7591 - Dynamic Client Registration."""
+        """RFC 7591 - Dynamic Client Registration.
+        Client ID is a signed token containing registration data — no server-side storage."""
         data = request.get_json() or {}
 
-        client_id = secrets.token_urlsafe(24)
-        client_secret = secrets.token_urlsafe(32)
-
-        _registered_clients[client_id] = {
-            'client_secret': client_secret,
-            'redirect_uris': data.get('redirect_uris', []),
-            'client_name': data.get('client_name', 'MCP Client'),
-            'grant_types': data.get('grant_types', ['authorization_code', 'refresh_token']),
-            'response_types': data.get('response_types', ['code']),
-            'token_endpoint_auth_method': data.get('token_endpoint_auth_method', 'client_secret_post'),
+        client_name = data.get('client_name', 'MCP Client')
+        reg_data = {
+            'k': 'dcr',
+            'n': client_name,
+            'ru': data.get('redirect_uris', []),
         }
+        client_id = _encode_state(reg_data)
+        # Client secret is HMAC of client_id — deterministic, verifiable
+        client_secret = hmac.new(JWT_SECRET.encode(), client_id.encode(), hashlib.sha256).hexdigest()[:32]
 
-        print(f'[OAUTH] Registered client: {client_id} name={_registered_clients[client_id]["client_name"]}', file=sys.stderr)
+        print(f'[OAUTH] Registered client: {client_id[:30]}... name={client_name}', file=sys.stderr)
 
         return jsonify({
             'client_id': client_id,
             'client_secret': client_secret,
             'client_id_issued_at': int(time.time()),
             'client_secret_expires_at': 0,
-            'redirect_uris': _registered_clients[client_id]['redirect_uris'],
-            'client_name': _registered_clients[client_id]['client_name'],
-            'grant_types': _registered_clients[client_id]['grant_types'],
-            'response_types': _registered_clients[client_id]['response_types'],
-            'token_endpoint_auth_method': _registered_clients[client_id]['token_endpoint_auth_method'],
+            'redirect_uris': data.get('redirect_uris', []),
+            'client_name': client_name,
+            'grant_types': data.get('grant_types', ['authorization_code', 'refresh_token']),
+            'response_types': data.get('response_types', ['code']),
+            'token_endpoint_auth_method': data.get('token_endpoint_auth_method', 'client_secret_post'),
         }), 201
 
     return oauth_bp
