@@ -1860,14 +1860,16 @@ def search_memories():
     - q: Search query (required)
     - type: Filter by content_type
     - limit: Max results (default: 20)
-    - mode: Search mode - 'keyword' (default, LIKE), 'semantic', 'hybrid' (BM25 + vector RRF)
+    - mode: Search mode - 'hybrid' (default, BM25 + vector RRF), 'semantic', 'keyword' (redirects to BM25)
+    - branch: Filter results to a specific branch (optional)
     """
     if HIPPOCAMPAL_ENABLED:
         ensure_hippocampal_tables()
     query = request.args.get('q', '')
     memory_type = request.args.get('type')
     limit = request.args.get('limit', 20, type=int)
-    mode = request.args.get('mode', 'keyword')
+    mode = request.args.get('mode', 'hybrid')
+    branch = request.args.get('branch')
 
     if not query:
         return jsonify({'error': 'Search query required'}), 400
@@ -1878,37 +1880,51 @@ def search_memories():
         cur = get_cursor()
         tenant_id = get_tenant_id()
 
-        # Run both searches with 2x limit to get good fusion candidates
+        # Over-fetch for fusion candidates (extra if branch filtering)
+        fetch_mult = 4 if branch else 2
         try:
-            keyword_results = bm25_search(cur, query, tenant_id, limit=limit * 2)
+            keyword_results = bm25_search(cur, query, tenant_id, limit=limit * fetch_mult)
         except Exception as e:
             print(f"[HYBRID] BM25 search error (falling back to empty): {e}", file=sys.stderr)
             keyword_results = []
 
         try:
-            semantic_results = _semantic_search_internal(cur, query, tenant_id, limit=limit * 2)
+            semantic_results = _semantic_search_internal(cur, query, tenant_id, limit=limit * fetch_mult)
         except Exception as e:
             print(f"[HYBRID] Semantic search error (falling back to empty): {e}", file=sys.stderr)
             semantic_results = []
 
         # Fuse via RRF, then apply multi-signal reranking
         rrf_results = reciprocal_rank_fusion(keyword_results, semantic_results)
-        results = _rerank_results(rrf_results, cur, tenant_id)[:limit]
+        results = _rerank_results(rrf_results, cur, tenant_id)
+
+        # Branch filter: post-filter permanent results by branch membership
+        if branch:
+            permanent_hashes = [r['blob_hash'] for r in results if r.get('source') != 'staged']
+            if permanent_hashes:
+                branch_map = get_blob_branches_batch(cur, permanent_hashes, tenant_id)
+                results = [r for r in results if branch_map.get(r['blob_hash'], '').lower() == branch.lower()]
+        results = results[:limit]
 
         # Also search staged candidates if hippocampal enabled
         if HIPPOCAMPAL_ENABLED:
             try:
                 remaining = limit - len(results)
                 if remaining > 0:
-                    cur.execute("""
+                    staged_sql = """
                         SELECT id, branch, summary, content, message, source_instance,
                                created_at
                         FROM candidate_memories
                         WHERE tenant_id = %s AND status IN ('active', 'cooling')
                           AND (summary ILIKE %s OR content::text ILIKE %s)
-                        ORDER BY created_at DESC
-                        LIMIT %s
-                    """, (tenant_id, f'%{query}%', f'%{query}%', remaining))
+                    """
+                    staged_params = [tenant_id, f'%{query}%', f'%{query}%']
+                    if branch:
+                        staged_sql += " AND LOWER(branch) = LOWER(%s)"
+                        staged_params.append(branch)
+                    staged_sql += " ORDER BY created_at DESC LIMIT %s"
+                    staged_params.append(remaining)
+                    cur.execute(staged_sql, staged_params)
 
                     for row in cur.fetchall():
                         content = row['summary']
@@ -1952,7 +1968,19 @@ def search_memories():
             cur.close()
             return jsonify({'error': 'Semantic search not available - OpenAI not configured'}), 503
 
-        results = _semantic_search_internal(cur, query, tenant_id, limit=limit)
+        # Over-fetch if branch filtering (post-filter will reduce)
+        fetch_limit = limit * 3 if branch else limit
+        results = _semantic_search_internal(cur, query, tenant_id, limit=fetch_limit)
+
+        # Branch filter: post-filter permanent results by branch membership
+        if branch:
+            permanent_hashes = [r['blob_hash'] for r in results if r.get('source') != 'staged']
+            if permanent_hashes:
+                branch_map = get_blob_branches_batch(cur, permanent_hashes, tenant_id)
+                results = [r for r in results
+                           if r.get('source') == 'staged'
+                           or branch_map.get(r['blob_hash'], '').lower() == branch.lower()]
+        results = results[:limit]
 
         # Auto-trail
         for r in results[:3]:
@@ -1962,58 +1990,43 @@ def search_memories():
         cur.close()
         return jsonify({'query': query, 'mode': 'semantic', 'results': results, 'count': len(results)})
 
-    # --- KEYWORD MODE (default): existing LIKE-based search, unchanged ---
+    # --- KEYWORD MODE: deprecated LIKE scan replaced with BM25 full-text search ---
     ensure_deprecated_commits_table()
     cur = get_cursor()
+    tenant_id = get_tenant_id()
 
-    sql = '''
-        SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
-               c.commit_hash, c.message, c.author
-        FROM blobs b
-        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
-        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
-        WHERE b.content LIKE %s AND b.tenant_id = %s AND dc.commit_hash IS NULL
-    '''
-    params = [f'%{query}%', get_tenant_id()]
+    # Use BM25 (full-text search) instead of broken LIKE scan
+    fetch_limit = limit * 3 if branch else limit
+    results = bm25_search(cur, query, tenant_id, limit=fetch_limit)
 
-    if memory_type:
-        sql += ' AND b.content_type = %s'
-        params.append(memory_type)
+    # Branch filter: post-filter permanent results by branch membership
+    if branch:
+        permanent_hashes = [r['blob_hash'] for r in results]
+        if permanent_hashes:
+            branch_map = get_blob_branches_batch(cur, permanent_hashes, tenant_id)
+            results = [r for r in results
+                       if branch_map.get(r['blob_hash'], '').lower() == branch.lower()]
+    results = results[:limit]
 
-    sql += ' ORDER BY b.created_at DESC LIMIT %s'
-    params.append(limit)
-
-    cur.execute(sql, params)
-    results = []
-
-    for row in cur.fetchall():
-        content = row['content']
-        results.append({
-            'blob_hash': row['blob_hash'],
-            'content': content[:500] + '...' if len(content) > 500 else content,
-            'content_type': row['content_type'],
-            'created_at': str(row['created_at']) if row['created_at'] else None,
-            'commit_hash': row['commit_hash'],
-            'message': row['message'],
-            'author': row['author'],
-            'source': 'permanent'
-        })
-
-    # v4: Also search candidate_memories (RAM) if enabled
+    # Also search staged candidates if hippocampal enabled
     if HIPPOCAMPAL_ENABLED:
         try:
             remaining = limit - len(results)
             if remaining > 0:
-                cur.execute("""
+                staged_sql = """
                     SELECT id, branch, summary, content, message, source_instance,
                            created_at
                     FROM candidate_memories
                     WHERE tenant_id = %s AND status IN ('active', 'cooling')
                       AND (summary ILIKE %s OR content::text ILIKE %s)
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (get_tenant_id(), f'%{query}%', f'%{query}%', remaining))
+                """
+                staged_params = [tenant_id, f'%{query}%', f'%{query}%']
+                if branch:
+                    staged_sql += " AND LOWER(branch) = LOWER(%s)"
+                    staged_params.append(branch)
+                staged_sql += " ORDER BY created_at DESC LIMIT %s"
+                staged_params.append(remaining)
+                cur.execute(staged_sql, staged_params)
 
                 for row in cur.fetchall():
                     content = row['summary']
@@ -2039,7 +2052,7 @@ def search_memories():
             g.accessed_blobs.add(r['blob_hash'])
 
     cur.close()
-    return jsonify({'query': query, 'results': results, 'count': len(results)})
+    return jsonify({'query': query, 'mode': mode, 'results': results, 'count': len(results)})
 
 
 @app.route('/v2/semantic-search', methods=['GET'])
@@ -9521,7 +9534,7 @@ MCP_TOOLS = [
                 "query": {"type": "string", "description": "Search query"},
                 "branch": {"type": "string", "description": "Optional: limit search to specific branch"},
                 "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10},
-                "mode": {"type": "string", "description": "Search mode: 'keyword' (default, LIKE), 'semantic' (vector), 'hybrid' (BM25 + vector via Reciprocal Rank Fusion)", "default": "keyword", "enum": ["keyword", "semantic", "hybrid"]}
+                "mode": {"type": "string", "description": "Search mode: 'hybrid' (default, BM25 + vector RRF), 'semantic' (vector only), 'keyword' (BM25 text only)", "default": "hybrid", "enum": ["keyword", "semantic", "hybrid"]}
             },
             "required": ["query"]
         }
