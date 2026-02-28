@@ -47,7 +47,7 @@ def get_anthropic_client():
 def generate_hyde_document(query: str) -> str:
     """Generate a Hypothetical Document Embedding (HyDE) for a search query.
 
-    Asks Haiku to write a short paragraph that would be a perfect answer
+    Asks Sonnet to write a short paragraph that would be a perfect answer
     to the query, then we embed THAT instead of the raw query.
     This improves recall for conceptual/fuzzy queries.
 
@@ -58,11 +58,11 @@ def generate_hyde_document(query: str) -> str:
         return None
     try:
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6-20250514",
             max_tokens=200,
             messages=[{
                 "role": "user",
-                "content": f"Generate a short paragraph (2-3 sentences) that would be a perfect memory entry answering this query. Write it as if it's a factual record, not a question. Query: {query}"
+                "content": f"You are searching a personal memory system. Generate a short paragraph (2-3 sentences) that would be a perfect memory entry answering this query. Write as a factual record — include names, dates, decisions, and context a future reader would need. Query: {query}"
             }]
         )
         return response.content[0].text
@@ -2253,7 +2253,7 @@ def semantic_search():
     response = {'query': query, 'results': results, 'count': len(results)}
     if use_hyde and hyde_doc:
         response['hyde'] = True
-        response['hyde_document'] = hyde_doc[:200]  # Truncate for response size
+        response['hyde_interpretation'] = hyde_doc
     return jsonify(response)
 
 
@@ -9547,7 +9547,7 @@ MCP_TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "Conceptual search query"},
                 "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10},
-                "hyde": {"type": "boolean", "description": "Enable HyDE (Hypothetical Document Embedding) for better conceptual retrieval. Generates a hypothetical answer via Haiku, then searches with that embedding. Costs ~$0.001 per query.", "default": False}
+                "hyde": {"type": "boolean", "description": "Enable HyDE (Hypothetical Document Embedding) for better conceptual retrieval. Generates a hypothetical answer via Sonnet, then searches with that embedding. Costs ~$0.005 per query.", "default": False}
             },
             "required": ["query"]
         }
