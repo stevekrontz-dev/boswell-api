@@ -9945,6 +9945,14 @@ def mcp_success_response(req_id, result):
     }
 
 
+def _require(args, *fields):
+    """Validate required fields, return error tuple or None."""
+    missing = [f for f in fields if f not in args]
+    if missing:
+        return {"error": f"Missing required field(s): {', '.join(missing)}"}, 400
+    return None
+
+
 def dispatch_mcp_tool(tool_name, args):
     """
     Dispatch MCP tool call to appropriate Flask view function.
@@ -9960,15 +9968,24 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(list_branches)
     
     elif tool_name == "boswell_head":
+        err = _require(args, "branch")
+        if err:
+            return err
         return invoke_view(get_head, query_string={"branch": args["branch"]})
     
     elif tool_name == "boswell_log":
+        err = _require(args, "branch")
+        if err:
+            return err
         qs = {"branch": args["branch"]}
         if "limit" in args:
             qs["limit"] = args["limit"]
         return invoke_view(get_log, query_string=qs)
     
     elif tool_name == "boswell_search":
+        err = _require(args, "query")
+        if err:
+            return err
         qs = {"q": args["query"]}
         if "branch" in args:
             qs["branch"] = args["branch"]
@@ -9979,6 +9996,9 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(search_memories, query_string=qs)
     
     elif tool_name == "boswell_semantic_search":
+        err = _require(args, "query")
+        if err:
+            return err
         qs = {"q": args["query"]}
         if "limit" in args:
             qs["limit"] = args["limit"]
@@ -10019,6 +10039,9 @@ def dispatch_mcp_tool(tool_name, args):
     # ===== WRITE OPERATIONS =====
     
     elif tool_name == "boswell_commit":
+        err = _require(args, "branch", "content", "message")
+        if err:
+            return err
         payload = {
             "branch": args["branch"],
             "content": args["content"],
@@ -10033,6 +10056,9 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(create_commit, method='POST', json_data=payload)
     
     elif tool_name == "boswell_link":
+        err = _require(args, "source_blob", "target_blob", "source_branch", "target_branch", "reasoning")
+        if err:
+            return err
         payload = {
             "source_blob": args["source_blob"],
             "target_blob": args["target_blob"],
@@ -10045,11 +10071,17 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(create_link, method='POST', json_data=payload)
     
     elif tool_name == "boswell_checkout":
+        err = _require(args, "branch")
+        if err:
+            return err
         return invoke_view(checkout_branch, method='POST', json_data={"branch": args["branch"]})
     
     # ===== TASK QUEUE OPERATIONS =====
     
     elif tool_name == "boswell_create_task":
+        err = _require(args, "description")
+        if err:
+            return err
         payload = {"description": args["description"]}
         for field in ["title", "branch", "priority", "assigned_to", "metadata", "plan_blob_hash"]:
             if field in args:
@@ -10057,6 +10089,9 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(create_task, method='POST', json_data=payload)
     
     elif tool_name == "boswell_claim_task":
+        err = _require(args, "task_id", "instance_id")
+        if err:
+            return err
         task_id = args["task_id"]
         payload = {"instance_id": args["instance_id"]}
         return invoke_view(
@@ -10068,6 +10103,9 @@ def dispatch_mcp_tool(tool_name, args):
         )
     
     elif tool_name == "boswell_release_task":
+        err = _require(args, "task_id", "instance_id")
+        if err:
+            return err
         task_id = args["task_id"]
         payload = {
             "instance_id": args["instance_id"],
@@ -10082,6 +10120,9 @@ def dispatch_mcp_tool(tool_name, args):
         )
     
     elif tool_name == "boswell_update_task":
+        err = _require(args, "task_id")
+        if err:
+            return err
         task_id = args["task_id"]
         payload = {}
         for field in ["status", "description", "title", "priority", "metadata", "plan_blob_hash"]:
@@ -10096,6 +10137,9 @@ def dispatch_mcp_tool(tool_name, args):
         )
     
     elif tool_name == "boswell_delete_task":
+        err = _require(args, "task_id")
+        if err:
+            return err
         task_id = args["task_id"]
         return invoke_view(
             delete_task,
@@ -10127,6 +10171,9 @@ def dispatch_mcp_tool(tool_name, args):
     # ===== TRAIL OPERATIONS =====
     
     elif tool_name == "boswell_record_trail":
+        err = _require(args, "source_blob", "target_blob")
+        if err:
+            return err
         payload = {
             "source_blob": args["source_blob"],
             "target_blob": args["target_blob"]
@@ -10140,6 +10187,9 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(get_hot_trails, query_string=qs if qs else None)
     
     elif tool_name == "boswell_trails_from":
+        err = _require(args, "blob")
+        if err:
+            return err
         blob = args["blob"]
         return invoke_view(
             get_trails_from,
@@ -10148,6 +10198,9 @@ def dispatch_mcp_tool(tool_name, args):
         )
     
     elif tool_name == "boswell_trails_to":
+        err = _require(args, "blob")
+        if err:
+            return err
         blob = args["blob"]
         return invoke_view(
             get_trails_to,
@@ -10184,6 +10237,9 @@ def dispatch_mcp_tool(tool_name, args):
     # ===== SESSION CHECKPOINT TOOLS =====
 
     elif tool_name == "boswell_checkpoint":
+        err = _require(args, "task_id")
+        if err:
+            return err
         json_data = {
             "task_id": args["task_id"],
             "instance_id": args.get("instance_id"),
@@ -10194,6 +10250,9 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(create_checkpoint, method='POST', json_data=json_data)
 
     elif tool_name == "boswell_resume":
+        err = _require(args, "task_id")
+        if err:
+            return err
         return invoke_view(get_checkpoint, query_string={"task_id": args["task_id"]})
 
     elif tool_name == "boswell_validate_routing":
@@ -10212,6 +10271,9 @@ def dispatch_mcp_tool(tool_name, args):
         return invoke_view(list_quarantine, query_string=qs if qs else None)
 
     elif tool_name == "boswell_quarantine_resolve":
+        err = _require(args, "blob_hash", "action")
+        if err:
+            return err
         blob_hash = args["blob_hash"]
         json_data = {
             "action": args["action"],
@@ -10231,6 +10293,9 @@ def dispatch_mcp_tool(tool_name, args):
     # ===== HIPPOCAMPAL MEMORY TOOLS (v4.0) =====
 
     elif tool_name == "boswell_bookmark":
+        err = _require(args, "summary")
+        if err:
+            return err
         payload = {
             "branch": args.get("branch", "command-center"),
             "summary": args["summary"]
@@ -10339,7 +10404,16 @@ BEHAVIORAL RULES:
         
         # Dispatch to view function
         start_time = time.time()
-        result_data, status_code = dispatch_mcp_tool(tool_name, tool_args)
+        try:
+            result_data, status_code = dispatch_mcp_tool(tool_name, tool_args)
+        except KeyError as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            print(f"[MCP] tool={tool_name} status=400 duration={duration_ms}ms error=missing_field:{e}", file=sys.stderr)
+            result = {
+                "content": [{"type": "text", "text": f"Error: Missing required field {e}"}],
+                "isError": True
+            }
+            return jsonify(mcp_success_response(req_id, result))
         duration_ms = int((time.time() - start_time) * 1000)
         
         # Log tool call for audit
