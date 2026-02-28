@@ -245,6 +245,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/api/health', '/.well-known/oauth-protected-resource',
         '/.well-known/oauth-authorization-server',
         '/oauth/authorize', '/oauth/token', '/oauth/register',
+        '/oauth/callback/github',
         '/v2/onboard/provision',  # Public signup — no auth required
         '/v2/auth/register',      # Public registration
     ]
