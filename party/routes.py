@@ -76,6 +76,15 @@ PARTY_HTML = Template(r"""<!DOCTYPE html>
     margin: 0 auto;
     padding: 3rem 1.5rem 4rem;
   }
+  .logo-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .logo-row img {
+    width: 32px;
+    height: 32px;
+  }
   .logo {
     font-family: 'Fraunces', Georgia, serif;
     font-weight: 300;
@@ -320,7 +329,10 @@ PARTY_HTML = Template(r"""<!DOCTYPE html>
 </style>
 </head><body>
 <div class="container">
-  <div class="logo">Boswell</div>
+  <div class="logo-row">
+    <img src="/boswell-logo-dark.svg" alt="Boswell">
+    <div class="logo">Boswell</div>
+  </div>
   <div class="tagline">Memory for AI</div>
 
   $body
@@ -481,6 +493,8 @@ SUCCESS_HTML = Template(r"""<!DOCTYPE html>
     -webkit-font-smoothing: antialiased;
   }
   .container { max-width: 420px; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+  .logo-row { display: flex; align-items: center; gap: 0.6rem; }
+  .logo-row img { width: 32px; height: 32px; }
   .logo { font-family: 'Fraunces', Georgia, serif; font-weight: 300; font-size: 1.5rem; margin-bottom: 0.25rem; }
   .tagline { font-size: 0.85rem; color: hsla(20,6%,90%,.5); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 2.5rem; }
   .card {
@@ -533,7 +547,10 @@ SUCCESS_HTML = Template(r"""<!DOCTYPE html>
 </style>
 </head><body>
 <div class="container">
-  <div class="logo">Boswell</div>
+  <div class="logo-row">
+    <img src="/boswell-logo-dark.svg" alt="Boswell">
+    <div class="logo">Boswell</div>
+  </div>
   <div class="tagline">Memory for AI</div>
   <div class="card">
     <div class="success-title">Welcome to Boswell Pro.</div>
