@@ -335,11 +335,10 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         g.mcp_auth = {'source': 'grace_mode', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Browser requests → redirect to OAuth login instead of JSON error
-    accept = request.headers.get('Accept', '')
-    if 'text/html' in accept and not request.path.startswith(('/v2/', '/mcp')):
-        from flask import redirect
-        return redirect('/oauth/authorize')
+    # SPA routes → let through so Flask catch-all serves index.html (React handles auth client-side)
+    SPA_PREFIXES = ('/dashboard', '/login', '/settings', '/connect', '/mindstate', '/branches', '/security', '/billing')
+    if request.path.startswith(SPA_PREFIXES):
+        return None
 
     # API requests → JSON error
     return jsonify({
