@@ -248,6 +248,9 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/oauth/callback/github',
         '/v2/onboard/provision',  # Public signup — no auth required
         '/v2/auth/register',      # Public registration
+        '/v2/auth/login',         # Login endpoint — must be public
+        '/v2/auth/password-reset/request',  # Password reset request
+        '/v2/auth/password-reset/confirm',  # Password reset confirm
     ]
     # Static files (logo, manifest, etc.) are public
     static_ext = request.path.rsplit('.', 1)[-1].lower() if '.' in request.path else ''
