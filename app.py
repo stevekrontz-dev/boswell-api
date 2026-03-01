@@ -9318,6 +9318,11 @@ def get_current_user():
                 branch_count = cur.fetchone()['branches']
 
                 cur.execute('''
+                    SELECT COUNT(*) as total FROM commits WHERE tenant_id = %s
+                ''', (user['tenant_id'],))
+                total_commits = cur.fetchone()['total']
+
+                cur.execute('''
                     SELECT COUNT(*) as commits FROM commits
                     WHERE tenant_id = %s
                     AND created_at >= date_trunc('month', CURRENT_TIMESTAMP)
@@ -9326,7 +9331,8 @@ def get_current_user():
 
                 usage = {
                     'branches': branch_count,
-                    'commits_this_month': commit_count
+                    'memories': total_commits,
+                    'commits_this_month': total_commits,
                 }
             except Exception:
                 pass
