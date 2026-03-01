@@ -249,7 +249,10 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/onboard/provision',  # Public signup — no auth required
         '/v2/auth/register',      # Public registration
     ]
-    if request.path in PUBLIC_PATHS or request.path.startswith('/party'):
+    if (request.path in PUBLIC_PATHS
+            or request.path.startswith('/party')
+            or request.path.startswith('/assets/')
+            or request.path.startswith('/oauth/')):
         return None
 
     # Internal request (stdio) - CRITICAL: protects CC/Desktop
@@ -332,7 +335,13 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         g.mcp_auth = {'source': 'grace_mode', 'tenant_id': DEFAULT_TENANT}
         return None
 
-    # Hard deny
+    # Browser requests → redirect to OAuth login instead of JSON error
+    accept = request.headers.get('Accept', '')
+    if 'text/html' in accept and not request.path.startswith(('/v2/', '/mcp')):
+        from flask import redirect
+        return redirect('/oauth/authorize')
+
+    # API requests → JSON error
     return jsonify({
         'error': 'unauthorized',
         'error_description': 'Valid authentication required'
