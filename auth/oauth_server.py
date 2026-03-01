@@ -91,29 +91,37 @@ def _get_base_url():
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Boswell</title>
+<title>Boswell — Sign In</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400&family=DM+Sans:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0a; color: #e0e0e0; margin: 0; padding: 2rem 1rem; }
-  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 1.5rem; max-width: 340px; margin: 0 auto; }
-  h1 { font-size: 1.4rem; margin-bottom: 0.3rem; color: #fff; }
-  .sub { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
-  .gh-btn { display: flex; align-items: center; justify-content: center; gap: 0.5rem; width: 100%; padding: 0.65rem; background: #238636; color: #fff; border: none; border-radius: 6px; font-size: 0.95rem; cursor: pointer; text-decoration: none; margin-bottom: 1rem; }
-  .gh-btn:hover { background: #2ea043; }
-  .gh-btn svg { width: 20px; height: 20px; fill: #fff; }
-  .divider { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; color: #555; font-size: 0.8rem; }
-  .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid #333; }
-  label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 0.25rem; }
-  input[type=email], input[type=password] { width: 100%; padding: 0.55rem; background: #111; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 0.95rem; margin-bottom: 0.75rem; }
-  input:focus { outline: none; border-color: #4a9eff; }
-  .submit { width: 100%; padding: 0.6rem; background: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; font-size: 0.9rem; cursor: pointer; }
-  .submit:hover { background: #444; color: #fff; }
-  .error { background: #2a1515; border: 1px solid #5a2020; color: #ff6b6b; font-size: 0.85rem; padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 1rem; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'DM Sans', system-ui, sans-serif; background: #0c0a09; color: #f5f5f4; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 2rem 1rem; -webkit-font-smoothing: antialiased; }
+  .card { background: #1c1917; border: 1px solid hsla(20,6%,90%,.08); border-radius: 16px; padding: 2.5rem 2rem; max-width: 380px; width: 100%; }
+  .logo-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.25rem; }
+  .logo-row img { width: 36px; height: 36px; }
+  .logo-row h1 { font-family: 'Fraunces', Georgia, serif; font-weight: 300; font-size: 1.5rem; color: #f5f5f4; letter-spacing: -0.02em; }
+  .sub { color: hsla(20,6%,90%,.45); font-size: 0.85rem; margin-bottom: 2rem; letter-spacing: 0.03em; }
+  .gh-btn { display: flex; align-items: center; justify-content: center; gap: 0.5rem; width: 100%; padding: 0.7rem; background: #f97316; color: #0c0a09; font-weight: 500; border: none; border-radius: 8px; font-size: 0.95rem; cursor: pointer; text-decoration: none; margin-bottom: 1.25rem; transition: background 0.15s; }
+  .gh-btn:hover { background: #fb923c; }
+  .gh-btn svg { width: 20px; height: 20px; fill: #0c0a09; }
+  .divider { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1.25rem; color: hsla(20,6%,90%,.25); font-size: 0.8rem; }
+  .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid hsla(20,6%,90%,.1); }
+  label { display: block; font-size: 0.8rem; color: hsla(20,6%,90%,.5); margin-bottom: 0.3rem; }
+  input[type=email], input[type=password] { width: 100%; padding: 0.6rem 0.75rem; background: #0c0a09; border: 1px solid hsla(20,6%,90%,.12); border-radius: 8px; color: #f5f5f4; font-size: 0.95rem; margin-bottom: 0.85rem; font-family: 'DM Sans', system-ui, sans-serif; }
+  input:focus { outline: none; border-color: #f97316; box-shadow: 0 0 0 2px hsla(25,95%,53%,.15); }
+  .submit { width: 100%; padding: 0.65rem; background: hsla(20,6%,90%,.08); color: hsla(20,6%,90%,.7); border: 1px solid hsla(20,6%,90%,.12); border-radius: 8px; font-size: 0.9rem; cursor: pointer; font-family: 'DM Sans', system-ui, sans-serif; transition: all 0.15s; }
+  .submit:hover { background: hsla(20,6%,90%,.14); color: #f5f5f4; }
+  .error { background: hsla(0,60%,30%,.15); border: 1px solid hsla(0,60%,40%,.3); color: #ff6b6b; font-size: 0.85rem; padding: 0.5rem 0.75rem; border-radius: 8px; margin-bottom: 1rem; }
 </style>
 </head><body>
 <div class="card">
-  <h1>Boswell</h1>
-  <p class="sub">Connect your memory system</p>
+  <div class="logo-row">
+    <img src="/boswell-logo-dark.svg" alt="Boswell">
+    <h1>Boswell</h1>
+  </div>
+  <p class="sub">Memory for AI</p>
   $error
   $github_btn
   <div class="divider">or sign in with email</div>

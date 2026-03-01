@@ -249,10 +249,13 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/onboard/provision',  # Public signup — no auth required
         '/v2/auth/register',      # Public registration
     ]
+    # Static files (logo, manifest, etc.) are public
+    static_ext = request.path.rsplit('.', 1)[-1].lower() if '.' in request.path else ''
     if (request.path in PUBLIC_PATHS
             or request.path.startswith('/party')
             or request.path.startswith('/assets/')
-            or request.path.startswith('/oauth/')):
+            or request.path.startswith('/oauth/')
+            or static_ext in ('svg', 'png', 'ico', 'json', 'js', 'css', 'woff', 'woff2', 'ttf')):
         return None
 
     # Internal request (stdio) - CRITICAL: protects CC/Desktop
