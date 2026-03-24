@@ -16,8 +16,16 @@ export default function Layout() {
     { to: '/dashboard/billing', label: 'Billing' },
   ];
 
-  const isFullWidth = location.pathname === '/dashboard/mindstate';
+  const adminSubLinks = [
+    { to: '/dashboard/admin', label: 'Pulse' },
+    { to: '/dashboard/admin/tenants', label: 'Tenants' },
+    { to: '/dashboard/admin/alerts', label: 'Alerts' },
+  ];
+
+  const isAdminRoute = location.pathname.startsWith('/dashboard/admin');
+  const isFullWidth = location.pathname === '/dashboard/mindstate' || isAdminRoute;
   const isActive = (path: string) => location.pathname === path;
+  const isAdminActive = location.pathname.startsWith('/dashboard/admin');
 
   return (
     <div className="min-h-screen bg-ink-950">
@@ -48,6 +56,21 @@ export default function Layout() {
                   {link.label}
                 </Link>
               ))}
+              {user?.is_admin && (
+                <>
+                  <div className="w-px h-5 bg-parchment-200/10 mx-1" />
+                  <Link
+                    to="/dashboard/admin"
+                    className={
+                      isAdminActive
+                        ? 'px-4 py-1.5 rounded-full text-sm font-medium bg-ember-500 text-ink-950 transition-all duration-200'
+                        : 'px-4 py-1.5 rounded-full text-sm font-medium text-parchment-200/60 hover:text-parchment-50 hover:bg-parchment-200/5 transition-all duration-200'
+                    }
+                  >
+                    Admin
+                  </Link>
+                </>
+              )}
             </div>
 
             {/* Desktop User Info */}
@@ -67,7 +90,7 @@ export default function Layout() {
               className="md:hidden p-2 text-parchment-200/60"
             >
               <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} 
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                   d={mobileMenuOpen ? "M6 18L18 6M6 6l12 12" : "M4 6h16M4 12h16M4 18h16"} />
               </svg>
             </button>
@@ -91,6 +114,22 @@ export default function Layout() {
                     {link.label}
                   </Link>
                 ))}
+                {user?.is_admin && (
+                  <>
+                    <div className="h-px bg-parchment-200/10 my-2" />
+                    <Link
+                      to="/dashboard/admin"
+                      onClick={() => setMobileMenuOpen(false)}
+                      className={
+                        isAdminActive
+                          ? 'px-4 py-2 rounded-lg text-sm font-medium bg-ember-500 text-ink-950'
+                          : 'px-4 py-2 rounded-lg text-sm font-medium text-parchment-200/60 hover:bg-parchment-200/5'
+                      }
+                    >
+                      Admin
+                    </Link>
+                  </>
+                )}
               </div>
               <div className="mt-3 pt-3 border-t border-parchment-200/5 px-4 flex items-center justify-between">
                 <span className="text-parchment-200/50 text-xs truncate">{user?.email}</span>
@@ -104,10 +143,33 @@ export default function Layout() {
             </div>
           )}
         </div>
+
+        {/* Admin Sub-Nav */}
+        {isAdminRoute && (
+          <div className="border-t border-parchment-200/5">
+            <div className="max-w-6xl mx-auto px-4 md:px-6">
+              <div className="flex items-center gap-1 py-2">
+                {adminSubLinks.map((link) => (
+                  <Link
+                    key={link.to}
+                    to={link.to}
+                    className={
+                      isActive(link.to)
+                        ? 'px-3 py-1 rounded-md text-xs font-medium bg-parchment-200/10 text-parchment-50 transition-all'
+                        : 'px-3 py-1 rounded-md text-xs font-medium text-parchment-200/40 hover:text-parchment-200/70 hover:bg-parchment-200/5 transition-all'
+                    }
+                  >
+                    {link.label}
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
       </nav>
 
       {/* Main Content */}
-      <main className={isFullWidth ? '' : 'max-w-4xl mx-auto px-4 md:px-6 py-8 md:py-12'}>
+      <main className={isFullWidth ? 'max-w-6xl mx-auto px-4 md:px-6 py-8 md:py-12' : 'max-w-4xl mx-auto px-4 md:px-6 py-8 md:py-12'}>
         <Outlet />
       </main>
     </div>

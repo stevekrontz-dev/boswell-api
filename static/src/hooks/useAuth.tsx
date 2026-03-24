@@ -6,6 +6,7 @@ interface User {
   id: string;
   email: string;
   name: string;
+  is_admin?: boolean;
 }
 
 interface AuthContextType {
@@ -30,7 +31,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const storedUser = localStorage.getItem('boswell_user');
     if (storedToken && storedUser) {
       setToken(storedToken);
-      setUser(JSON.parse(storedUser));
+      const parsed = JSON.parse(storedUser);
+      setUser(parsed);
+      // Refresh is_admin from server if not cached
+      if (parsed.is_admin === undefined) {
+        getCurrentUser(storedToken).then(profile => {
+          const updated = { ...parsed, is_admin: profile.is_admin || false };
+          setUser(updated);
+          localStorage.setItem('boswell_user', JSON.stringify(updated));
+        }).catch(() => {});
+      }
     }
     setIsLoading(false);
   }, []);
@@ -62,6 +72,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           id: userProfile.id,
           email: userProfile.email,
           name: userProfile.name || userProfile.email,
+          is_admin: userProfile.is_admin || false,
         };
         setToken(sessionToken);
         setUser(userData);

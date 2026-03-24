@@ -12,6 +12,10 @@ import Branches from './pages/Branches';
 import Billing from './pages/Billing';
 import Mindstate from './pages/Mindstate';
 import Security from './pages/Security';
+import AdminPulse from './pages/admin/Pulse';
+import AdminTenants from './pages/admin/Tenants';
+import AdminTenantDetail from './pages/admin/TenantDetail';
+import AdminAlerts from './pages/admin/Alerts';
 
 function App() {
   return (
@@ -36,6 +40,10 @@ function App() {
             <Route path="billing" element={<Billing />} />
             <Route path="mindstate" element={<Mindstate />} />
             <Route path="security" element={<Security />} />
+            <Route path="admin" element={<AdminPulse />} />
+            <Route path="admin/tenants" element={<AdminTenants />} />
+            <Route path="admin/tenants/:tenantId" element={<AdminTenantDetail />} />
+            <Route path="admin/alerts" element={<AdminAlerts />} />
           </Route>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -74,6 +74,7 @@ export interface UserProfile {
   api_key: string | null;
   has_subscription: boolean;
   member_since: string | null;
+  is_admin: boolean;
   usage: {
     branches: number;
     commits_this_month: number;
@@ -126,5 +127,88 @@ export async function createBranch(name: string, fromBranch: string = 'command-c
 export async function deleteBranch(name: string): Promise<{ status: string; branch: string }> {
   return fetchWithAuth(`/v2/branch/${encodeURIComponent(name)}`, {
     method: 'DELETE'
+  });
+}
+
+// Admin types
+export interface AdminPulse {
+  cards: {
+    total_tenants: number;
+    total_commits: number;
+    total_blobs: number;
+    api_calls_24h: number;
+    total_storage_bytes: number;
+  };
+  charts: {
+    request_volume: { day: string; requests: number }[];
+    error_rates: { day: string; error_rate: number; errors: number }[];
+    response_times: { p50: number; p95: number; p99: number; avg: number };
+  };
+  status: {
+    system_health: 'healthy' | 'degraded';
+    recent_500_errors: number;
+    storage_bytes: number;
+    encryption: string;
+    audit: string;
+  };
+  timestamp: string;
+}
+
+export interface AdminTenant {
+  id: string;
+  name: string;
+  created_at: string | null;
+  commit_count: number;
+  blob_count: number;
+  storage_bytes: number;
+  api_calls_7d: number;
+  last_active: string | null;
+}
+
+export interface AdminTenantDetail {
+  tenant: { id: string; name: string; created_at: string | null };
+  charts: {
+    commits_by_branch: { branch: string; commits: number }[];
+    api_calls_by_day: { day: string; requests: number }[];
+    top_actions: { action: string; count: number }[];
+  };
+}
+
+export interface AdminAlert {
+  severity: 'critical' | 'warning' | 'info';
+  type: string;
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export interface AdminAlertsResponse {
+  alerts: AdminAlert[];
+  count: number;
+  critical_count: number;
+  warning_count: number;
+  timestamp: string;
+}
+
+// Admin API functions
+export async function getAdminPulse(): Promise<AdminPulse> {
+  return fetchWithAuth('/v2/admin/pulse');
+}
+
+export async function getAdminTenants(): Promise<{ tenants: AdminTenant[]; count: number }> {
+  return fetchWithAuth('/v2/admin/tenants');
+}
+
+export async function getAdminTenantDetail(tenantId: string): Promise<AdminTenantDetail> {
+  return fetchWithAuth(`/v2/admin/tenants/${tenantId}`);
+}
+
+export async function getAdminAlerts(): Promise<AdminAlertsResponse> {
+  return fetchWithAuth('/v2/admin/alerts');
+}
+
+export async function adminCreateTenant(name: string, email?: string): Promise<{ tenant_id: string; api_key: string; name: string; branches: string[] }> {
+  return fetchWithAuth('/v2/admin/create-tenant', {
+    method: 'POST',
+    body: JSON.stringify({ name, email }),
   });
 }

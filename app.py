@@ -3977,6 +3977,7 @@ def audit_stats():
 # ==================== ADMIN API (God Mode Dashboard) ====================
 
 @app.route('/v2/admin/pulse', methods=['GET'])
+@require_admin
 def admin_pulse():
     """Get all stats for the Pulse view - system overview."""
     cur = get_cursor()
@@ -3986,51 +3987,51 @@ def admin_pulse():
         cur.execute('SELECT COUNT(*) as count FROM tenants')
         tenant_count = cur.fetchone()['count']
 
-        # Count commits
-        cur.execute('SELECT COUNT(*) as count FROM commits WHERE tenant_id = %s', (get_tenant_id(),))
+        # Count commits (cross-tenant for admin view)
+        cur.execute('SELECT COUNT(*) as count FROM commits')
         commit_count = cur.fetchone()['count']
 
-        # Count blobs
-        cur.execute('SELECT COUNT(*) as count FROM blobs WHERE tenant_id = %s', (get_tenant_id(),))
+        # Count blobs (cross-tenant)
+        cur.execute('SELECT COUNT(*) as count FROM blobs')
         blob_count = cur.fetchone()['count']
 
-        # Total storage
-        cur.execute('SELECT COALESCE(SUM(byte_size), 0) as total FROM blobs WHERE tenant_id = %s', (get_tenant_id(),))
+        # Total storage (cross-tenant)
+        cur.execute('SELECT COALESCE(SUM(byte_size), 0) as total FROM blobs')
         total_storage = cur.fetchone()['total']
 
-        # API calls in last 24h
+        # API calls in last 24h (cross-tenant)
         cur.execute('''
             SELECT COUNT(*) as count FROM audit_logs
-            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '24 hours'
-        ''', (get_tenant_id(),))
+            WHERE timestamp > NOW() - INTERVAL '24 hours'
+        ''')
         api_calls_24h = cur.fetchone()['count']
 
-        # Request volume by day (last 7 days)
+        # Request volume by day (last 7 days, cross-tenant)
         cur.execute('''
             SELECT DATE(timestamp) as day, COUNT(*) as requests
             FROM audit_logs
-            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
+            WHERE timestamp > NOW() - INTERVAL '7 days'
             GROUP BY DATE(timestamp)
             ORDER BY day
-        ''', (get_tenant_id(),))
+        ''')
         request_volume = [{'day': str(row['day']), 'requests': row['requests']} for row in cur.fetchall()]
 
-        # Error rate by day (last 7 days)
+        # Error rate by day (last 7 days, cross-tenant)
         cur.execute('''
             SELECT DATE(timestamp) as day,
                    COUNT(*) as total,
                    COUNT(*) FILTER (WHERE response_status >= 400) as errors
             FROM audit_logs
-            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '7 days'
+            WHERE timestamp > NOW() - INTERVAL '7 days'
             GROUP BY DATE(timestamp)
             ORDER BY day
-        ''', (get_tenant_id(),))
+        ''')
         error_rates = []
         for row in cur.fetchall():
             error_rate = round((row['errors'] / max(row['total'], 1)) * 100, 2)
             error_rates.append({'day': str(row['day']), 'error_rate': error_rate, 'errors': row['errors']})
 
-        # Response time percentiles (last 24h)
+        # Response time percentiles (last 24h, cross-tenant)
         cur.execute('''
             SELECT
                 PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms) as p50,
@@ -4038,8 +4039,8 @@ def admin_pulse():
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) as p99,
                 AVG(duration_ms) as avg
             FROM audit_logs
-            WHERE tenant_id = %s AND timestamp > NOW() - INTERVAL '24 hours'
-        ''', (get_tenant_id(),))
+            WHERE timestamp > NOW() - INTERVAL '24 hours'
+        ''')
         perf_row = cur.fetchone()
         response_times = {
             'p50': round(perf_row['p50'] or 0, 1),
@@ -4084,6 +4085,7 @@ def admin_pulse():
 
 
 @app.route('/v2/admin/tenants', methods=['GET'])
+@require_admin
 def admin_tenants():
     """List all tenants with aggregate stats."""
     cur = get_cursor()
@@ -4128,6 +4130,7 @@ def admin_tenants():
 
 
 @app.route('/v2/admin/tenants/<tenant_id>', methods=['GET'])
+@require_admin
 def admin_tenant_detail(tenant_id):
     """Get detailed stats for a specific tenant."""
     cur = get_cursor()
@@ -4192,6 +4195,7 @@ def admin_tenant_detail(tenant_id):
 
 
 @app.route('/v2/admin/create-tenant', methods=['POST'])
+@require_admin
 def admin_create_tenant():
     """
     Create a new tenant with auto-generated credentials.
@@ -4207,15 +4211,7 @@ def admin_create_tenant():
     import uuid
     import secrets
 
-    # Security check
-    godmode_password = os.environ.get('GODMODE_PASSWORD')
-    provided_password = request.headers.get('X-Godmode-Password')
-
-    if not godmode_password:
-        return jsonify({'error': 'Server not configured for tenant provisioning'}), 503
-
-    if not provided_password or provided_password != godmode_password:
-        return jsonify({'error': 'Unauthorized'}), 401
+    # Auth handled by @require_admin decorator (JWT admin or GODMODE_PASSWORD)
 
     # Parse request
     data = request.get_json() or {}
@@ -4291,6 +4287,7 @@ def admin_create_tenant():
 
 
 @app.route('/v2/admin/alerts', methods=['GET'])
+@require_admin
 def admin_alerts():
     """Get computed alerts for the system."""
     cur = get_cursor()
@@ -8798,6 +8795,59 @@ def require_auth(f):
     return decorated
 
 
+def require_admin(f):
+    """Decorator to require admin authentication via JWT or passkey session."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from auth import verify_jwt
+        user_id = None
+
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            # Try JWT first
+            try:
+                payload = verify_jwt(token)
+                user_id = payload.get('sub')
+            except ValueError:
+                # Try passkey session token
+                try:
+                    from passkey_auth import hash_session_token
+                    token_hash = hash_session_token(token)
+                    scur = get_cursor()
+                    try:
+                        scur.execute('SELECT user_id FROM passkey_sessions WHERE token = %s AND expires_at > NOW()', (token_hash,))
+                        session = scur.fetchone()
+                        if session:
+                            user_id = session['user_id']
+                    finally:
+                        scur.close()
+                except Exception:
+                    pass
+
+        # Also allow GODMODE_PASSWORD as fallback for CLI usage
+        if not user_id and request.headers.get('X-Godmode-Password') == GODMODE_PASSWORD:
+            g.admin_user_id = 'godmode'
+            return f(*args, **kwargs)
+
+        if not user_id:
+            return jsonify({'error': 'Authentication required'}), 401
+
+        cur = get_cursor()
+        try:
+            cur.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            row = cur.fetchone()
+            if not row or not row.get('is_admin'):
+                return jsonify({'error': 'Admin access required'}), 403
+        finally:
+            cur.close()
+
+        g.admin_user_id = user_id
+        return f(*args, **kwargs)
+    return decorated
+
+
 @app.route('/auth/register/options', methods=['POST'])
 def auth_register_options():
     """
@@ -9292,7 +9342,8 @@ def get_current_user():
     try:
         cur.execute('''
             SELECT email, name, tenant_id, plan, status, api_key_encrypted,
-                   stripe_customer_id, stripe_subscription_id, created_at
+                   stripe_customer_id, stripe_subscription_id, created_at,
+                   COALESCE(is_admin, false) as is_admin
             FROM users WHERE id = %s
         ''', (user_id,))
         user = cur.fetchone()
@@ -9347,6 +9398,7 @@ def get_current_user():
             'api_key': api_key,
             'has_subscription': bool(user.get('stripe_subscription_id')),
             'member_since': str(user['created_at']) if user.get('created_at') else None,
+            'is_admin': bool(user.get('is_admin', False)),
             'usage': usage
         })
 
