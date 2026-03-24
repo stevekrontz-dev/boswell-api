@@ -150,6 +150,24 @@ def parse_request_action(req):
     path = req.path
     method = req.method
 
+    # MCP dispatch — extract tool name from JSON-RPC body
+    if path in ('/v2/mcp', '/mcp') and method == 'POST':
+        try:
+            data = req.get_json(silent=True) or {}
+            rpc_method = data.get('method', '')
+            params = data.get('params', {})
+            if rpc_method == 'tools/call':
+                tool = params.get('name', 'unknown_tool')
+                return f'MCP_{tool}', 'mcp_tool', tool
+            elif rpc_method == 'initialize':
+                return 'MCP_INITIALIZE', 'mcp', None
+            elif rpc_method == 'tools/list':
+                return 'MCP_TOOLS_LIST', 'mcp', None
+            else:
+                return f'MCP_{rpc_method}', 'mcp', None
+        except Exception:
+            return 'MCP_UNKNOWN', 'mcp', None
+
     # API endpoint mappings
     if '/commit' in path:
         if method == 'POST':
@@ -184,8 +202,51 @@ def parse_request_action(req):
     if '/audit' in path:
         return AuditAction.AUDIT_QUERY, 'audit', None
 
+    if '/startup' in path:
+        return AuditAction.STARTUP, 'startup', None
+
+    if '/bookmark' in path:
+        return 'BOOKMARK_CREATE' if method == 'POST' else 'BOOKMARK_READ', 'bookmark', None
+
+    if '/candidates' in path or '/consolidate' in path:
+        return 'CONSOLIDATION', 'candidates', None
+
+    if '/replay' in path:
+        return 'REPLAY', 'bookmark', None
+
+    if '/tasks' in path:
+        action = {'POST': 'TASK_CREATE', 'PATCH': 'TASK_UPDATE', 'DELETE': 'TASK_DELETE'}.get(method, 'TASK_READ')
+        return action, 'task', None
+
+    if '/trails' in path:
+        return 'TRAIL_READ' if method == 'GET' else 'TRAIL_RECORD', 'trail', None
+
+    if '/immune' in path or '/quarantine' in path:
+        return 'IMMUNE_ACTION', 'immune', None
+
+    if '/fingerprint' in path or '/routing' in path:
+        return 'ROUTING', 'routing', None
+
+    if '/admin' in path:
+        return f'ADMIN_{method}', 'admin', path.split('/')[-1] if '/' in path else None
+
+    if '/branches' in path:
+        return 'BRANCH_LIST', 'branch', None
+
+    if '/quick-brief' in path or '/brief' in path:
+        return 'BRIEF', 'brief', None
+
+    if '/nightly' in path or '/discovery' in path:
+        return 'MAINTENANCE', 'system', None
+
     if '/health' in path:
         return AuditAction.HEALTH_CHECK, 'health', None
+
+    if '/me' in path or '/auth' in path:
+        return 'AUTH', 'auth', None
+
+    if '/billing' in path:
+        return 'BILLING', 'billing', None
 
     # Default fallback
     return f'{method}_UNKNOWN', 'unknown', path
