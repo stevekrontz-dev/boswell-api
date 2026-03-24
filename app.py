@@ -4198,16 +4198,24 @@ def admin_tenant_detail(tenant_id):
             cur.close()
             return jsonify({'error': 'Tenant not found'}), 404
 
-        # Commits by branch
-        cur.execute('''
-            SELECT br.name as branch, COUNT(c.commit_hash) as commits
-            FROM branches br
-            LEFT JOIN commits c ON c.tenant_id = br.tenant_id
-            WHERE br.tenant_id = %s
-            GROUP BY br.name
-            ORDER BY commits DESC
-        ''', (tenant_id,))
-        commits_by_branch = [{'branch': row['branch'], 'commits': row['commits']} for row in cur.fetchall()]
+        # Commits by branch - walk parent chain from each branch head
+        cur.execute('SELECT name, head_commit FROM branches WHERE tenant_id = %s', (tenant_id,))
+        commits_by_branch = []
+        for branch_row in cur.fetchall():
+            bname = branch_row['name']
+            head = branch_row['head_commit']
+            if not head or head == 'GENESIS':
+                commits_by_branch.append({'branch': bname, 'commits': 0})
+                continue
+            count = 0
+            current = head
+            while current and current != 'GENESIS' and count < 10000:
+                count += 1
+                cur.execute('SELECT parent_hash FROM commits WHERE commit_hash = %s AND tenant_id = %s', (current, tenant_id))
+                row = cur.fetchone()
+                current = row['parent_hash'] if row else None
+            commits_by_branch.append({'branch': bname, 'commits': count})
+        commits_by_branch.sort(key=lambda x: x['commits'], reverse=True)
 
         # API calls by day (last 30 days)
         cur.execute('''
