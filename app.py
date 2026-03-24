@@ -3976,6 +3976,61 @@ def audit_stats():
 
 # ==================== ADMIN API (God Mode Dashboard) ====================
 
+
+def require_admin(f):
+    """Decorator to require admin authentication via JWT or passkey session."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from auth import verify_jwt
+        user_id = None
+
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            # Try JWT first
+            try:
+                payload = verify_jwt(token)
+                user_id = payload.get('sub')
+            except ValueError:
+                # Try passkey session token
+                try:
+                    from passkey_auth import hash_session_token
+                    token_hash = hash_session_token(token)
+                    scur = get_cursor()
+                    try:
+                        scur.execute('SELECT user_id FROM passkey_sessions WHERE token = %s AND expires_at > NOW()', (token_hash,))
+                        session = scur.fetchone()
+                        if session:
+                            user_id = session['user_id']
+                    finally:
+                        scur.close()
+                except Exception:
+                    pass
+
+        # Also allow GODMODE_PASSWORD as fallback for CLI usage
+        godmode = os.environ.get('GODMODE_PASSWORD')
+        if not user_id and godmode and request.headers.get('X-Godmode-Password') == godmode:
+            g.admin_user_id = 'godmode'
+            return f(*args, **kwargs)
+
+        if not user_id:
+            return jsonify({'error': 'Authentication required'}), 401
+
+        cur = get_cursor()
+        try:
+            cur.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
+            row = cur.fetchone()
+            if not row or not row.get('is_admin'):
+                return jsonify({'error': 'Admin access required'}), 403
+        finally:
+            cur.close()
+
+        g.admin_user_id = user_id
+        return f(*args, **kwargs)
+    return decorated
+
+
 @app.route('/v2/admin/pulse', methods=['GET'])
 @require_admin
 def admin_pulse():
@@ -8791,59 +8846,6 @@ def require_auth(f):
                 return f(*args, **kwargs)
             return jsonify({'error': 'Authentication required'}), 401
         g.current_user = session['user_id']
-        return f(*args, **kwargs)
-    return decorated
-
-
-def require_admin(f):
-    """Decorator to require admin authentication via JWT or passkey session."""
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        from auth import verify_jwt
-        user_id = None
-
-        auth_header = request.headers.get('Authorization', '')
-        if auth_header.startswith('Bearer '):
-            token = auth_header[7:]
-            # Try JWT first
-            try:
-                payload = verify_jwt(token)
-                user_id = payload.get('sub')
-            except ValueError:
-                # Try passkey session token
-                try:
-                    from passkey_auth import hash_session_token
-                    token_hash = hash_session_token(token)
-                    scur = get_cursor()
-                    try:
-                        scur.execute('SELECT user_id FROM passkey_sessions WHERE token = %s AND expires_at > NOW()', (token_hash,))
-                        session = scur.fetchone()
-                        if session:
-                            user_id = session['user_id']
-                    finally:
-                        scur.close()
-                except Exception:
-                    pass
-
-        # Also allow GODMODE_PASSWORD as fallback for CLI usage
-        if not user_id and request.headers.get('X-Godmode-Password') == GODMODE_PASSWORD:
-            g.admin_user_id = 'godmode'
-            return f(*args, **kwargs)
-
-        if not user_id:
-            return jsonify({'error': 'Authentication required'}), 401
-
-        cur = get_cursor()
-        try:
-            cur.execute('SELECT is_admin FROM users WHERE id = %s', (user_id,))
-            row = cur.fetchone()
-            if not row or not row.get('is_admin'):
-                return jsonify({'error': 'Admin access required'}), 403
-        finally:
-            cur.close()
-
-        g.admin_user_id = user_id
         return f(*args, **kwargs)
     return decorated
 
