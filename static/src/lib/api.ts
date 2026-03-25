@@ -167,6 +167,8 @@ export interface AdminTenant {
 
 export interface AdminTenantDetail {
   tenant: { id: string; name: string; created_at: string | null };
+  user: { email: string | null; plan: string; status: string | null } | null;
+  branches: string[];
   charts: {
     commits_by_branch: { branch: string; commits: number }[];
     api_calls_by_day: { day: string; requests: number }[];
@@ -206,9 +208,16 @@ export async function getAdminAlerts(): Promise<AdminAlertsResponse> {
   return fetchWithAuth('/v2/admin/alerts');
 }
 
-export async function adminCreateTenant(name: string, email?: string): Promise<{ tenant_id: string; api_key: string; name: string; branches: string[] }> {
+export async function adminCreateTenant(name: string, email?: string, branches?: string[]): Promise<{ tenant_id: string; api_key: string; name: string; branches: string[] }> {
   return fetchWithAuth('/v2/admin/create-tenant', {
     method: 'POST',
-    body: JSON.stringify({ name, email }),
+    body: JSON.stringify({ name, email, branches }),
+  });
+}
+
+export async function adminCreateBranches(tenantId: string, names: string[]): Promise<{ created: string[]; count: number }> {
+  return fetchWithAuth(`/v2/admin/tenants/${tenantId}/branches`, {
+    method: 'POST',
+    body: JSON.stringify({ names }),
   });
 }

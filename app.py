@@ -4238,6 +4238,14 @@ def admin_tenant_detail(tenant_id):
         ''', (tenant_id,))
         top_actions = [{'action': row['action'], 'count': row['count']} for row in cur.fetchall()]
 
+        # User info
+        cur.execute('SELECT email, plan, status FROM users WHERE tenant_id = %s LIMIT 1', (tenant_id,))
+        user_row = cur.fetchone()
+
+        # Branch list
+        cur.execute('SELECT name FROM branches WHERE tenant_id = %s ORDER BY name', (tenant_id,))
+        branch_names = [r['name'] for r in cur.fetchall()]
+
         cur.close()
         return jsonify({
             'tenant': {
@@ -4245,6 +4253,12 @@ def admin_tenant_detail(tenant_id):
                 'name': tenant['name'],
                 'created_at': str(tenant['created_at']) if tenant['created_at'] else None
             },
+            'user': {
+                'email': user_row['email'] if user_row else None,
+                'plan': user_row['plan'] if user_row else 'free',
+                'status': user_row['status'] if user_row else None,
+            } if user_row else None,
+            'branches': branch_names,
             'charts': {
                 'commits_by_branch': commits_by_branch,
                 'api_calls_by_day': api_calls_by_day,
@@ -4262,85 +4276,91 @@ def admin_tenant_detail(tenant_id):
 def admin_create_tenant():
     """
     Create a new tenant with auto-generated credentials.
-    Secured with GODMODE_PASSWORD header.
 
     Request:
-        Headers: X-Godmode-Password: <password>
-        Body: { "name": "Tenant Name", "email": "contact@email.com" }
+        Body: { "name": "Tenant Name", "email": "contact@email.com", "branches": ["upshift", "business"] }
 
     Response:
-        { "tenant_id": "uuid", "api_key": "key", "name": "...", "created_at": "..." }
+        { "tenant_id": "uuid", "api_key": "key", "name": "...", "branches": [...] }
     """
-    import uuid
-    import secrets
+    from billing.provisioning import provision_tenant
 
-    # Auth handled by @require_admin decorator (JWT admin or GODMODE_PASSWORD)
-
-    # Parse request
     data = request.get_json() or {}
     tenant_name = data.get('name')
     tenant_email = data.get('email')
+    custom_branches = data.get('branches')
 
     if not tenant_name:
         return jsonify({'error': 'name is required'}), 400
-
-    # Generate credentials
-    tenant_id = str(uuid.uuid4())
-    api_key = f"bos_{secrets.token_urlsafe(32)}"
-    api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
 
     db = get_db()
     cur = get_cursor()
 
     try:
-        # Insert tenant
-        cur.execute(
-            '''INSERT INTO tenants (id, name, created_at)
-               VALUES (%s, %s, NOW())
-               RETURNING id, name, created_at''',
-            (tenant_id, tenant_name)
-        )
-        tenant_row = cur.fetchone()
-
-        # Store API key hash (we return the actual key only once)
-        # Note: api_keys table may not exist yet - use savepoint to handle gracefully
-        api_key_stored = False
-        try:
-            cur.execute('SAVEPOINT api_key_insert')
-            cur.execute(
-                '''INSERT INTO api_keys (tenant_id, key_hash, name, created_at)
-                   VALUES (%s, %s, %s, NOW())''',
-                (tenant_id, api_key_hash, f"Default key for {tenant_name}")
-            )
-            cur.execute('RELEASE SAVEPOINT api_key_insert')
-            api_key_stored = True
-        except Exception as key_err:
-            # Table might not exist yet - rollback savepoint and continue
-            cur.execute('ROLLBACK TO SAVEPOINT api_key_insert')
-            print(f"[WARN] Could not store API key hash: {key_err}", file=sys.stderr)
-
-        # Create default branches for new tenant
-        default_branches = ['main', 'command-center']
-        for branch_name in default_branches:
-            cur.execute(
-                '''INSERT INTO branches (tenant_id, name, head_commit)
-                   VALUES (%s, %s, NULL)
-                   ON CONFLICT DO NOTHING''',
-                (tenant_id, branch_name)
-            )
+        result = provision_tenant(cur, tenant_name, branches=custom_branches)
 
         db.commit()
         cur.close()
 
         return jsonify({
             'status': 'created',
-            'tenant_id': tenant_id,
-            'api_key': api_key,  # Only returned once!
-            'name': tenant_row['name'],
+            'tenant_id': result['tenant_id'],
+            'api_key': result['api_key'],
+            'name': tenant_name,
             'email': tenant_email,
-            'created_at': str(tenant_row['created_at']),
-            'branches': default_branches,
+            'branches': result['branches'],
             'warning': 'Save your API key now - it cannot be retrieved again!'
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        cur.close()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/admin/tenants/<tenant_id>/branches', methods=['POST'])
+@require_admin
+def admin_create_branches(tenant_id):
+    """Create branches for a specific tenant."""
+    data = request.get_json() or {}
+    names = data.get('names', [])
+    if isinstance(data.get('name'), str):
+        names = [data['name']]
+
+    if not names:
+        return jsonify({'error': 'names array or name string required'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Verify tenant exists
+        cur.execute('SELECT id FROM tenants WHERE id = %s', (tenant_id,))
+        if not cur.fetchone():
+            cur.close()
+            return jsonify({'error': 'Tenant not found'}), 404
+
+        created = []
+        for name in names:
+            name = name.strip().lower()
+            if not name:
+                continue
+            cur.execute(
+                '''INSERT INTO branches (tenant_id, name, head_commit, created_at)
+                   VALUES (%s, %s, 'GENESIS', NOW())
+                   ON CONFLICT DO NOTHING''',
+                (tenant_id, name)
+            )
+            if cur.rowcount > 0:
+                created.append(name)
+
+        db.commit()
+        cur.close()
+
+        return jsonify({
+            'created': created,
+            'tenant_id': tenant_id,
+            'count': len(created)
         }), 201
 
     except Exception as e:

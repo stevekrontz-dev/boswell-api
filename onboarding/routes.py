@@ -116,8 +116,9 @@ def init_onboarding(get_db, get_cursor):
                 (user_id, email, password_hash, now)
             )
 
-            # 3. Provision tenant, branches, API key (shared logic)
-            result = provision_tenant(cur, email, user_id=user_id)
+            # 3. Provision tenant, branches, API key, sacred manifest, skill (shared logic)
+            custom_branches = data.get('branches')  # optional custom branch list
+            result = provision_tenant(cur, email, user_id=user_id, branches=custom_branches)
             tenant_id = result['tenant_id']
             api_key = result['api_key']
             api_key_encrypted = result['api_key_encrypted']
@@ -189,6 +190,23 @@ def init_onboarding(get_db, get_cursor):
             tenant_id = auth.get('tenant_id')
         if not tenant_id:
             return jsonify({'error': 'Could not determine tenant'}), 401
+
+        # Check if already seeded (provisioning now handles this automatically)
+        db_check = get_db()
+        cur_check = get_cursor()
+        try:
+            cur_check.execute(
+                "SELECT commit_hash FROM commits WHERE tenant_id = %s AND message = 'Seed sacred manifest for new account' LIMIT 1",
+                (tenant_id,)
+            )
+            if cur_check.fetchone():
+                cur_check.close()
+                return jsonify({
+                    'status': 'already_seeded',
+                    'message': 'Sacred manifest was already seeded during provisioning'
+                }), 200
+        finally:
+            cur_check.close()
 
         data = request.get_json() or {}
         branches = data.get('branches', ['command-center', 'work', 'personal', 'research'])
