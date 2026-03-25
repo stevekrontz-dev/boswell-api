@@ -8810,6 +8810,20 @@ def nightly_maintenance():
             except Exception as e:
                 results['discovery_pass'] = {'error': str(e)}
 
+            # Step 5: Rebuild branch fingerprints
+            try:
+                with app.test_request_context(method='POST', path='/v2/fingerprints/bootstrap'):
+                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+                    fp_result = bootstrap_fingerprints()
+                    if isinstance(fp_result, tuple):
+                        results['fingerprints'] = fp_result[0].get_json() if hasattr(fp_result[0], 'get_json') else fp_result[0]
+                    elif hasattr(fp_result, 'get_json'):
+                        results['fingerprints'] = fp_result.get_json()
+                    else:
+                        results['fingerprints'] = fp_result
+            except Exception as e:
+                results['fingerprints'] = {'error': str(e)}
+
             all_results[tenant_name] = results
         finally:
             pop_tenant_override()
