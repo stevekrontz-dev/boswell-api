@@ -169,6 +169,7 @@ export interface AdminTenantDetail {
   tenant: { id: string; name: string; created_at: string | null };
   user: { email: string | null; plan: string; status: string | null } | null;
   branches: string[];
+  recent_commits: { message: string; created_at: string; author: string }[];
   charts: {
     commits_by_branch: { branch: string; commits: number }[];
     api_calls_by_day: { day: string; requests: number }[];

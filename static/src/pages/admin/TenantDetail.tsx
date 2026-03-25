@@ -196,6 +196,31 @@ export default function AdminTenantDetailPage() {
         </div>
       </div>
 
+      {/* Recent Commits */}
+      <div className="card p-6">
+        <h3 className="text-sm font-medium text-parchment-200/60 mb-4">Recent Commits</h3>
+        {(data.recent_commits || []).length > 0 ? (
+          <div className="space-y-3">
+            {data.recent_commits.map((c, i) => (
+              <div key={i} className="flex items-start gap-3 group">
+                <div className="w-1.5 h-1.5 rounded-full bg-ember-500/60 mt-2 flex-shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-parchment-50 leading-snug">{c.message}</p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="text-[10px] text-parchment-200/30">
+                      {new Date(c.created_at).toLocaleString('en', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+                    </span>
+                    <span className="text-[10px] text-parchment-200/20">by {c.author}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-parchment-200/30 text-sm">No commits yet</div>
+        )}
+      </div>
+
       {/* Top Actions */}
       <div className="card p-6">
         <h3 className="text-sm font-medium text-parchment-200/60 mb-4">Top Actions (7d)</h3>

@@ -4238,6 +4238,14 @@ def admin_tenant_detail(tenant_id):
         ''', (tenant_id,))
         top_actions = [{'action': row['action'], 'count': row['count']} for row in cur.fetchall()]
 
+        # Recent commits (last 5)
+        cur.execute('''
+            SELECT message, created_at, author
+            FROM commits WHERE tenant_id = %s
+            ORDER BY created_at DESC LIMIT 5
+        ''', (tenant_id,))
+        recent_commits = [{'message': row['message'], 'created_at': str(row['created_at']), 'author': row['author']} for row in cur.fetchall()]
+
         # User info
         cur.execute('SELECT email, plan, status FROM users WHERE tenant_id = %s LIMIT 1', (tenant_id,))
         user_row = cur.fetchone()
@@ -4259,6 +4267,7 @@ def admin_tenant_detail(tenant_id):
                 'status': user_row['status'] if user_row else None,
             } if user_row else None,
             'branches': branch_names,
+            'recent_commits': recent_commits,
             'charts': {
                 'commits_by_branch': commits_by_branch,
                 'api_calls_by_day': api_calls_by_day,
