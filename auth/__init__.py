@@ -234,8 +234,13 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
     """
     import sys
 
+    # Re-read from env on every request — module-level constants are frozen at import
+    # time and can miss Railway env var changes or be stale across worker restarts.
+    auth_enabled = os.environ.get('AUTH_ENABLED', 'false').lower() == 'true'
+    auth_grace_mode = os.environ.get('AUTH_GRACE_MODE', 'false').lower() == 'true'
+
     # Auth disabled - allow all
-    if not AUTH_ENABLED:
+    if not auth_enabled:
         g.mcp_auth = {'source': 'disabled', 'tenant_id': DEFAULT_TENANT}
         return None
 
@@ -332,7 +337,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
             return None
 
     # No valid auth — grace mode logs but allows through
-    if AUTH_GRACE_MODE:
+    if auth_grace_mode:
         print(
             f'[AUTH-GRACE] Unauthenticated request: {request.method} {request.path} '
             f'from {request.remote_addr}',
