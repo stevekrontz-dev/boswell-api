@@ -266,6 +266,11 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
             or static_ext in ('svg', 'png', 'ico', 'json', 'js', 'css', 'woff', 'woff2', 'ttf')):
         return None
 
+    # MCP health probe — GET /v2/mcp is Claude Code checking if server is alive
+    # No credentials needed for discovery; POST tool calls still enforce auth
+    if request.method == 'GET' and request.path == '/v2/mcp':
+        return None
+
     # Internal request (stdio) - CRITICAL: protects CC/Desktop
     if is_internal_request():
         g.mcp_auth = {'source': 'internal', 'tenant_id': DEFAULT_TENANT}
