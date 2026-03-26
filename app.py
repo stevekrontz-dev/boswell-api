@@ -10502,6 +10502,24 @@ def dispatch_mcp_tool(tool_name, args):
         return {"error": f"Unknown tool: {tool_name}"}, 400
 
 
+@app.route('/v2/mcp', methods=['GET'])
+def mcp_ping():
+    """
+    MCP endpoint health probe (GET).
+    Claude Code's MCP client GETs this URL before sending initialize.
+    Auth is enforced by before_request: grace mode passes, hard-auth mode returns 401.
+    """
+    from auth import AUTH_GRACE_MODE
+    return jsonify({
+        "status": "ok",
+        "server": MCP_SERVER_NAME,
+        "version": MCP_SERVER_VERSION,
+        "protocol": MCP_PROTOCOL_VERSION,
+        "grace_mode": AUTH_GRACE_MODE,
+        "tools_count": len(MCP_TOOLS),
+    })
+
+
 @app.route('/v2/mcp', methods=['POST'])
 def mcp_handler():
     """
