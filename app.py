@@ -96,7 +96,8 @@ def generate_embedding(text: str) -> list:
         response = client.embeddings.create(
             model="text-embedding-3-small",
             input=text,
-            dimensions=1536
+            dimensions=1536,
+            timeout=3.0,
         )
         return response.data[0].embedding
     except Exception as e:
@@ -1718,32 +1719,36 @@ def _rerank_results(rrf_results, cur, tenant_id):
     rrf_results.sort(key=lambda r: r.get('reranked_score', 0), reverse=True)
 
     if embeddings:
-        selected = []
-        remaining = list(rrf_results)
-        while remaining:
-            candidate = remaining.pop(0)
-            bh = candidate.get('blob_hash', '')
-            cand_emb = embeddings.get(bh)
+        import numpy as np
+        # Build embedding matrix once for batch cosine similarity
+        ordered_hashes = [r.get('blob_hash', '') for r in rrf_results]
+        emb_list = [embeddings.get(bh) for bh in ordered_hashes]
+        has_emb = [e is not None for e in emb_list]
 
-            if cand_emb is not None and selected:
-                max_sim = 0.0
-                for sel in selected:
-                    sel_emb = embeddings.get(sel.get('blob_hash', ''))
-                    if sel_emb is not None:
-                        try:
-                            sim = cosine_similarity(cand_emb, sel_emb)
-                            max_sim = max(max_sim, sim)
-                        except Exception:
-                            pass
-                if max_sim > 0.90:
-                    candidate['reranked_score'] *= 0.5
-                    candidate['_rerank_signals']['mmr_penalty'] = round(max_sim, 4)
+        if any(has_emb):
+            # Pre-compute normalized matrix for dot-product cosine similarity
+            emb_matrix = np.zeros((len(rrf_results), 1536))
+            for i, emb in enumerate(emb_list):
+                if emb is not None:
+                    arr = np.array(emb)
+                    norm = np.linalg.norm(arr)
+                    if norm > 0:
+                        emb_matrix[i] = arr / norm
 
-            selected.append(candidate)
+            # Compute full similarity matrix in one operation
+            sim_matrix = emb_matrix @ emb_matrix.T
+
+            # Apply MMR penalties: for each result, check max similarity to all preceding results
+            for i in range(1, len(rrf_results)):
+                if has_emb[i]:
+                    max_sim = float(np.max(sim_matrix[i, :i])) if i > 0 else 0.0
+                    if max_sim > 0.90:
+                        rrf_results[i]['reranked_score'] *= 0.5
+                        rrf_results[i]['_rerank_signals']['mmr_penalty'] = round(max_sim, 4)
 
         # Re-sort after MMR penalties
-        selected.sort(key=lambda r: r.get('reranked_score', 0), reverse=True)
-        return selected
+        rrf_results.sort(key=lambda r: r.get('reranked_score', 0), reverse=True)
+        return rrf_results
 
     return rrf_results
 
@@ -2864,7 +2869,7 @@ def semantic_startup():
             'verbosity': 'minimal'
         }
     elif verbosity == 'full':
-        # Everything for debugging — full landscape
+        # Everything for debugging — full landscape (backlog removed: redundant with open_tasks)
         response = {
             'timestamp': timestamp_utc,
             'local_time': local_time,
@@ -2873,7 +2878,6 @@ def semantic_startup():
             'relevant_memories': relevant_memories,
             'hot_memories': hot_memories,
             'work_landscape': work_landscape,
-            'backlog': backlog,
             'open_tasks': open_tasks,
             'context_used': context,
             'verbosity': 'full'
@@ -2887,20 +2891,37 @@ def semantic_startup():
             'distance': m.get('distance')
         } for m in relevant_memories[:3]]
 
+        # Slim tasks: P1-P2 only, title-only (no full descriptions)
+        slim_tasks = [{
+            'id': t['id'],
+            'title': t.get('title', t.get('description', '')[:80]),
+            'branch': t['branch'],
+            'priority': t['priority'],
+            'assigned_to': t['assigned_to']
+        } for t in open_tasks if t.get('priority', 3) <= 2]
+
+        # Slim landscape: branch:health pairs only (plan titles on demand via boswell_log)
+        slim_landscape = {
+            branch: {'health': data['health']}
+            for branch, data in work_landscape.items()
+        }
+
         response = {
             'timestamp': timestamp_utc,
             'local_time': local_time,
             'sacred_manifest': sacred_manifest,
             'relevant_memories': trimmed_memories,
-            'work_landscape': work_landscape,
-            'backlog': backlog,
-            'open_tasks': open_tasks,
+            'work_landscape': slim_landscape,
+            'open_tasks': slim_tasks,
             'context_used': context,
             'verbosity': 'normal'
         }
 
-    # v4: Add recent bookmarks if available
+    # v4: Add recent bookmarks if available (summaries truncated for startup weight)
     if HIPPOCAMPAL_ENABLED and recent_bookmarks:
+        for bm in recent_bookmarks:
+            if bm.get('summary') and len(bm['summary']) > 200:
+                bm['summary'] = bm['summary'][:200] + '...'
         response['recent_bookmarks'] = recent_bookmarks
 
     # v5: Discovery blobs — orphaned memories surfaced for reconnection
@@ -8781,21 +8802,13 @@ def nightly_maintenance():
             except Exception as e:
                 results['candidate_cleanup'] = {'error': str(e)}
 
-            # Step 3: Consolidation (promote top 10)
-            try:
-                with app.test_request_context(method='POST', path='/v2/consolidate',
-                                               content_type='application/json',
-                                               json={'max_promotions': 10, 'cycle_type': 'nightly'}):
-                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
-                    consol_result = run_consolidation()
-                    if isinstance(consol_result, tuple):
-                        results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
-                    elif hasattr(consol_result, 'get_json'):
-                        results['consolidation'] = consol_result.get_json()
-                    else:
-                        results['consolidation'] = consol_result
-            except Exception as e:
-                results['consolidation'] = {'error': str(e)}
+            # Step 3: Consolidation — DISABLED until search unification lands (CC/CW consensus 2026-03-29)
+            # Consolidation scores bookmarks on replay signals that can't accumulate because
+            # candidate_memories are invisible to boswell_search. Re-enable after Track B (B1).
+            results['consolidation'] = {
+                'status': 'disabled',
+                'reason': 'CC/CW consensus: consolidation held until search unification makes bookmarks visible to search'
+            }
 
             # Step 4: Discovery pass (surface orphaned memories)
             try:
