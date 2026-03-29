@@ -1753,7 +1753,7 @@ def _rerank_results(rrf_results, cur, tenant_id):
     return rrf_results
 
 
-def bm25_search(cur, query, tenant_id, limit=20):
+def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
     """Full-text search using PostgreSQL ts_rank (BM25-like scoring).
 
     Uses plainto_tsquery for robust query parsing (handles special characters).
@@ -1762,11 +1762,24 @@ def bm25_search(cur, query, tenant_id, limit=20):
 
     Searches both permanent memories (blobs) and staged bookmarks (candidate_memories)
     when HIPPOCAMPAL_ENABLED. Bookmarks participate in RRF fusion on equal footing.
+
+    Depth levels (Steve's whiteboard architecture):
+    - 'surface' (default): active blobs + active/cooling candidates
+    - 'deep': adds silted commits (silt_status IS NOT NULL)
+    - 'silt': everything including silted bookmarks (geological dig)
     """
     ensure_deprecated_commits_table()
 
+    # Build commit silt filter based on depth
+    silt_filter = "AND (c.silt_status IS NULL)" if depth == 'surface' else ""
+
+    # Build candidate status filter based on depth
+    candidate_statuses = "('active', 'cooling')"
+    if depth == 'silt':
+        candidate_statuses = "('active', 'cooling', 'silt')"
+
     if HIPPOCAMPAL_ENABLED:
-        cur.execute("""
+        cur.execute(f"""
             SELECT * FROM (
                 SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
                        c.commit_hash, c.message, c.author,
@@ -1780,6 +1793,7 @@ def bm25_search(cur, query, tenant_id, limit=20):
                   AND dc.commit_hash IS NULL
                   AND b.search_vector IS NOT NULL
                   AND b.search_vector @@ plainto_tsquery('english', %s)
+                  {silt_filter}
 
                 UNION ALL
 
@@ -1794,7 +1808,7 @@ def bm25_search(cur, query, tenant_id, limit=20):
                        'staged' as source
                 FROM candidate_memories cm
                 WHERE cm.tenant_id = %s
-                  AND cm.status IN ('active', 'cooling')
+                  AND cm.status IN {candidate_statuses}
                   AND to_tsvector('english', coalesce(cm.summary, '') || ' ' || coalesce(cm.message, ''))
                       @@ plainto_tsquery('english', %s)
             ) combined
@@ -1836,11 +1850,13 @@ def bm25_search(cur, query, tenant_id, limit=20):
     return results
 
 
-def _semantic_search_internal(cur, query, tenant_id, limit=20):
+def _semantic_search_internal(cur, query, tenant_id, limit=20, depth='surface'):
     """Internal semantic search returning results as list of dicts.
 
     Separated from the /v2/semantic-search endpoint so hybrid search
     can reuse it without going through Flask request/response cycle.
+
+    Depth: 'surface' (default), 'deep', 'silt' — controls which tiers are searched.
     """
     if not OPENAI_API_KEY:
         return []
@@ -1851,8 +1867,12 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20):
 
     ensure_deprecated_commits_table()
 
+    # Build depth-aware filters
+    silt_filter = "AND (c.silt_status IS NULL)" if depth == 'surface' else ""
+    candidate_statuses = "('active', 'cooling', 'silt')" if depth == 'silt' else "('active', 'cooling')"
+
     if HIPPOCAMPAL_ENABLED:
-        cur.execute("""
+        cur.execute(f"""
             SELECT * FROM (
                 SELECT b.blob_hash, b.content, b.content_type, b.created_at,
                        c.commit_hash, c.message, c.author,
@@ -1863,6 +1883,7 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20):
                 JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
                 LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
                 WHERE b.embedding IS NOT NULL AND b.tenant_id = %s AND dc.commit_hash IS NULL
+                {silt_filter}
 
                 UNION ALL
 
@@ -1876,7 +1897,7 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20):
                        'staged' as source
                 FROM candidate_memories cm
                 WHERE cm.embedding IS NOT NULL AND cm.tenant_id = %s
-                  AND cm.status IN ('active', 'cooling')
+                  AND cm.status IN {candidate_statuses}
             ) combined
             ORDER BY distance
             LIMIT %s
@@ -1928,6 +1949,7 @@ def search_memories():
     - limit: Max results (default: 20)
     - mode: Search mode - 'hybrid' (default, BM25 + vector RRF), 'semantic', 'keyword' (redirects to BM25)
     - branch: Filter results to a specific branch (optional)
+    - depth: Search depth - 'surface' (default), 'deep' (includes silted commits), 'silt' (geological dig, everything)
     """
     if HIPPOCAMPAL_ENABLED:
         ensure_hippocampal_tables()
@@ -1936,6 +1958,7 @@ def search_memories():
     limit = request.args.get('limit', 20, type=int)
     mode = request.args.get('mode', 'hybrid')
     branch = request.args.get('branch')
+    depth = request.args.get('depth', 'surface')
 
     if not query:
         return jsonify({'error': 'Search query required'}), 400
@@ -1949,13 +1972,13 @@ def search_memories():
         # Over-fetch for fusion candidates (extra if branch filtering)
         fetch_mult = 4 if branch else 2
         try:
-            keyword_results = bm25_search(cur, query, tenant_id, limit=limit * fetch_mult)
+            keyword_results = bm25_search(cur, query, tenant_id, limit=limit * fetch_mult, depth=depth)
         except Exception as e:
             print(f"[HYBRID] BM25 search error (falling back to empty): {e}", file=sys.stderr)
             keyword_results = []
 
         try:
-            semantic_results = _semantic_search_internal(cur, query, tenant_id, limit=limit * fetch_mult)
+            semantic_results = _semantic_search_internal(cur, query, tenant_id, limit=limit * fetch_mult, depth=depth)
         except Exception as e:
             print(f"[HYBRID] Semantic search error (falling back to empty): {e}", file=sys.stderr)
             semantic_results = []
@@ -2001,7 +2024,7 @@ def search_memories():
 
         # Over-fetch if branch filtering (post-filter will reduce)
         fetch_limit = limit * 3 if branch else limit
-        results = _semantic_search_internal(cur, query, tenant_id, limit=fetch_limit)
+        results = _semantic_search_internal(cur, query, tenant_id, limit=fetch_limit, depth=depth)
 
         # Branch filter: post-filter permanent results by branch membership
         if branch:
@@ -2028,7 +2051,7 @@ def search_memories():
 
     # Use BM25 (full-text search) instead of broken LIKE scan
     fetch_limit = limit * 3 if branch else limit
-    results = bm25_search(cur, query, tenant_id, limit=fetch_limit)
+    results = bm25_search(cur, query, tenant_id, limit=fetch_limit, depth=depth)
 
     # Branch filter: post-filter permanent results by branch membership
     if branch:
@@ -6178,6 +6201,27 @@ def decay_trails():
                 'avg_stability': round(float(row['avg_stability'] or 0), 3)
             }
 
+        # Commit SILT: blobs whose ALL trails are archived sink to geological depth
+        # Per Steve's whiteboard — each branch has its own silt layer at the bottom
+        commits_silted = 0
+        try:
+            cur.execute('''
+                UPDATE commits SET silt_status = 'silted', silted_at = NOW(),
+                    silt_reason = 'trail_decay: all trails archived'
+                WHERE tenant_id = %s AND silt_status IS NULL
+                AND tree_hash IN (
+                    SELECT DISTINCT te.tree_hash FROM tree_entries te
+                    JOIN trails t ON te.blob_hash = t.source_blob AND te.tenant_id = t.tenant_id
+                    WHERE te.tenant_id = %s
+                    GROUP BY te.tree_hash
+                    HAVING COUNT(*) FILTER (WHERE t.state != 'archived') = 0
+                )
+            ''', (get_tenant_id(), get_tenant_id()))
+            commits_silted = cur.rowcount
+        except Exception as e:
+            # silt_status column may not exist yet (migration 021 pending)
+            print(f"[DECAY] Commit silt check skipped: {e}", file=sys.stderr)
+
         db.commit()
         cur.close()
 
@@ -6189,7 +6233,8 @@ def decay_trails():
                 'became_active': became_active,
                 'became_fading': became_fading,
                 'became_dormant': became_dormant,
-                'became_archived': became_archived
+                'became_archived': became_archived,
+                'commits_silted': commits_silted
             },
             'state_distribution': state_stats,
             'sacred_directive': 'bf4b68532a81 honored — storage_strength never decreases, no memory deleted',
@@ -8522,51 +8567,43 @@ def run_consolidation():
 
 @app.route('/v2/candidates/cleanup', methods=['POST'])
 def cleanup_candidates():
-    """Expire past-TTL candidates and hard-delete old expired ones.
+    """SILT transition for candidates that failed consolidation.
 
-    FROZEN by sacred directive (2026-02-09). No candidates may expire or be deleted.
-    See Boswell commit bf4b68532a81 on branch boswell.
-    Lift condition: Steve explicitly re-enables after architecture review.
+    Sacred directive bf4b68532a81 HONORED: nothing is ever deleted.
+    Instead of expiring/deleting, candidates sink to SILT status.
+    Architecture: Steve's whiteboard (IMG_9925.jpeg) — consolidation NO path → bookmark SILT.
+
+    Candidates transition to 'silt' when:
+    - Status is 'cooling' (older than 3 days, not yet promoted)
+    - consolidation_score is set (has been scored at least once)
+    - consolidation_score < min_score threshold
     """
-    # SACRED DIRECTIVE: Candidate cleanup frozen (2026-02-09)
-    return jsonify({
-        'status': 'frozen',
-        'reason': 'Sacred directive bf4b68532a81 - candidate cleanup disabled until architecture review',
-        'expired': 0,
-        'hard_deleted': 0,
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
-    })
-
-    # --- ORIGINAL CLEANUP LOGIC (frozen) ---
     ensure_hippocampal_tables()
     db = get_db()
     cur = get_cursor()
 
+    min_score = request.json.get('min_score', 0.3) if request.json else 0.3
+
     try:
-        # Expire past-TTL (only if expires_at is set — NULL means no expiry)
+        # Transition low-scoring cooling candidates to silt
+        # They must have been scored at least once (consolidation_score IS NOT NULL)
         cur.execute("""
             UPDATE candidate_memories
-            SET status = 'expired'
-            WHERE tenant_id = %s AND status IN ('active', 'cooling')
-              AND expires_at IS NOT NULL AND expires_at < NOW()
-        """, (get_tenant_id(),))
-        expired = cur.rowcount
-
-        # Hard-delete expired > 30 days
-        cur.execute("""
-            DELETE FROM candidate_memories
-            WHERE tenant_id = %s AND status = 'expired'
-              AND expires_at IS NOT NULL AND expires_at < NOW() - INTERVAL '30 days'
-        """, (get_tenant_id(),))
-        hard_deleted = cur.rowcount
+            SET status = 'silt'
+            WHERE tenant_id = %s AND status = 'cooling'
+              AND consolidation_score IS NOT NULL
+              AND consolidation_score < %s
+        """, (get_tenant_id(), min_score))
+        silted = cur.rowcount
 
         db.commit()
         cur.close()
 
         return jsonify({
-            'status': 'cleaned',
-            'expired': expired,
-            'hard_deleted': hard_deleted,
+            'status': 'silt_transition',
+            'silted': silted,
+            'min_score_threshold': min_score,
+            'hard_deleted': 0,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         })
 
@@ -8772,13 +8809,23 @@ def nightly_maintenance():
             except Exception as e:
                 results['candidate_cleanup'] = {'error': str(e)}
 
-            # Step 3: Consolidation — DISABLED until search unification lands (CC/CW consensus 2026-03-29)
-            # Consolidation scores bookmarks on replay signals that can't accumulate because
-            # candidate_memories are invisible to boswell_search. Re-enable after Track B (B1).
-            results['consolidation'] = {
-                'status': 'disabled',
-                'reason': 'CC/CW consensus: consolidation held until search unification makes bookmarks visible to search'
-            }
+            # Step 3: Consolidation (dry-run — scores candidates but does not promote)
+            # Search unification landed (B1, commit ba9c6f4). Bookmarks now visible to search.
+            # Running in dry_run mode so Steve can review scoring before enabling promotions.
+            try:
+                with app.test_request_context(method='POST', path='/v2/consolidate',
+                                               content_type='application/json',
+                                               json={'max_promotions': 10, 'cycle_type': 'dream', 'dry_run': True}):
+                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+                    consol_result = run_consolidation()
+                    if isinstance(consol_result, tuple):
+                        results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
+                    elif hasattr(consol_result, 'get_json'):
+                        results['consolidation'] = consol_result.get_json()
+                    else:
+                        results['consolidation'] = consol_result
+            except Exception as e:
+                results['consolidation'] = {'error': str(e)}
 
             # Step 4: Discovery pass (surface orphaned memories)
             try:
@@ -9663,7 +9710,8 @@ MCP_TOOLS = [
                 "query": {"type": "string", "description": "Search query"},
                 "branch": {"type": "string", "description": "Optional: limit search to specific branch"},
                 "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10},
-                "mode": {"type": "string", "description": "Search mode: 'hybrid' (default, BM25 + vector RRF), 'semantic' (vector only), 'keyword' (BM25 text only)", "default": "hybrid", "enum": ["keyword", "semantic", "hybrid"]}
+                "mode": {"type": "string", "description": "Search mode: 'hybrid' (default, BM25 + vector RRF), 'semantic' (vector only), 'keyword' (BM25 text only)", "default": "hybrid", "enum": ["keyword", "semantic", "hybrid"]},
+                "depth": {"type": "string", "description": "Search depth: 'surface' (default, active memories), 'deep' (includes silted commits), 'silt' (geological dig — everything including failed bookmarks)", "default": "surface", "enum": ["surface", "deep", "silt"]}
             },
             "required": ["query"]
         }
@@ -10135,6 +10183,8 @@ def dispatch_mcp_tool(tool_name, args):
             qs["limit"] = args["limit"]
         if "mode" in args:
             qs["mode"] = args["mode"]
+        if "depth" in args:
+            qs["depth"] = args["depth"]
         return invoke_view(search_memories, query_string=qs)
     
     elif tool_name == "boswell_semantic_search":
