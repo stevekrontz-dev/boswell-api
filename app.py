@@ -2507,6 +2507,7 @@ def semantic_startup():
     k = request.args.get('k', 5, type=int)
     agent_id = request.args.get('agent_id')  # Filter tasks for specific agent
     verbosity = request.args.get('verbosity', 'normal')  # minimal, normal, full
+    semantic = request.args.get('semantic', 'false').lower() in ('true', '1', 'yes')  # opt-in semantic search
 
     cur = get_cursor()
 
@@ -2540,9 +2541,9 @@ def semantic_startup():
         except:
             pass
 
-    # Semantic search for contextually relevant memories
+    # Semantic search for contextually relevant memories (opt-in via semantic=true)
     relevant_memories = []
-    if OPENAI_API_KEY:
+    if semantic and OPENAI_API_KEY:
         query_embedding = generate_embedding(context)
         if query_embedding:
             cur.execute("""
@@ -9623,13 +9624,14 @@ def invoke_view(view_fn, method='GET', path='/', query_string=None, json_data=No
 MCP_TOOLS = [
     {
         "name": "boswell_startup",
-        "description": "Load startup context. Returns sacred commitments, open tasks, and relevant memories. CALL THIS FIRST at conversation start, before responding to anything—even 'hi'. Sets the stage for continuity. Use verbosity='minimal' for greetings, 'normal' (default) for work, 'full' for debugging.",
+        "description": "Load startup context. Returns sacred commitments, open tasks, and relevant memories. CALL THIS FIRST at conversation start, before responding to anything—even 'hi'. Sets the stage for continuity. Use verbosity='minimal' for greetings, 'normal' (default) for work, 'full' for debugging. Semantic search is OFF by default—use boswell_search for targeted retrieval.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "context": {"type": "string", "description": "Optional context for semantic retrieval (default: 'important decisions and active commitments')"},
-                "k": {"type": "integer", "description": "Number of relevant memories to return (default: 5)", "default": 5},
-                "verbosity": {"type": "string", "enum": ["minimal", "normal", "full"], "description": "Response size: minimal (greeting), normal (work), full (debug)", "default": "normal"}
+                "context": {"type": "string", "description": "Optional context for semantic retrieval (only used when semantic=true)"},
+                "k": {"type": "integer", "description": "Number of relevant memories to return when semantic=true (default: 5)", "default": 5},
+                "verbosity": {"type": "string", "enum": ["minimal", "normal", "full"], "description": "Response size: minimal (greeting), normal (work), full (debug)", "default": "normal"},
+                "semantic": {"type": "string", "enum": ["true", "false"], "description": "Enable semantic search for relevant memories (default: false). Use boswell_search instead for targeted retrieval.", "default": "false"}
             }
         }
     },
@@ -10191,6 +10193,8 @@ def dispatch_mcp_tool(tool_name, args):
             qs["context"] = args["context"]
         if "k" in args:
             qs["k"] = args["k"]
+        if "semantic" in args:
+            qs["semantic"] = args["semantic"]
         return invoke_view(semantic_startup, query_string=qs)
     
     # ===== WRITE OPERATIONS =====
