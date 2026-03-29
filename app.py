@@ -1759,24 +1759,65 @@ def bm25_search(cur, query, tenant_id, limit=20):
     Uses plainto_tsquery for robust query parsing (handles special characters).
     Returns results as list of dicts matching the search result format.
     Tenant-scoped via explicit WHERE clause.
+
+    Searches both permanent memories (blobs) and staged bookmarks (candidate_memories)
+    when HIPPOCAMPAL_ENABLED. Bookmarks participate in RRF fusion on equal footing.
     """
     ensure_deprecated_commits_table()
 
-    cur.execute("""
-        SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
-               c.commit_hash, c.message, c.author,
-               ts_rank(b.search_vector, plainto_tsquery('english', %s)) as rank
-        FROM blobs b
-        JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
-        JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-        LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
-        WHERE b.tenant_id = %s
-          AND dc.commit_hash IS NULL
-          AND b.search_vector IS NOT NULL
-          AND b.search_vector @@ plainto_tsquery('english', %s)
-        ORDER BY rank DESC
-        LIMIT %s
-    """, (query, tenant_id, query, limit))
+    if HIPPOCAMPAL_ENABLED:
+        cur.execute("""
+            SELECT * FROM (
+                SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
+                       c.commit_hash, c.message, c.author,
+                       ts_rank(b.search_vector, plainto_tsquery('english', %s)) as rank,
+                       'permanent' as source
+                FROM blobs b
+                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+                WHERE b.tenant_id = %s
+                  AND dc.commit_hash IS NULL
+                  AND b.search_vector IS NOT NULL
+                  AND b.search_vector @@ plainto_tsquery('english', %s)
+
+                UNION ALL
+
+                SELECT cm.id::text as blob_hash, cm.summary as content,
+                       'staged' as content_type, cm.created_at,
+                       NULL as commit_hash, cm.message,
+                       cm.source_instance as author,
+                       ts_rank(
+                           to_tsvector('english', coalesce(cm.summary, '') || ' ' || coalesce(cm.message, '')),
+                           plainto_tsquery('english', %s)
+                       ) as rank,
+                       'staged' as source
+                FROM candidate_memories cm
+                WHERE cm.tenant_id = %s
+                  AND cm.status IN ('active', 'cooling')
+                  AND to_tsvector('english', coalesce(cm.summary, '') || ' ' || coalesce(cm.message, ''))
+                      @@ plainto_tsquery('english', %s)
+            ) combined
+            ORDER BY rank DESC
+            LIMIT %s
+        """, (query, tenant_id, query, query, tenant_id, query, limit))
+    else:
+        cur.execute("""
+            SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
+                   c.commit_hash, c.message, c.author,
+                   ts_rank(b.search_vector, plainto_tsquery('english', %s)) as rank,
+                   'permanent' as source
+            FROM blobs b
+            JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+            JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+            LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
+            WHERE b.tenant_id = %s
+              AND dc.commit_hash IS NULL
+              AND b.search_vector IS NOT NULL
+              AND b.search_vector @@ plainto_tsquery('english', %s)
+            ORDER BY rank DESC
+            LIMIT %s
+        """, (query, tenant_id, query, limit))
 
     results = []
     for row in cur.fetchall():
@@ -1789,7 +1830,7 @@ def bm25_search(cur, query, tenant_id, limit=20):
             'commit_hash': row['commit_hash'],
             'message': row['message'],
             'author': row['author'],
-            'source': 'permanent',
+            'source': row.get('source', 'permanent'),
             'bm25_rank': float(row['rank'])
         })
     return results
@@ -1931,43 +1972,8 @@ def search_memories():
                 results = [r for r in results if branch_map.get(r['blob_hash'], '').lower() == branch.lower()]
         results = results[:limit]
 
-        # Also search staged candidates if hippocampal enabled
-        if HIPPOCAMPAL_ENABLED:
-            try:
-                remaining = limit - len(results)
-                if remaining > 0:
-                    staged_sql = """
-                        SELECT id, branch, summary, content, message, source_instance,
-                               created_at
-                        FROM candidate_memories
-                        WHERE tenant_id = %s AND status IN ('active', 'cooling')
-                          AND (summary ILIKE %s OR content::text ILIKE %s)
-                    """
-                    staged_params = [tenant_id, f'%{query}%', f'%{query}%']
-                    if branch:
-                        staged_sql += " AND LOWER(branch) = LOWER(%s)"
-                        staged_params.append(branch)
-                    staged_sql += " ORDER BY created_at DESC LIMIT %s"
-                    staged_params.append(remaining)
-                    cur.execute(staged_sql, staged_params)
-
-                    for row in cur.fetchall():
-                        content = row['summary']
-                        if row['content']:
-                            content_str = json.dumps(row['content'], default=str) if isinstance(row['content'], dict) else str(row['content'])
-                            content = f"{row['summary']}\n{content_str}"
-                        results.append({
-                            'blob_hash': str(row['id']),
-                            'content': content[:500] + '...' if len(content) > 500 else content,
-                            'content_type': 'staged',
-                            'created_at': str(row['created_at']) if row['created_at'] else None,
-                            'commit_hash': None,
-                            'message': row['message'],
-                            'author': row['source_instance'],
-                            'source': 'staged'
-                        })
-            except Exception as e:
-                print(f"[HYBRID] Candidate search error: {e}", file=sys.stderr)
+        # Staged candidates now participate in both BM25 and semantic halves of RRF fusion
+        # (no separate ILIKE append needed — candidates come through the pipeline)
 
         # Auto-trail
         for r in results[:3]:
@@ -2033,43 +2039,7 @@ def search_memories():
                        if branch_map.get(r['blob_hash'], '').lower() == branch.lower()]
     results = results[:limit]
 
-    # Also search staged candidates if hippocampal enabled
-    if HIPPOCAMPAL_ENABLED:
-        try:
-            remaining = limit - len(results)
-            if remaining > 0:
-                staged_sql = """
-                    SELECT id, branch, summary, content, message, source_instance,
-                           created_at
-                    FROM candidate_memories
-                    WHERE tenant_id = %s AND status IN ('active', 'cooling')
-                      AND (summary ILIKE %s OR content::text ILIKE %s)
-                """
-                staged_params = [tenant_id, f'%{query}%', f'%{query}%']
-                if branch:
-                    staged_sql += " AND LOWER(branch) = LOWER(%s)"
-                    staged_params.append(branch)
-                staged_sql += " ORDER BY created_at DESC LIMIT %s"
-                staged_params.append(remaining)
-                cur.execute(staged_sql, staged_params)
-
-                for row in cur.fetchall():
-                    content = row['summary']
-                    if row['content']:
-                        content_str = json.dumps(row['content'], default=str) if isinstance(row['content'], dict) else str(row['content'])
-                        content = f"{row['summary']}\n{content_str}"
-                    results.append({
-                        'blob_hash': str(row['id']),
-                        'content': content[:500] + '...' if len(content) > 500 else content,
-                        'content_type': 'staged',
-                        'created_at': str(row['created_at']) if row['created_at'] else None,
-                        'commit_hash': None,
-                        'message': row['message'],
-                        'author': row['source_instance'],
-                        'source': 'staged'
-                    })
-        except Exception as e:
-            print(f"[SEARCH] Candidate search error: {e}", file=sys.stderr)
+    # Staged candidates now included in bm25_search via UNION (no separate ILIKE needed)
 
     # Auto-trail: track top 3 result blob hashes
     for r in results[:3]:
