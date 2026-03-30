@@ -1160,16 +1160,19 @@ def create_commit():
             )
 
         # Embedding deferred to 5-minute micro-batch backfill service.
-        # Queue blob for embedding generation (discovery_queue already exists).
+        # Queue blob for backfill. Uses savepoint so failure doesn't poison the commit transaction.
         embedding = None
         try:
+            cur.execute("SAVEPOINT embed_queue")
             ensure_discovery_queue_table()
             cur.execute("""
-                INSERT INTO discovery_queue (tenant_id, blob_hash, status, queued_at, preview, commit_message)
-                VALUES (%s, %s, 'pending', NOW(), %s, %s)
+                INSERT INTO discovery_queue (tenant_id, blob_hash, status, queued_at, preview)
+                VALUES (%s, %s, 'pending', NOW(), %s)
                 ON CONFLICT (tenant_id, blob_hash) DO NOTHING
-            """, (get_tenant_id(), blob_hash, content_str[:200], message[:100]))
+            """, (get_tenant_id(), blob_hash, content_str[:200]))
+            cur.execute("RELEASE SAVEPOINT embed_queue")
         except Exception as e:
+            cur.execute("ROLLBACK TO SAVEPOINT embed_queue")
             print(f"[DEFERRED-EMBED] Queue failed (non-fatal): {e}", file=sys.stderr)
 
         # Routing suggestion deferred — requires embedding
