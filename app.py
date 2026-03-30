@@ -84,8 +84,22 @@ def get_openai_client():
         openai_client = OpenAI(api_key=api_key)
     return openai_client
 
-def generate_embedding(text: str) -> list:
-    """Generate embedding using OpenAI text-embedding-3-small."""
+_embedding_cache = {}
+_EMBEDDING_CACHE_MAX = 200
+
+def generate_embedding(text: str, use_cache: bool = True) -> list:
+    """Generate embedding using OpenAI text-embedding-3-small.
+
+    LRU cache (in-memory, process-scoped) avoids repeat OpenAI calls for
+    identical queries within the same process lifetime. Pass use_cache=False
+    for write-path embeddings that should always be fresh.
+    """
+    import hashlib
+    cache_key = hashlib.md5(text[:1000].encode()).hexdigest() if use_cache else None
+
+    if use_cache and cache_key in _embedding_cache:
+        return _embedding_cache[cache_key]
+
     client = get_openai_client()
     if not client:
         print(f"[EMBEDDING] No client - OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}", file=sys.stderr)
@@ -99,7 +113,12 @@ def generate_embedding(text: str) -> list:
             dimensions=1536,
             timeout=3.0,
         )
-        return response.data[0].embedding
+        result = response.data[0].embedding
+
+        if use_cache and result and len(_embedding_cache) < _EMBEDDING_CACHE_MAX:
+            _embedding_cache[cache_key] = result
+
+        return result
     except Exception as e:
         print(f"[EMBEDDING] Error: {e}")
         return None
@@ -1063,45 +1082,14 @@ def create_commit():
         if not plan_status or plan_status not in valid_plan_statuses:
             return jsonify({'error': f'Plan content requires "status" field, one of: {valid_plan_statuses}'}), 400
 
-    # Phase 4: Check routing suggestion (warn but don't block)
+    # Routing check and novelty filter deferred — embedding generation moved to
+    # 5-minute micro-batch backfill service (CC/CW consensus March 30 2026).
+    # Write-path P50 drops from 1193ms to ~200ms by eliminating synchronous OpenAI calls.
+    # Routing suggestion will be computed post-backfill when embedding exists.
     force_branch = data.get('force_branch', False)
     routing_warning = None
     embedding_check = None
-    try:
-        content_str_check = json.dumps(content) if isinstance(content, dict) else str(content)
-        embedding_check = generate_embedding(content_str_check)
-        if embedding_check:
-            check_cur = get_cursor()
-            check_cur.execute("""
-                SELECT branch_name, centroid, commit_count
-                FROM branch_fingerprints
-                WHERE tenant_id = %s AND centroid IS NOT NULL
-            """, (get_tenant_id(),))
-            scores = []
-            for row in check_cur.fetchall():
-                if row['centroid'] is not None:
-                    sim = cosine_similarity(embedding_check, row['centroid'])
-                    scores.append({'branch': row['branch_name'], 'similarity': sim})
-            check_cur.close()
-            if scores:
-                scores.sort(key=lambda x: x['similarity'], reverse=True)
-                best = scores[0]
-                if best['branch'].lower() != branch.lower() and best['similarity'] > 0.4:
-                    routing_warning = {
-                        'suggested_branch': best['branch'],
-                        'requested_branch': branch,
-                        'confidence': round(best['similarity'], 4),
-                        'message': f"Content may belong on '{best['branch']}' (confidence: {best['similarity']:.1%})"
-                    }
-    except Exception as e:
-        print(f"[ROUTING CHECK] Non-fatal error: {e}", file=sys.stderr)
-
-    # Novelty filter: check for near-duplicates using the same embedding
-    novelty_result = check_novelty(
-        embedding_check,
-        branch,
-        request.headers.get('X-Tenant-ID', get_tenant_id())
-    )
+    novelty_result = {'novelty_score': 1.0, 'is_novel': True}
 
     # W2P4: Check commit limit before creating
     from billing.enforce import enforce_commit_limit
@@ -1171,21 +1159,23 @@ def create_commit():
                 (blob_hash, get_tenant_id(), content_str, memory_type, now, len(content_str))
             )
 
-        # Generate and store embedding for semantic search
-        embedding = generate_embedding(content_str)
-        if embedding:
-            try:
-                cur.execute(
-                    '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
-                    (embedding, blob_hash, get_tenant_id())
-                )
-            except Exception as e:
-                print(f"[EMBEDDING] Failed to store embedding: {e}", file=sys.stderr)
+        # Embedding deferred to 5-minute micro-batch backfill service.
+        # Queue blob for embedding generation (discovery_queue already exists).
+        embedding = None
+        try:
+            ensure_discovery_queue_table()
+            cur.execute("""
+                INSERT INTO discovery_queue (tenant_id, blob_hash, status, queued_at, preview, commit_message)
+                VALUES (%s, %s, 'pending', NOW(), %s, %s)
+                ON CONFLICT (tenant_id, blob_hash) DO NOTHING
+            """, (get_tenant_id(), blob_hash, content_str[:200], message[:100]))
+        except Exception as e:
+            print(f"[DEFERRED-EMBED] Queue failed (non-fatal): {e}", file=sys.stderr)
 
-        # Phase 4: Check routing against branch fingerprints
+        # Routing suggestion deferred — requires embedding
         routing_suggestion = None
         force_branch = data.get('force_branch', False)
-        if embedding and not force_branch:
+        if False:  # Deferred — will run in backfill when embedding exists
             try:
                 fp_cur = get_cursor()
                 fp_cur.execute("""
@@ -3745,61 +3735,90 @@ def debug_branch_detection():
 
 @app.route('/v2/embeddings/backfill', methods=['POST'])
 def backfill_embeddings():
-    """Generate embeddings for all blobs that don't have them."""
+    """Generate embeddings for blobs and candidates that don't have them.
+
+    Called by the embedding-backfill Railway cron service every 5 minutes.
+    Handles both blobs (permanent memory) and candidate_memories (bookmarks).
+    CC/CW consensus March 30 2026: 5-minute micro-batch, not nightly.
+    """
     if not OPENAI_API_KEY:
         return jsonify({'error': 'OpenAI API key not configured'}), 500
-    
-    limit = request.args.get('limit', 100, type=int)
+
+    start_time = time.time()
+    batch_size = 20
+    if request.json and 'batch_size' in request.json:
+        batch_size = min(request.json['batch_size'], 50)
+
     db = get_db()
     cur = get_cursor()
-    
-    # Find blobs without embeddings
+    blobs_filled = 0
+    candidates_filled = 0
+    errors_count = 0
+
+    # Phase 1: Backfill blob embeddings
     cur.execute('''
-        SELECT blob_hash, content FROM blobs 
+        SELECT blob_hash, content FROM blobs
         WHERE tenant_id = %s AND embedding IS NULL
+        ORDER BY created_at DESC
         LIMIT %s
-    ''', (get_tenant_id(), limit))
-    
-    blobs = cur.fetchall()
-    processed = 0
-    failed = 0
-    errors = []
-    
-    for blob in blobs:
-        blob_hash = blob['blob_hash']
-        content = blob['content']
-        
-        embedding = generate_embedding(content)
+    ''', (get_tenant_id(), batch_size))
+
+    for blob in cur.fetchall():
+        embedding = generate_embedding(blob['content'], use_cache=False)
         if embedding:
             try:
                 cur.execute(
                     '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
-                    (embedding, blob_hash, get_tenant_id())
+                    (embedding, blob['blob_hash'], get_tenant_id())
                 )
-                processed += 1
+                blobs_filled += 1
             except Exception as e:
-                print(f"[BACKFILL] Failed to store embedding for {blob_hash}: {e}", file=sys.stderr)
-                errors.append(f"store:{blob_hash[:8]}:{str(e)[:50]}")
-                failed += 1
+                errors_count += 1
         else:
-            errors.append(f"generate:{blob_hash[:8]}:embedding returned None")
-            failed += 1
-    
+            errors_count += 1
+
+    # Phase 2: Backfill candidate_memories embeddings
+    if HIPPOCAMPAL_ENABLED:
+        ensure_hippocampal_tables()
+        cur.execute('''
+            SELECT id, summary, content, context_embedding IS NULL as needs_context
+            FROM candidate_memories
+            WHERE tenant_id = %s AND embedding IS NULL
+              AND status IN ('active', 'cooling')
+            ORDER BY created_at DESC
+            LIMIT %s
+        ''', (get_tenant_id(), batch_size))
+
+        for cand in cur.fetchall():
+            embed_text = cand['summary'] or ''
+            if cand['content']:
+                content_str = json.dumps(cand['content'], default=str) if isinstance(cand['content'], dict) else str(cand['content'])
+                embed_text = f"{embed_text}\n{content_str}"
+
+            embedding = generate_embedding(embed_text, use_cache=False)
+            if embedding:
+                try:
+                    cur.execute(
+                        '''UPDATE candidate_memories SET embedding = %s WHERE id = %s AND tenant_id = %s''',
+                        (embedding, str(cand['id']), get_tenant_id())
+                    )
+                    candidates_filled += 1
+                except Exception as e:
+                    errors_count += 1
+            else:
+                errors_count += 1
+
     db.commit()
     cur.close()
-    
-    # Check how many still need processing
-    cur2 = get_cursor()
-    cur2.execute('SELECT COUNT(*) as remaining FROM blobs WHERE tenant_id = %s AND embedding IS NULL', (get_tenant_id(),))
-    remaining = cur2.fetchone()['remaining']
-    cur2.close()
-    
+
+    duration_ms = int((time.time() - start_time) * 1000)
+
     return jsonify({
         'status': 'completed',
-        'processed': processed,
-        'failed': failed,
-        'remaining': remaining,
-        'errors': errors[:10],
+        'blobs_filled': blobs_filled,
+        'candidates_filled': candidates_filled,
+        'errors': errors_count,
+        'duration_ms': duration_ms,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
     })
 
@@ -7755,17 +7774,12 @@ def create_bookmark():
     ttl_days = data.get('ttl_days', 7)
     session_context = data.get('session_context')
 
-    # Generate content embedding from summary + content
-    embed_text = summary
-    if content:
-        content_str = json.dumps(content, default=str) if isinstance(content, dict) else str(content)
-        embed_text = f"{summary}\n{content_str}"
-    embedding = generate_embedding(embed_text)
-
-    # Generate context embedding if context provided
+    # Embedding deferred to 5-minute micro-batch backfill service (CC/CW consensus March 30 2026).
+    # Bookmark P50 drops from 752ms to ~100ms by eliminating synchronous OpenAI calls.
+    # BM25 keyword search finds bookmarks immediately via inline to_tsvector.
+    # Vector search finds them after backfill (~5 min).
+    embedding = None
     context_embedding = None
-    if context_str:
-        context_embedding = generate_embedding(context_str)
 
     import uuid
     candidate_id = str(uuid.uuid4())

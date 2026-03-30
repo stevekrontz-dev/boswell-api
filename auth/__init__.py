@@ -262,6 +262,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/billing/sync',                 # Post-payment sync
         '/v2/nightly',                      # Nightly cron — called by Railway cron service
         '/v2/immune/patrol',                # Immune patrol cron — called by Railway cron service
+        '/v2/embeddings/backfill',          # Embedding backfill — called by Railway cron service every 5 min
     ]
     # Static files (logo, manifest, etc.) are public
     static_ext = request.path.rsplit('.', 1)[-1].lower() if '.' in request.path else ''

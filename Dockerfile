@@ -18,6 +18,7 @@ COPY passkey_auth.py .
 COPY nightly_cron.py .
 COPY immune_cron.py .
 COPY health_cron.py .
+COPY embedding_backfill.py .
 COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY onboarding/ ./onboarding/
