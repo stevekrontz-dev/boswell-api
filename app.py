@@ -8855,7 +8855,9 @@ def nightly_maintenance():
             except Exception as e:
                 results['fingerprints'] = {'error': str(e)}
 
-            all_results[tenant_name] = results
+            # Use tenant_id as key suffix to prevent duplicate name overwrites
+            result_key = f"{tenant_name} ({tenant_id[:8]})" if tenant_name in all_results else tenant_name
+            all_results[result_key] = results
         finally:
             pop_tenant_override()
 
