@@ -260,6 +260,8 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/billing/checkout',             # Signup payment — tenant_id not yet assigned
         '/v2/billing/health',               # Billing health check
         '/v2/billing/sync',                 # Post-payment sync
+        '/v2/nightly',                      # Nightly cron — called by Railway cron service
+        '/v2/immune/patrol',                # Immune patrol cron — called by Railway cron service
     ]
     # Static files (logo, manifest, etc.) are public
     static_ext = request.path.rsplit('.', 1)[-1].lower() if '.' in request.path else ''
