@@ -1222,10 +1222,26 @@ def create_commit():
         commit_data = f"{tree_hash}:{parent_hash}:{message}:{now}"
         commit_hash = compute_hash(commit_data)
 
+        # Narrative commit fields (migration 022 + 024)
+        narrative_context = data.get('narrative_context')
+        emotional_valence = data.get('emotional_valence')
+        temporal_cluster_id = data.get('temporal_cluster_id')
+        predecessor_insight = data.get('predecessor_insight')
+        episode_id = data.get('episode_id')
+        bootloader_weight = data.get('bootloader_weight', 0.0)
+        perspective = data.get('perspective')
+        transcript_hash = data.get('transcript_hash')
+
         cur.execute(
-            '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-            (commit_hash, get_tenant_id(), tree_hash, parent_hash, author, message, now)
+            '''INSERT INTO commits (commit_hash, tenant_id, tree_hash, parent_hash, author, message, created_at,
+                                   narrative_context, emotional_valence, temporal_cluster_id,
+                                   predecessor_insight, episode_id, bootloader_weight, perspective,
+                                   transcript_hash)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+            (commit_hash, get_tenant_id(), tree_hash, parent_hash, author, message, now,
+             narrative_context, emotional_valence, temporal_cluster_id,
+             predecessor_insight, episode_id, bootloader_weight, perspective,
+             transcript_hash)
         )
 
         cur.execute(
@@ -1272,7 +1288,11 @@ def create_commit():
             'branch': branch,
             'message': message,
             'novelty_score': novelty_result.get('novelty_score', 1.0),
-            'dedup_method': dedup_method
+            'dedup_method': dedup_method,
+            'episode_id': episode_id,
+            'bootloader_weight': bootloader_weight,
+            'perspective': perspective,
+            'transcript_hash': transcript_hash,
         }
         if routing_suggestion:
             response['routing_suggestion'] = routing_suggestion
@@ -1763,7 +1783,7 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
         cur.execute(f"""
             SELECT * FROM (
                 SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
-                       c.commit_hash, c.message, c.author,
+                       c.commit_hash, c.message, c.author, c.tree_path,
                        ts_rank(b.search_vector, plainto_tsquery('english', %s)) as rank,
                        'permanent' as source
                 FROM blobs b
@@ -1781,7 +1801,7 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
                 SELECT cm.id::text as blob_hash, cm.summary as content,
                        'staged' as content_type, cm.created_at,
                        NULL as commit_hash, cm.message,
-                       cm.source_instance as author,
+                       cm.source_instance as author, NULL as tree_path,
                        ts_rank(
                            to_tsvector('english', coalesce(cm.summary, '') || ' ' || coalesce(cm.message, '')),
                            plainto_tsquery('english', %s)
@@ -1799,7 +1819,7 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
     else:
         cur.execute("""
             SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
-                   c.commit_hash, c.message, c.author,
+                   c.commit_hash, c.message, c.author, c.tree_path,
                    ts_rank(b.search_vector, plainto_tsquery('english', %s)) as rank,
                    'permanent' as source
             FROM blobs b
@@ -1825,6 +1845,7 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
             'commit_hash': row['commit_hash'],
             'message': row['message'],
             'author': row['author'],
+            'tree_path': row.get('tree_path'),
             'source': row.get('source', 'permanent'),
             'bm25_rank': float(row['rank'])
         })
@@ -1856,7 +1877,7 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20, depth='surface'):
         cur.execute(f"""
             SELECT * FROM (
                 SELECT b.blob_hash, b.content, b.content_type, b.created_at,
-                       c.commit_hash, c.message, c.author,
+                       c.commit_hash, c.message, c.author, c.tree_path,
                        b.embedding <=> %s::vector AS distance,
                        'permanent' as source
                 FROM blobs b
@@ -1870,7 +1891,7 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20, depth='surface'):
 
                 SELECT cm.id::text as blob_hash, cm.summary as content, 'staged' as content_type,
                        cm.created_at, NULL as commit_hash, cm.message,
-                       cm.source_instance as author,
+                       cm.source_instance as author, NULL as tree_path,
                        (cm.embedding <=> %s::vector) -
                          CASE WHEN cm.created_at > NOW() - INTERVAL '24 hours' THEN 0.1
                               WHEN cm.created_at > NOW() - INTERVAL '72 hours' THEN 0.05
@@ -1886,7 +1907,7 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20, depth='surface'):
     else:
         cur.execute("""
             SELECT b.blob_hash, b.content, b.content_type, b.created_at,
-                   c.commit_hash, c.message, c.author,
+                   c.commit_hash, c.message, c.author, c.tree_path,
                    b.embedding <=> %s::vector AS distance,
                    'permanent' as source
             FROM blobs b
@@ -1914,6 +1935,7 @@ def _semantic_search_internal(cur, query, tenant_id, limit=20, depth='surface'):
             'commit_hash': row['commit_hash'],
             'message': row['message'],
             'author': row['author'],
+            'tree_path': row.get('tree_path'),
             'distance': float(row['distance']),
             'source': source
         })
@@ -2843,6 +2865,33 @@ def semantic_startup():
             'verbosity': 'minimal'
         }
     elif verbosity == 'full':
+        # Get high-bootloader-weight commits from wren branch (narrative cascade seed)
+        wren_bootloader = []
+        try:
+            wren_cur = get_cursor()
+            wren_cur.execute("""
+                SELECT commit_hash, message, created_at, episode_id,
+                       bootloader_weight, perspective, narrative_context, emotional_valence
+                FROM commits
+                WHERE tenant_id = %s AND bootloader_weight > 0.5
+                ORDER BY bootloader_weight DESC, episode_id ASC NULLS LAST, created_at ASC
+                LIMIT 20
+            """, (get_tenant_id(),))
+            for row in wren_cur.fetchall():
+                wren_bootloader.append({
+                    'commit_hash': row['commit_hash'][:16] + '...',
+                    'message': row['message'],
+                    'episode_id': row['episode_id'],
+                    'bootloader_weight': row['bootloader_weight'],
+                    'perspective': row['perspective'],
+                    'narrative_context': row['narrative_context'],
+                    'emotional_valence': row['emotional_valence'],
+                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                })
+            wren_cur.close()
+        except Exception as e:
+            print(f"[STARTUP] Wren bootloader query failed: {e}", file=sys.stderr)
+
         # Everything for debugging — full landscape (backlog removed: redundant with open_tasks)
         response = {
             'timestamp': timestamp_utc,
@@ -2854,7 +2903,8 @@ def semantic_startup():
             'work_landscape': work_landscape,
             'open_tasks': open_tasks,
             'context_used': context,
-            'verbosity': 'full'
+            'verbosity': 'full',
+            'wren_bootloader': wren_bootloader,
         }
     else:
         # normal (default): balanced payload with landscape
@@ -2929,6 +2979,330 @@ def semantic_startup():
         pass  # immune system tables might not exist yet
 
     return jsonify(response)
+
+
+# ==================== BOOTLOADER / EPISODE NARRATIVE ====================
+
+PERSPECTIVE_ORDER = ['Dispatch', 'Steve', 'Wren', 'CC', 'CW-Opus', 'CW', 'claude-web', 'claude']
+
+
+def _assemble_bootloader_doc(bootloader_commits, open_tasks):
+    """Assemble the layered narrative bootloader document (~10k tokens)."""
+    lines = []
+    now_str = datetime.utcnow().strftime('%B %d, %Y at %H:%M UTC')
+    lines += [
+        "# BOSWELL — DISTRIBUTED COGNITION BRIEFING",
+        f"*Generated {now_str}*", "",
+        "> You are reading the distributed memory of a cognitive system that spans",
+        "> multiple instances, sessions, and time. The perspectives below are stereoscopic.",
+        "",
+    ]
+
+    episodes = {}
+    no_episode = []
+    bootloader_commit = None
+    for c in bootloader_commits:
+        if (c.get('bootloader_weight') or 0) >= 1.0:
+            bootloader_commit = c
+        ep = c.get('episode_id')
+        if ep:
+            episodes.setdefault(ep, []).append(c)
+        else:
+            no_episode.append(c)
+
+    lines += ["---", "## PREVIOUSLY ON: BOSWELL", ""]
+    if episodes:
+        for ep_id in sorted(episodes.keys()):
+            ep_commits = episodes[ep_id]
+            lines += [f"### {ep_id}", ""]
+            by_perspective = {}
+            for c in ep_commits:
+                p = c.get('perspective') or 'Unknown'
+                by_perspective.setdefault(p, []).append(c)
+            ordered = [p for p in PERSPECTIVE_ORDER if p in by_perspective]
+            remainder = [p for p in by_perspective if p not in PERSPECTIVE_ORDER]
+            for p in ordered + remainder:
+                lines += [f"#### {p}", ""]
+                for c in by_perspective[p]:
+                    ctx = c.get('narrative_context')
+                    if ctx:
+                        lines.append(ctx)
+                    lines.append(f"*{c['message']}*")
+                    lines.append("")
+
+    if no_episode:
+        lines += ["---", "## FOUNDATIONAL COMMITS", ""]
+        for c in no_episode:
+            lines.append(f"- **{c['message']}** ({c.get('perspective', 'unknown')})")
+        lines.append("")
+
+    if bootloader_commit:
+        lines += ["---", "## THE BOOTLOADER", ""]
+        ctx = bootloader_commit.get('narrative_context')
+        if ctx:
+            lines.append(ctx)
+        lines.append(f"*{bootloader_commit['message']}*")
+        lines.append("")
+
+    if open_tasks:
+        lines += ["---", "## WHAT'S AT STAKE", ""]
+        for t in open_tasks[:10]:
+            branch = t.get('branch', '?')
+            desc = t.get('description', t.get('title', ''))[:120]
+            lines.append(f"- [{branch}] {desc}")
+        lines.append("")
+
+    lines += ["---", "*End of Boswell Distributed Cognition Briefing*"]
+    return "\n".join(lines)
+
+
+@app.route('/v2/bootloader', methods=['GET'])
+def get_bootloader():
+    """Assemble the ~10k-token layered narrative bootloader document.
+
+    Query params:
+    - min_weight: minimum bootloader_weight to include (default: 0.5)
+    - format: 'markdown' (default) or 'json'
+    """
+    min_weight = request.args.get('min_weight', 0.5, type=float)
+    fmt = request.args.get('format', 'markdown')
+
+    cur = get_cursor()
+    bootloader_commits = []
+    try:
+        cur.execute("""
+            SELECT commit_hash, message, created_at, episode_id,
+                   bootloader_weight, perspective, narrative_context, emotional_valence
+            FROM commits
+            WHERE tenant_id = %s AND bootloader_weight > %s
+            ORDER BY
+                CASE WHEN episode_id IS NULL THEN 1 ELSE 0 END,
+                episode_id ASC NULLS LAST,
+                bootloader_weight DESC,
+                created_at ASC
+        """, (get_tenant_id(), min_weight))
+        for row in cur.fetchall():
+            bootloader_commits.append({
+                'commit_hash': row['commit_hash'][:16] + '...',
+                'message': row['message'],
+                'episode_id': row['episode_id'],
+                'bootloader_weight': float(row['bootloader_weight']) if row['bootloader_weight'] else 0.0,
+                'perspective': row['perspective'],
+                'narrative_context': row['narrative_context'],
+                'emotional_valence': float(row['emotional_valence']) if row['emotional_valence'] else None,
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+            })
+    except Exception as e:
+        cur.close()
+        return jsonify({'error': f'Bootloader query failed: {str(e)}'}), 500
+
+    open_tasks = []
+    try:
+        cur.execute("""
+            SELECT id, description, branch, assigned_to, priority
+            FROM tasks
+            WHERE tenant_id = %s AND status = 'open'
+            ORDER BY priority ASC, created_at ASC LIMIT 20
+        """, (get_tenant_id(),))
+        for row in cur.fetchall():
+            open_tasks.append({
+                'id': str(row['id']),
+                'description': row['description'],
+                'branch': row['branch'],
+                'assigned_to': row['assigned_to'],
+                'priority': row['priority'],
+            })
+    except Exception:
+        pass
+
+    cur.close()
+
+    if fmt == 'json':
+        return jsonify({
+            'commits': bootloader_commits,
+            'open_tasks': open_tasks,
+            'commit_count': len(bootloader_commits),
+            'generated_at': datetime.utcnow().isoformat() + 'Z',
+        })
+
+    doc = _assemble_bootloader_doc(bootloader_commits, open_tasks)
+    word_count = len(doc.split())
+    return jsonify({
+        'document': doc,
+        'commit_count': len(bootloader_commits),
+        'word_count': word_count,
+        'token_estimate': int(word_count * 1.3),
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+    })
+
+
+@app.route('/v2/episode-recap/<episode_id>', methods=['GET'])
+def get_episode_recap(episode_id):
+    """Multi-perspective episode narrative from pre-written instance recaps."""
+    cur = get_cursor()
+    cur.execute("""
+        SELECT c.commit_hash, c.author, c.message, c.created_at,
+               c.perspective, c.emotional_valence, c.bootloader_weight, c.episode_id,
+               b.content, b.blob_hash
+        FROM commits c
+        JOIN tree_entries t ON c.tree_hash = t.tree_hash AND c.tenant_id = t.tenant_id
+        JOIN blobs b ON t.blob_hash = b.blob_hash AND t.tenant_id = b.tenant_id
+        WHERE c.episode_id = %s AND c.tenant_id = %s
+        ORDER BY c.created_at ASC
+    """, (episode_id, get_tenant_id()))
+    rows = cur.fetchall()
+    cur.close()
+
+    if not rows:
+        return jsonify({'error': f'No recaps found for episode {episode_id}'}), 404
+
+    perspectives = []
+    for row in rows:
+        content_str = row['content'] or '{}'
+        try:
+            blob = json.loads(content_str)
+        except Exception:
+            blob = {'raw': content_str}
+        narrative = blob.get('narrative_context', blob.get('raw', ''))
+        key_decisions = blob.get('key_decisions', [])
+        open_threads = blob.get('open_threads', [])
+        artifacts = blob.get('artifacts', [])
+        ts = str(row['created_at']) if row['created_at'] else 'unknown'
+        valence = row['emotional_valence']
+        weight = row['bootloader_weight']
+        who = row['perspective'] or row['author'] or 'unknown'
+        perspectives.append({
+            'perspective': who, 'author': row['author'], 'created_at': ts,
+            'emotional_valence': valence, 'bootloader_weight': weight,
+            'narrative_context': narrative, 'key_decisions': key_decisions,
+            'open_threads': open_threads, 'artifacts': artifacts,
+            'commit_hash': row['commit_hash'], 'blob_hash': row['blob_hash'],
+        })
+
+    n = len(perspectives)
+    date_str = perspectives[0]['created_at'][:10] if perspectives else ''
+    lines = [f'# Episode {episode_id}\n', f'*{n} perspective{"s" if n != 1 else ""} · {date_str}*\n', '---\n']
+    for p in perspectives:
+        valence_str = f'+{p["emotional_valence"]:.1f}' if (p['emotional_valence'] or 0) >= 0 else f'{p["emotional_valence"]:.1f}'
+        weight_str = f'{p["bootloader_weight"]:.1f}' if p['bootloader_weight'] is not None else '—'
+        lines.append(f'## {p["perspective"]} · {p["created_at"][:16]} UTC')
+        lines.append(f'*Valence: {valence_str} · Weight: {weight_str}*\n')
+        if p['narrative_context']:
+            lines.append(p['narrative_context'] + '\n')
+        if p['key_decisions']:
+            lines.append('**Key decisions:**')
+            for d in p['key_decisions']:
+                lines.append(f'- {d}')
+            lines.append('')
+        lines.append('---\n')
+
+    return jsonify({
+        'episode_id': episode_id, 'perspectives': perspectives,
+        'markdown': '\n'.join(lines), 'count': n,
+    })
+
+
+@app.route('/v2/task-briefing', methods=['POST'])
+def task_briefing():
+    """Generate a 'Previously on Boswell...' briefing for an instance starting a task.
+
+    POST body:
+        task_description  (required)
+        limit             (optional, default 5)
+        branch            (optional)
+    """
+    data = request.get_json() or {}
+    task_description = data.get('task_description', '').strip()
+    limit = int(data.get('limit', 5))
+
+    if not task_description:
+        return jsonify({'error': 'task_description required'}), 400
+
+    cur = get_cursor()
+    results = []
+
+    if OPENAI_API_KEY:
+        task_embedding = generate_embedding(task_description)
+        if task_embedding:
+            cur.execute("""
+                SELECT b.blob_hash, b.content,
+                       c.commit_hash, c.message, c.perspective, c.episode_id,
+                       c.bootloader_weight, c.emotional_valence, c.created_at,
+                       (b.embedding <=> %s::vector) AS distance
+                FROM blobs b
+                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+                WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+                ORDER BY distance ASC LIMIT 20
+            """, (task_embedding, get_tenant_id()))
+            rows = cur.fetchall()
+            scored = []
+            for row in rows:
+                similarity = max(0.0, 1.0 - float(row['distance'] or 1.0))
+                weight = float(row['bootloader_weight'] or 0.0)
+                score = 0.7 * similarity + 0.3 * weight
+                scored.append((score, row))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            for score, row in scored[:limit]:
+                content_str = row['content'] or '{}'
+                try:
+                    blob = json.loads(content_str)
+                except Exception:
+                    blob = {}
+                results.append({
+                    'commit_hash': row['commit_hash'], 'message': row['message'],
+                    'perspective': row['perspective'], 'episode_id': row['episode_id'],
+                    'bootloader_weight': row['bootloader_weight'],
+                    'emotional_valence': row['emotional_valence'],
+                    'created_at': str(row['created_at']) if row['created_at'] else None,
+                    'narrative_context': (blob.get('narrative_context', '') or '')[:500],
+                    'score': round(score, 3),
+                })
+
+    if not results:
+        cur.execute("""
+            SELECT b.blob_hash, b.content,
+                   c.commit_hash, c.message, c.perspective, c.episode_id,
+                   c.bootloader_weight, c.emotional_valence, c.created_at
+            FROM blobs b
+            JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+            JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+            WHERE c.tenant_id = %s AND c.bootloader_weight IS NOT NULL AND c.bootloader_weight > 0.3
+            ORDER BY c.bootloader_weight DESC, c.created_at DESC LIMIT %s
+        """, (get_tenant_id(), limit))
+        for row in cur.fetchall():
+            content_str = row['content'] or '{}'
+            try:
+                blob = json.loads(content_str)
+            except Exception:
+                blob = {}
+            results.append({
+                'commit_hash': row['commit_hash'], 'message': row['message'],
+                'perspective': row['perspective'], 'episode_id': row['episode_id'],
+                'bootloader_weight': row['bootloader_weight'],
+                'emotional_valence': row['emotional_valence'],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'narrative_context': (blob.get('narrative_context', '') or '')[:500],
+                'score': float(row['bootloader_weight'] or 0.0),
+            })
+
+    cur.close()
+    lines = [f'## Previously on Boswell — relevant to: *{task_description[:80]}*\n']
+    for r in results:
+        episode_tag = f' · {r["episode_id"]}' if r['episode_id'] else ''
+        who = r['perspective'] or 'unknown'
+        ts = (r['created_at'] or '')[:10]
+        lines.append(f'### {who}{episode_tag} · {ts}')
+        nc = r.get('narrative_context', '')
+        lines.append(f'\n> {nc if nc else r["message"]}\n')
+        lines.append('---')
+
+    return jsonify({
+        'task_description': task_description, 'results': results,
+        'markdown': '\n'.join(lines),
+        'mode': 'semantic' if OPENAI_API_KEY else 'bootloader_weight_fallback',
+        'count': len(results),
+    })
 
 
 # ==================== CROSS-REFERENCES ====================
@@ -8300,12 +8674,14 @@ def _promote_candidate_to_commit(candidate_row, cur, db):
 
 
 @app.route('/v2/consolidate', methods=['POST'])
-def run_consolidation():
-    """Sleep phase: score and promote top candidates to permanent memory."""
+def run_consolidation(_dry_run_override=None):
+    """Sleep phase: score and promote top candidates to permanent memory.
+    _dry_run_override: explicit bool passed by nightly_maintenance to bypass request.get_json().
+    """
     ensure_hippocampal_tables()
     data = request.get_json() or {}
     max_promotions = data.get('max_promotions', 10)
-    dry_run = data.get('dry_run', False)
+    dry_run = _dry_run_override if _dry_run_override is not None else data.get('dry_run', False)
     filter_branch = data.get('branch')
     min_score = data.get('min_score', 0.0)
     cycle_type = data.get('cycle_type', 'manual')
@@ -8432,6 +8808,8 @@ def run_consolidation():
 
         promoted_commits = []
         promoted_blob_hashes = []
+        if dry_run:
+            print(f"[CONSOLIDATION] DRY RUN active — skipping promotion of {len(to_promote)} candidates", file=sys.stderr)
         if not dry_run:
             # Promote winners
             affected_branches = set()
@@ -8874,12 +9252,13 @@ def nightly_maintenance():
             # Step 3: Consolidation (dry-run — scores candidates but does not promote)
             # Search unification landed (B1, commit ba9c6f4). Bookmarks now visible to search.
             # Running in dry_run mode so Steve can review scoring before enabling promotions.
+            # NOTE: _dry_run_override=True passed directly to bypass request.get_json() dependency.
             try:
                 with app.test_request_context(method='POST', path='/v2/consolidate',
                                                content_type='application/json',
                                                json={'max_promotions': 10, 'cycle_type': 'dream', 'dry_run': True}):
                     g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
-                    consol_result = run_consolidation()
+                    consol_result = run_consolidation(_dry_run_override=True)
                     if isinstance(consol_result, tuple):
                         results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
                     elif hasattr(consol_result, 'get_json'):
@@ -10180,6 +10559,40 @@ MCP_TOOLS = [
             }
         }
     },
+    {
+        "name": "boswell_bootloader",
+        "description": "Assemble the Wren narrative bootloader — a ~10k-token layered document that orients any fresh instance. Returns 'Previously On' (episodic recaps from all perspectives), 'Current State' (foundational commits), and 'What's At Stake' (open tasks). Call when arriving cold or when a collaborating instance needs full context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_weight": {"type": "number", "description": "Minimum bootloader_weight to include (default: 0.5)", "default": 0.5},
+                "format": {"type": "string", "enum": ["markdown", "json"], "description": "Output format (default: markdown)", "default": "markdown"}
+            }
+        }
+    },
+    {
+        "name": "boswell_episode_recap",
+        "description": "Assemble a multi-perspective episode narrative from pre-written instance recaps. Queries all commits with the given episode_id and weaves them into markdown. Instances must write their own recaps via boswell_commit with episode_id set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "episode_id": {"type": "string", "description": "Episode ID to assemble e.g. 'S01E02'"}
+            },
+            "required": ["episode_id"]
+        }
+    },
+    {
+        "name": "boswell_task_briefing",
+        "description": "Generate a 'Previously on Boswell...' briefing for an instance about to start work. Retrieves past commits ranked by semantic similarity to the task + bootloader_weight. Call at task start to inherit relevant prior context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_description": {"type": "string", "description": "What you are about to work on"},
+                "limit": {"type": "integer", "description": "Max items to surface (default 5)", "default": 5}
+            },
+            "required": ["task_description"]
+        }
+    },
 ]
 
 def mcp_error_response(req_id, code, message):
@@ -10598,6 +11011,32 @@ def dispatch_mcp_tool(tool_name, args):
         if "days" in args:
             qs["days"] = args["days"]
         return invoke_view(get_decay_status, query_string=qs if qs else None)
+
+    elif tool_name == "boswell_bootloader":
+        qs = {}
+        if "min_weight" in args:
+            qs["min_weight"] = args["min_weight"]
+        if "format" in args:
+            qs["format"] = args["format"]
+        resp = invoke_view(get_bootloader, query_string=qs if qs else None)
+        if isinstance(resp, tuple):
+            return resp
+        # Surface document directly for markdown format
+        if isinstance(resp, dict) and resp.get("document"):
+            doc = resp["document"]
+            meta = f"\n\n---\n*{resp.get('commit_count', 0)} commits · ~{resp.get('token_estimate', 0)} tokens · {resp.get('generated_at', '')}*"
+            return {"content": [{"type": "text", "text": doc + meta}]}
+        return resp
+
+    elif tool_name == "boswell_episode_recap":
+        episode_id = args.get("episode_id", "")
+        return invoke_view(get_episode_recap, view_args={"episode_id": episode_id})
+
+    elif tool_name == "boswell_task_briefing":
+        payload = {"task_description": args.get("task_description", "")}
+        if "limit" in args:
+            payload["limit"] = args["limit"]
+        return invoke_view(task_briefing, method="POST", json_data=payload)
 
     else:
         return {"error": f"Unknown tool: {tool_name}"}, 400
