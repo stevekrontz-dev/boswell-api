@@ -6565,8 +6565,14 @@ def resurrect_trail():
 
 # ==================== IMMUNE SYSTEM (Anomaly Detection & Quarantine) ====================
 
+_immune_tables_ensured = False
+
+
 def ensure_immune_tables():
     """Create immune system tables if they don't exist."""
+    global _immune_tables_ensured
+    if _immune_tables_ensured:
+        return
     cur = get_cursor()
 
     # Add quarantine columns to blobs
@@ -6630,6 +6636,7 @@ def ensure_immune_tables():
 
     get_db().commit()
     cur.close()
+    _immune_tables_ensured = True
 
 
 def log_immune_action(action: str, blob_hash: str = None, patrol_type: str = None, details: dict = None):
@@ -6645,15 +6652,43 @@ def log_immune_action(action: str, blob_hash: str = None, patrol_type: str = Non
 
 def quarantine_blob(blob_hash: str, reason: str, patrol_type: str = None):
     """Quarantine a blob and log the action."""
+    quarantine_blobs_batch([(blob_hash, reason)], patrol_type)
+
+
+def quarantine_blobs_batch(items: list, patrol_type: str = None):
+    """Quarantine multiple blobs in a single transaction.
+
+    items: list of (blob_hash, reason) tuples
+    """
+    if not items:
+        return
+    tenant_id = get_tenant_id()
     cur = get_cursor()
+    db = get_db()
+
+    # Single UPDATE for all hashes
+    blob_hashes = [h for h, _ in items]
+    # Use first reason as the shared reason; per-blob reasons stored in immune_log
+    first_reason = items[0][1]
     cur.execute('''
         UPDATE blobs SET quarantined = TRUE, quarantined_at = NOW(), quarantine_reason = %s
-        WHERE blob_hash = %s AND tenant_id = %s
-    ''', (reason, blob_hash, get_tenant_id()))
-    get_db().commit()
-    cur.close()
+        WHERE blob_hash = ANY(%s) AND tenant_id = %s
+    ''', (first_reason, blob_hashes, tenant_id))
 
-    log_immune_action('QUARANTINE', blob_hash, patrol_type, {'reason': reason})
+    # Batch insert immune_log rows
+    from psycopg2.extras import execute_values
+    log_rows = [
+        (tenant_id, 'QUARANTINE', h, patrol_type,
+         json.dumps({'reason': r}) if r else None)
+        for h, r in items
+    ]
+    execute_values(cur, '''
+        INSERT INTO immune_log (tenant_id, action, blob_hash, patrol_type, details)
+        VALUES %s
+    ''', log_rows)
+
+    db.commit()
+    cur.close()
 
 
 def get_quarantine_count() -> int:
@@ -7141,18 +7176,23 @@ def immune_patrol():
                     **finding
                 })
 
-                if auto_quarantine and 'blob_hash' in finding:
+            if auto_quarantine:
+                to_quarantine = [
+                    (f['blob_hash'], f['reason'])
+                    for f in findings if 'blob_hash' in f
+                ]
+                if to_quarantine:
                     try:
-                        quarantine_blob(finding['blob_hash'], finding['reason'], route['name'])
-                        results['quarantined'].append({
-                            'blob_hash': finding['blob_hash'],
-                            'route': route['name'],
-                            'reason': finding['reason']
-                        })
+                        quarantine_blobs_batch(to_quarantine, route['name'])
+                        for blob_hash, reason in to_quarantine:
+                            results['quarantined'].append({
+                                'blob_hash': blob_hash,
+                                'route': route['name'],
+                                'reason': reason
+                            })
                     except Exception as qe:
                         results['errors'].append({
                             'route': route['name'],
-                            'blob_hash': finding.get('blob_hash'),
                             'error': f"Quarantine failed: {str(qe)}"
                         })
 
@@ -8105,13 +8145,11 @@ def _compute_connectivity(embedding, branch_name, cur):
     try:
         cur.execute("SAVEPOINT connectivity_sp")
         cur.execute("""
-            SELECT b.blob_hash, te.name as branch_hint,
+            SELECT b.blob_hash,
                    b.embedding <=> %s::vector AS distance
             FROM blobs b
-            JOIN tree_entries te ON b.blob_hash = te.blob_hash AND b.tenant_id = te.tenant_id
             WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
-              AND b.embedding <=> %s::vector < 0.4
-            ORDER BY distance LIMIT 20
+            ORDER BY b.embedding <=> %s::vector LIMIT 20
         """, (embedding, tenant_id, embedding))
 
         neighbors = cur.fetchall()
@@ -8125,7 +8163,7 @@ def _compute_connectivity(embedding, branch_name, cur):
             SELECT DISTINCT ON (te.blob_hash) te.blob_hash, br.name as branch_name
             FROM tree_entries te
             JOIN commits c ON te.tree_hash = c.tree_hash AND te.tenant_id = c.tenant_id
-            JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = c.tenant_id
+            JOIN branches br ON br.head_commit = c.commit_hash AND br.tenant_id = c.tenant_id
             WHERE te.blob_hash = ANY(%s) AND te.tenant_id = %s
         """, (blob_hashes, tenant_id))
 
@@ -8456,26 +8494,45 @@ def run_consolidation():
             hard_deleted = cur.rowcount
 
             # Step 7.5: Tier 3 dedup sweep — link near-duplicates at 0.12 distance
+            # Uses LATERAL + HNSW instead of O(N²) self-join: sample 100 seeds,
+            # find each seed's nearest neighbor, filter by distance < 0.12.
             dedup_links_created = 0
             try:
                 cur.execute("""
-                    SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
-                           b1.embedding <=> b2.embedding AS distance
-                    FROM blobs b1
-                    JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
-                    WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
-                      AND b1.tenant_id = %s
-                      AND COALESCE(b1.quarantined, FALSE) = FALSE
-                      AND COALESCE(b2.quarantined, FALSE) = FALSE
-                      AND b1.embedding <=> b2.embedding < 0.12
+                    SELECT DISTINCT ON (least(b1.blob_hash, neighbor.blob_hash),
+                                        greatest(b1.blob_hash, neighbor.blob_hash))
+                           least(b1.blob_hash, neighbor.blob_hash) AS blob1,
+                           greatest(b1.blob_hash, neighbor.blob_hash) AS blob2,
+                           neighbor.distance
+                    FROM (
+                        SELECT blob_hash, embedding
+                        FROM blobs
+                        WHERE tenant_id = %s
+                          AND embedding IS NOT NULL
+                          AND COALESCE(quarantined, FALSE) = FALSE
+                        LIMIT 100
+                    ) b1
+                    CROSS JOIN LATERAL (
+                        SELECT b.blob_hash, b.embedding <=> b1.embedding AS distance
+                        FROM blobs b
+                        WHERE b.tenant_id = %s
+                          AND b.blob_hash <> b1.blob_hash
+                          AND COALESCE(b.quarantined, FALSE) = FALSE
+                          AND b.embedding IS NOT NULL
+                        ORDER BY b.embedding <=> b1.embedding
+                        LIMIT 3
+                    ) neighbor
+                    WHERE neighbor.distance < 0.12
                       AND NOT EXISTS (
                           SELECT 1 FROM cross_references cr
-                          WHERE cr.tenant_id = b1.tenant_id
-                            AND ((cr.source_blob = b1.blob_hash AND cr.target_blob = b2.blob_hash)
-                              OR (cr.source_blob = b2.blob_hash AND cr.target_blob = b1.blob_hash))
+                          WHERE cr.tenant_id = %s
+                            AND ((cr.source_blob = least(b1.blob_hash, neighbor.blob_hash)
+                                  AND cr.target_blob = greatest(b1.blob_hash, neighbor.blob_hash))
+                              OR (cr.source_blob = greatest(b1.blob_hash, neighbor.blob_hash)
+                                  AND cr.target_blob = least(b1.blob_hash, neighbor.blob_hash)))
                       )
                     LIMIT 50
-                """, (get_tenant_id(),))
+                """, (get_tenant_id(), get_tenant_id(), get_tenant_id()))
 
                 dedup_now = datetime.utcnow().isoformat() + 'Z'
                 for row in cur.fetchall():
