@@ -167,7 +167,7 @@ def _seed_behavioral_skill(cursor, tenant_id):
         (tenant_id,)
     )
     row = cursor.fetchone()
-    parent = row[0] if row and row[0] != 'GENESIS' else 'GENESIS'
+    parent = row['head_commit'] if row and row['head_commit'] != 'GENESIS' else 'GENESIS'
 
     skill = {
         'name': 'Boswell Priority Framework',

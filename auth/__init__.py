@@ -260,6 +260,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/billing/checkout',             # Signup payment — tenant_id not yet assigned
         '/v2/billing/health',               # Billing health check
         '/v2/billing/sync',                 # Post-payment sync
+        '/v2/billing/webhook',              # Stripe webhook — signature-verified, not JWT
         '/v2/nightly',                      # Nightly cron — called by Railway cron service
         '/v2/immune/patrol',                # Immune patrol cron — called by Railway cron service
         '/v2/embeddings/backfill',          # Embedding backfill — called by Railway cron service every 5 min
