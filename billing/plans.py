@@ -4,16 +4,17 @@ Owner: CC2
 Workstream: W2P1
 
 Plan tiers:
-- Free: Limited commits and branches, no payment required
-- Pro: Higher limits, single user, monthly subscription
-- Team: Unlimited, per-seat pricing, for organizations
+- Free: Demo the magic, very limited
+- Starter $29/mo: Hobby/prototype, one project
+- Pro $149/mo: Production continuity infrastructure (default recommendation)
+- Team $999/mo: Org-ready, SSO/RBAC/audit
 """
 
 import os
 from typing import Optional, Dict, Any
 
 # Stripe Price IDs from environment (set in Railway)
-# These are created in Stripe Dashboard (test mode first, then live)
+STRIPE_PRICE_STARTER = os.environ.get('STRIPE_PRICE_STARTER', 'price_test_starter')
 STRIPE_PRICE_PRO = os.environ.get('STRIPE_PRICE_PRO', 'price_test_pro')
 STRIPE_PRICE_TEAM = os.environ.get('STRIPE_PRICE_TEAM', 'price_test_team')
 
@@ -22,40 +23,62 @@ PLANS: Dict[str, Dict[str, Any]] = {
     'free': {
         'id': 'free',
         'name': 'Free',
-        'description': 'Get started with Boswell memory',
-        'price': 0,  # cents
-        'interval': None,  # no billing
-        'commit_limit': 1000,  # per month
-        'branch_limit': 3,
-        'storage_limit_mb': 100,
-        'retention_days': 30,  # memories older than 30 days may be archived
+        'description': 'See the magic',
+        'price': 0,
+        'interval': None,
+        'commit_limit': 50,
+        'branch_limit': 1,
+        'storage_limit_mb': 50,
+        'retention_days': 30,
+        'identity_limit': 1,
         'features': [
-            '1,000 commits per month',
-            '3 cognitive branches',
-            '100 MB storage',
-            '30-day memory retention',
-            'Community support'
+            '50 memory operations / month',
+            '1 project',
+            'Basic search',
+            'No overages — it just stops'
         ],
-        'stripe_price_id': None,  # no Stripe product for free tier
+        'stripe_price_id': None,
         'stripe_product_id': None
+    },
+    'starter': {
+        'id': 'starter',
+        'name': 'Starter',
+        'description': 'Ship something real',
+        'price': 2900,  # $29/month in cents
+        'interval': 'month',
+        'commit_limit': 1000,
+        'branch_limit': 5,
+        'storage_limit_mb': 1000,
+        'retention_days': None,
+        'identity_limit': 10,
+        'features': [
+            '1,000 memory operations / month',
+            '1 deployed project',
+            '10 identities',
+            'Smart search',
+            'Claude.ai, Claude Code & API'
+        ],
+        'stripe_price_id': STRIPE_PRICE_STARTER,
+        'stripe_product_id': os.environ.get('STRIPE_PRODUCT_STARTER')
     },
     'pro': {
         'id': 'pro',
         'name': 'Pro',
-        'description': 'For power users who need more memory',
-        'price': 1900,  # $19/month in cents
+        'description': 'Continuity infrastructure',
+        'price': 14900,  # $149/month in cents
         'interval': 'month',
-        'commit_limit': 50000,  # per month
-        'branch_limit': None,  # unlimited
-        'storage_limit_mb': 5000,  # 5 GB
-        'retention_days': None,  # unlimited retention
+        'commit_limit': None,
+        'branch_limit': None,
+        'storage_limit_mb': None,
+        'retention_days': None,
+        'identity_limit': None,
         'features': [
-            '50,000 commits per month',
-            'Unlimited branches',
-            '5 GB storage',
-            'Unlimited retention',
-            'Priority support',
-            'API access'
+            'Unlimited memory operations',
+            'Unlimited projects & identities',
+            'Webhooks & automation',
+            'Analytics dashboard',
+            'Advanced retention policies',
+            'Priority support'
         ],
         'stripe_price_id': STRIPE_PRICE_PRO,
         'stripe_product_id': os.environ.get('STRIPE_PRODUCT_PRO')
@@ -63,23 +86,21 @@ PLANS: Dict[str, Dict[str, Any]] = {
     'team': {
         'id': 'team',
         'name': 'Team',
-        'description': 'For teams building together',
-        'price': 4900,  # $49/seat/month in cents
+        'description': 'Org-ready',
+        'price': 99900,  # $999/month in cents
         'interval': 'month',
-        'price_per': 'seat',  # per-seat pricing
-        'commit_limit': None,  # unlimited
-        'branch_limit': None,  # unlimited
-        'storage_limit_mb': None,  # unlimited
-        'retention_days': None,  # unlimited
+        'commit_limit': None,
+        'branch_limit': None,
+        'storage_limit_mb': None,
+        'retention_days': None,
+        'identity_limit': None,
         'features': [
-            'Unlimited commits',
-            'Unlimited branches',
-            'Unlimited storage',
-            'Unlimited retention',
-            'Shared team memory',
-            'SSO integration',
-            'Dedicated support',
-            'Custom integrations'
+            'Everything in Pro',
+            'Shared workspace',
+            'SSO, RBAC & audit logs',
+            'Higher rate limits',
+            'Onboarding support',
+            'Compliance-ready deployment'
         ],
         'stripe_price_id': STRIPE_PRICE_TEAM,
         'stripe_product_id': os.environ.get('STRIPE_PRODUCT_TEAM')
