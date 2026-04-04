@@ -4185,8 +4185,14 @@ def backfill_embeddings():
         LIMIT %s
     ''', (get_tenant_id(), batch_size))
 
+    error_details = []
     for blob in cur.fetchall():
-        embedding = generate_embedding(blob['content'], use_cache=False)
+        content = blob['content']
+        if not content or not content.strip():
+            error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': 'empty_content'})
+            errors_count += 1
+            continue
+        embedding = generate_embedding(content, use_cache=False)
         if embedding:
             try:
                 cur.execute(
@@ -4195,8 +4201,10 @@ def backfill_embeddings():
                 )
                 blobs_filled += 1
             except Exception as e:
+                error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': f'update_failed: {e}'})
                 errors_count += 1
         else:
+            error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': 'embedding_generation_failed'})
             errors_count += 1
 
     # Phase 2: Backfill candidate_memories embeddings
@@ -4235,14 +4243,17 @@ def backfill_embeddings():
 
     duration_ms = int((time.time() - start_time) * 1000)
 
-    return jsonify({
+    response = {
         'status': 'completed',
         'blobs_filled': blobs_filled,
         'candidates_filled': candidates_filled,
         'errors': errors_count,
         'duration_ms': duration_ms,
         'timestamp': datetime.utcnow().isoformat() + 'Z'
-    })
+    }
+    if error_details:
+        response['error_details'] = error_details
+    return jsonify(response)
 
 @app.route('/v2/embeddings/status', methods=['GET'])
 def embeddings_status():
