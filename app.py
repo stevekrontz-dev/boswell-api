@@ -419,6 +419,28 @@ def health_check():
         runtime_key = os.environ.get('OPENAI_API_KEY', '')
         openai_keys = [k for k in os.environ.keys() if 'OPENAI' in k.upper()]
 
+        # Embedding staleness check
+        embedding_staleness = {}
+        try:
+            cur2 = get_cursor()
+            cur2.execute('''
+                SELECT COUNT(*) as null_count,
+                       MIN(created_at) as oldest_null,
+                       EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))/60 as oldest_age_minutes
+                FROM blobs
+                WHERE tenant_id = %s AND embedding IS NULL
+            ''', (get_tenant_id(),))
+            row = cur2.fetchone()
+            embedding_staleness = {
+                'unembedded_blobs': row['null_count'],
+                'oldest_unembedded': str(row['oldest_null']) if row['oldest_null'] else None,
+                'oldest_age_minutes': round(float(row['oldest_age_minutes']), 1) if row['oldest_age_minutes'] else 0,
+                'healthy': row['null_count'] == 0 or (row['oldest_age_minutes'] is not None and float(row['oldest_age_minutes']) < 10),
+            }
+            cur2.close()
+        except Exception as e:
+            embedding_staleness = {'error': str(e)}
+
         return jsonify({
             'status': 'ok',
             'service': 'boswell-v2',
@@ -427,6 +449,7 @@ def health_check():
             'database': 'postgres',
             'encryption': encryption_status,
             'embeddings': 'enabled' if runtime_key else 'disabled',
+            'embedding_staleness': embedding_staleness,
             'openai_key_set': bool(runtime_key),
             'openai_key_prefix': runtime_key[:10] + '...' if runtime_key else None,
             'openai_env_vars': openai_keys,
@@ -2315,6 +2338,40 @@ def recall_memory():
     if blob_hash:
         cur.execute('SELECT * FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
         blob = cur.fetchone()
+
+        # Fallback: check candidate_memories (bookmarks) if not found in blobs
+        if not blob and HIPPOCAMPAL_ENABLED:
+            try:
+                ensure_hippocampal_tables()
+                cur.execute('''
+                    SELECT id, summary, content, context, salience, status,
+                           created_at, expires_at, replay_count, source_instance,
+                           tags, branch, embedding IS NOT NULL as has_embedding
+                    FROM candidate_memories
+                    WHERE id::text = %s AND tenant_id = %s
+                ''', (blob_hash, get_tenant_id()))
+                candidate = cur.fetchone()
+                if candidate:
+                    cur.close()
+                    return jsonify({
+                        'source': 'bookmark',
+                        'id': str(candidate['id']),
+                        'summary': candidate['summary'],
+                        'content': candidate['content'] if isinstance(candidate['content'], str) else json.dumps(candidate['content'], default=str) if candidate['content'] else None,
+                        'context': candidate['context'],
+                        'salience': float(candidate['salience']) if candidate['salience'] else None,
+                        'status': candidate['status'],
+                        'branch': candidate['branch'],
+                        'source_instance': candidate['source_instance'],
+                        'tags': candidate['tags'],
+                        'created_at': str(candidate['created_at']) if candidate['created_at'] else None,
+                        'expires_at': str(candidate['expires_at']) if candidate['expires_at'] else None,
+                        'replay_count': candidate['replay_count'],
+                        'has_embedding': candidate['has_embedding'],
+                    })
+            except Exception as e:
+                print(f"[RECALL] Bookmark fallback error: {e}", file=sys.stderr)
+
         if not blob:
             cur.close()
             return jsonify({'error': 'Memory not found'}), 404
