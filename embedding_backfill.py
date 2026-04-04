@@ -50,7 +50,9 @@ def main():
             print(f"[BACKFILL] {blobs_filled} blobs + {candidates_filled} candidates embedded in {duration}ms ({errors} errors)")
         # Silent on zero work — runs every 5 min, usually nothing to do
 
-        sys.exit(1 if errors > total else 0)
+        # Exit 0 unless errors outnumber successes during actual work.
+        # Persistent bad blobs (e.g. empty content) shouldn't fail every run.
+        sys.exit(1 if total > 0 and errors > total else 0)
 
     except requests.Timeout:
         print(f"[BACKFILL] TIMEOUT: Exceeded {MAX_RUNTIME}s", file=sys.stderr)
