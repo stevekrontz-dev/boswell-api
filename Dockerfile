@@ -38,4 +38,4 @@ ENV BOSWELL_DB=/data/boswell_v2.db
 
 EXPOSE 8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "360", "app:app"]
