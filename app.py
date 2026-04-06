@@ -15,6 +15,7 @@ except ImportError:
 import hashlib
 import json
 import os
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify, g, send_from_directory, has_request_context
 from flask_cors import CORS
@@ -2327,6 +2328,42 @@ def decrypt_blob_content(blob):
     return blob.get('content', '')
 
 
+def resolve_hash_prefix(cur, table, hash_column, prefix, tenant_id):
+    """Resolve a short hash prefix to a full hash, git-style.
+
+    Returns (full_hash, error_response) tuple.
+    On success: (full_hash, None). On failure: (None, (response, status_code)).
+    Note: table/hash_column are hardcoded at call sites, never user input.
+    """
+    prefix = prefix.strip().rstrip('.').lower()
+
+    if not re.match(r'^[a-f0-9]+$', prefix):
+        return None, (jsonify({'error': 'Invalid hash: must be hex characters only'}), 400)
+
+    if len(prefix) < 7:
+        return None, (jsonify({'error': 'Hash prefix too short: minimum 7 characters'}), 400)
+
+    # Fast path: full 64-char hash needs no prefix search
+    if len(prefix) == 64:
+        return prefix, None
+
+    # Prefix match — B-tree index supports left-anchored LIKE efficiently
+    sql = f'SELECT {hash_column} FROM {table} WHERE {hash_column} LIKE %s AND tenant_id = %s'
+    cur.execute(sql, (prefix + '%', tenant_id))
+    rows = cur.fetchall()
+
+    if len(rows) == 0:
+        return None, (jsonify({'error': f'No match for hash prefix {prefix}'}), 404)
+    elif len(rows) == 1:
+        return rows[0][hash_column], None
+    else:
+        return None, (jsonify({
+            'error': f'Ambiguous hash prefix: {prefix} matches {len(rows)} entries',
+            'matches': [r[hash_column] for r in rows[:10]],
+            'hint': 'Provide more characters to disambiguate'
+        }), 409)
+
+
 @app.route('/v2/recall', methods=['GET'])
 def recall_memory():
     """Recall a specific memory by hash."""
@@ -2336,7 +2373,12 @@ def recall_memory():
     cur = get_cursor()
 
     if blob_hash:
-        cur.execute('SELECT * FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (blob_hash, get_tenant_id()))
+        full_hash, err = resolve_hash_prefix(cur, 'blobs', 'blob_hash', blob_hash, get_tenant_id())
+        if err:
+            cur.close()
+            return err
+
+        cur.execute('SELECT * FROM blobs WHERE blob_hash = %s AND tenant_id = %s', (full_hash, get_tenant_id()))
         blob = cur.fetchone()
 
         # Fallback: check candidate_memories (bookmarks) if not found in blobs
@@ -2458,13 +2500,18 @@ def recall_memory():
         return jsonify(response_data)
 
     elif commit_hash:
+        full_hash, err = resolve_hash_prefix(cur, 'commits', 'commit_hash', commit_hash, get_tenant_id())
+        if err:
+            cur.close()
+            return err
+
         cur.execute(
             '''SELECT c.*, b.blob_hash as resolved_blob_hash, b.content, b.content_type, b.content_encrypted, b.nonce, b.encryption_key_id
                FROM commits c
                JOIN tree_entries t ON c.tree_hash = t.tree_hash AND c.tenant_id = t.tenant_id
                JOIN blobs b ON t.blob_hash = b.blob_hash AND t.tenant_id = b.tenant_id
                WHERE c.commit_hash = %s AND c.tenant_id = %s''',
-            (commit_hash, get_tenant_id())
+            (full_hash, get_tenant_id())
         )
         commit = cur.fetchone()
         cur.close()
