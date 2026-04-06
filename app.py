@@ -7406,6 +7406,9 @@ def patrol_contradictions() -> list:
     tenant_id = get_tenant_id()
     cur = get_cursor()
 
+    # Set statement timeout to prevent runaway queries (60s max per statement)
+    cur.execute("SET statement_timeout TO 60000")
+
     client = get_anthropic_client()
     if not client:
         print("[CONTRADICTION] Anthropic client unavailable, skipping", file=sys.stderr)
@@ -7469,6 +7472,7 @@ def patrol_contradictions() -> list:
             response = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=150,
+                timeout=30,
                 messages=[{
                     "role": "user",
                     "content": (
@@ -7647,10 +7651,22 @@ def immune_patrol():
     # Log patrol start
     log_immune_action('PATROL_START', details={'patrol_id': results['patrol_id']})
 
+    # Max patrol runtime (4 minutes — leaves margin before gunicorn's 6min timeout)
+    PATROL_MAX_SECONDS = 240
+
     # Run each patrol route
     for route in PATROL_ROUTES:
         if route_filter and route['name'] not in route_filter:
             continue
+
+        # Bail if we've exceeded max runtime
+        elapsed = time.time() - start_time
+        if elapsed > PATROL_MAX_SECONDS:
+            results['errors'].append({
+                'route': route['name'],
+                'error': f'Patrol timeout ({PATROL_MAX_SECONDS}s) — skipping remaining routes'
+            })
+            break
 
         try:
             findings = route['detector']()
