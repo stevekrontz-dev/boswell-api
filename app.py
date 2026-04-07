@@ -9365,20 +9365,27 @@ def nightly_maintenance():
             except Exception as e:
                 results['trail_decay'] = {'error': str(e)}
 
-            # Step 2: Candidate cleanup
-            try:
-                with app.test_request_context(method='POST', path='/v2/candidates/cleanup',
-                                               content_type='application/json', json={}):
-                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
-                    cleanup_result = cleanup_candidates()
-                    if isinstance(cleanup_result, tuple):
-                        results['candidate_cleanup'] = cleanup_result[0].get_json() if hasattr(cleanup_result[0], 'get_json') else cleanup_result[0]
-                    elif hasattr(cleanup_result, 'get_json'):
-                        results['candidate_cleanup'] = cleanup_result.get_json()
-                    else:
-                        results['candidate_cleanup'] = cleanup_result
-            except Exception as e:
-                results['candidate_cleanup'] = {'error': str(e)}
+            # Step 2: Candidate cleanup — DISABLED 2026-04-07 pending architecture review.
+            # The dream formula was silting high-salience novel content (incl. sacred-tier
+            # bookmarks) across multiple tenants. Damage: Steve 473 silted (11 sacred),
+            # Henry 30 silted (14 sacred). Recovery + redesign in flight.
+            # See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
+            # Re-enable only after the new consolidation architecture lands.
+            results['candidate_cleanup'] = {'skipped': 'pending architecture review'}
+            print("[NIGHTLY] cleanup_candidates DISABLED pending architecture review", file=sys.stderr)
+            # try:
+            #     with app.test_request_context(method='POST', path='/v2/candidates/cleanup',
+            #                                    content_type='application/json', json={}):
+            #         g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
+            #         cleanup_result = cleanup_candidates()
+            #         if isinstance(cleanup_result, tuple):
+            #             results['candidate_cleanup'] = cleanup_result[0].get_json() if hasattr(cleanup_result[0], 'get_json') else cleanup_result[0]
+            #         elif hasattr(cleanup_result, 'get_json'):
+            #             results['candidate_cleanup'] = cleanup_result.get_json()
+            #         else:
+            #             results['candidate_cleanup'] = cleanup_result
+            # except Exception as e:
+            #     results['candidate_cleanup'] = {'error': str(e)}
 
             # Step 3: Consolidation (dry-run — scores candidates but does not promote)
             # Search unification landed (B1, commit ba9c6f4). Bookmarks now visible to search.
