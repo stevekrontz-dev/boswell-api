@@ -2117,6 +2117,141 @@ def search_memories():
     return jsonify({'query': query, 'mode': mode, 'results': results, 'count': len(results)})
 
 
+@app.route('/v2/retrieve', methods=['POST'])
+def retrieve_with_verdicts():
+    """Retrieval Agent v1.0 — Plan A from CC/CW argue 2026-04-07.
+
+    Pre-commit semantic dedup judgment layer. Wraps the existing hybrid search
+    (BM25 + pgvector + RRF + supersession-aware rerank), filters to cosine ≥ 0.70,
+    and bands candidates into high/mid for downstream classification.
+
+    PHASE STATUS: Phase 1 — passthrough stub. Returns banded candidates without
+    Haiku classification. Phase 2 will add classify_retrieval_candidates() to
+    produce the 5 verdict types (duplicate, near_duplicate, supersedable_predecessor,
+    related_but_distinct, unrelated).
+
+    POST body:
+        content (str, required) — text to check for prior work
+        branch_hint (str, optional) — narrows post-search filtering to a branch
+        purpose (str, optional) — commit_check | question | context_assembly | other
+        limit (int, optional) — max candidates to return (default 10, max 25)
+
+    Response:
+        verdicts: array of {blob_hash, commit_hash, message, content_type,
+                            cosine, band, source}
+        summary: counts by band
+        phase: "1-passthrough"
+
+    KNOWN GAP (Phase 2 future work): cosine 0.50-0.70 mid-band has no guardian.
+    Patrol covers 0.05-0.50 (contradiction band); this endpoint covers 0.70+.
+    The 0.50-0.70 strip is uncovered. Probably fine in practice (most real
+    near-dupes are >0.85), but worth a note for future maintainers.
+
+    See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
+    """
+    data = request.get_json() or {}
+    content = (data.get('content') or '').strip()
+    branch_hint = data.get('branch_hint')
+    purpose = data.get('purpose', 'commit_check')
+    try:
+        limit = min(int(data.get('limit', 10)), 25)
+    except (TypeError, ValueError):
+        limit = 10
+
+    if not content:
+        return jsonify({'error': 'content required'}), 400
+
+    if HIPPOCAMPAL_ENABLED:
+        ensure_hippocampal_tables()
+
+    cur = get_cursor()
+    tenant_id = get_tenant_id()
+    fetch_mult = 4 if branch_hint else 2
+
+    # Run hybrid search (mirrors search_memories hybrid mode)
+    try:
+        keyword_results = bm25_search(cur, content, tenant_id, limit=limit * fetch_mult)
+    except Exception as e:
+        print(f"[RETRIEVE] BM25 error (non-fatal): {e}", file=sys.stderr)
+        keyword_results = []
+
+    try:
+        semantic_results = _semantic_search_internal(cur, content, tenant_id, limit=limit * fetch_mult)
+    except Exception as e:
+        print(f"[RETRIEVE] Semantic error (non-fatal): {e}", file=sys.stderr)
+        semantic_results = []
+
+    # RRF fusion + multi-signal rerank (includes supersession penalty —
+    # superseded memories are already 0.3× by the existing pipeline, so they
+    # show up lower without us doing anything special)
+    rrf_results = reciprocal_rank_fusion(keyword_results, semantic_results)
+    reranked = _rerank_results(rrf_results, cur, tenant_id)
+
+    # Branch hint post-filter (same shape as search_memories)
+    if branch_hint:
+        permanent_hashes = [r['blob_hash'] for r in reranked if r.get('source') != 'staged']
+        if permanent_hashes:
+            branch_map = get_blob_branches_batch(cur, permanent_hashes, tenant_id)
+            reranked = [
+                r for r in reranked
+                if r.get('source') == 'staged'
+                or branch_map.get(r['blob_hash'], '').lower() == branch_hint.lower()
+            ]
+
+    # Filter to cosine ≥ 0.70 (distance ≤ 0.30) and band candidates.
+    # pgvector cosine distance: 0 = identical, 1 = orthogonal.
+    #   distance ≤ 0.15 → cosine similarity ≥ 0.85 (high band)
+    #   0.15 < distance ≤ 0.30 → 0.70 ≤ cosine < 0.85 (mid band)
+    candidates = []
+    for r in reranked:
+        distance = r.get('distance')
+        if distance is None:
+            # BM25-only hit (no embedding distance computed) — include but mark
+            band = 'bm25_only'
+            cosine = None
+        else:
+            try:
+                cosine = round(1.0 - float(distance), 4)
+            except (TypeError, ValueError):
+                continue
+            if cosine < 0.70:
+                continue
+            band = 'high' if cosine >= 0.85 else 'mid'
+
+        candidates.append({
+            'blob_hash': r.get('blob_hash'),
+            'commit_hash': r.get('commit_hash'),
+            'message': r.get('message'),
+            'content_type': r.get('content_type'),
+            'cosine': cosine,
+            'band': band,
+            'source': r.get('source'),
+            # Phase 2 will add: verdict_type, rationale (from Haiku batch call)
+        })
+        if len(candidates) >= limit:
+            break
+
+    cur.close()
+
+    summary = {
+        'high_count': sum(1 for c in candidates if c['band'] == 'high'),
+        'mid_count': sum(1 for c in candidates if c['band'] == 'mid'),
+        'bm25_only_count': sum(1 for c in candidates if c['band'] == 'bm25_only'),
+        'total_count': len(candidates),
+        # Phase 2 will add: duplicate_count, near_duplicate_count,
+        # supersedable_count, related_count, recommended_action
+    }
+
+    return jsonify({
+        'phase': '1-passthrough',
+        'purpose': purpose,
+        'branch_hint': branch_hint,
+        'verdicts': candidates,
+        'summary': summary,
+        'note': 'Phase 1 stub — banded candidates only. Phase 2 will add Haiku verdict_type per candidate.',
+    })
+
+
 @app.route('/v2/semantic-search', methods=['GET'])
 def semantic_search():
     """Semantic search using vector embeddings.
