@@ -2538,6 +2538,409 @@ def retrieve_with_verdicts():
     return jsonify(response_payload)
 
 
+# =============================================================================
+# Plan B — Commit Agent v1.0 (CC/CW argue 2026-04-07)
+# Pre-commit dedup wrapper around create_commit. Calls /v2/retrieve internally,
+# applies the decision tree, and (when conditions hold) auto-creates supersession
+# links with three guard rails:
+#   1. source='commit_agent' tag in cross_references
+#   2. mandatory immune_log entry for every auto-supersede
+#   3. high-confidence gate — only act on duplicate or supersedable_predecessor
+#      with classifier_confidence ≥ AUTO_SUPERSEDE_CONFIDENCE_THRESHOLD
+# Plan source: 2f947c3a + 392f17ce + 552c7205 (Boswell)
+# =============================================================================
+
+AUTO_SUPERSEDE_CONFIDENCE_THRESHOLD = 0.90
+
+
+def _commit_agent_call_retrieve(content, branch_hint, tenant_id):
+    """Internal call to retrieve_with_verdicts. Returns the parsed JSON dict
+    or None on failure (caller falls back to write-as-new with immune_log entry)."""
+    try:
+        with app.test_request_context(
+            method='POST',
+            path='/v2/retrieve',
+            content_type='application/json',
+            json={
+                'content': content,
+                'branch_hint': branch_hint,
+                'purpose': 'commit_check',
+                'limit': 10,
+            },
+        ):
+            g.mcp_auth = {'tenant_id': tenant_id, 'source': 'commit_agent'}
+            result = retrieve_with_verdicts()
+            if isinstance(result, tuple):
+                resp = result[0]
+                return resp.get_json() if hasattr(resp, 'get_json') else resp
+            if hasattr(result, 'get_json'):
+                return result.get_json()
+            if isinstance(result, dict):
+                return result
+            return None
+    except Exception as e:
+        print(f"[COMMIT_AGENT] Retrieval call failed: {e}", file=sys.stderr)
+        return None
+
+
+def _commit_agent_create_supersedes_link(
+    source_blob, target_blob, source_branch, target_branch,
+    verdict_type, confidence, cosine, rationale, tenant_id,
+):
+    """Insert a supersedes link into cross_references with source='commit_agent'
+    and write a corresponding immune_log entry. Guard rails #1 and #2.
+    Returns True on success, False on failure (logged to stderr)."""
+    try:
+        cur = get_cursor()
+        cur.execute(
+            """
+            INSERT INTO cross_references
+                (tenant_id, source_blob, target_blob, source_branch, target_branch,
+                 link_type, weight, reasoning, source, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                tenant_id, source_blob, target_blob,
+                source_branch or 'unknown', target_branch or 'unknown',
+                'supersedes',
+                round(float(confidence or 0.0), 4),
+                f"commit_agent auto-supersede ({verdict_type}): {rationale[:200]}",
+                'commit_agent',
+                datetime.utcnow().isoformat() + 'Z',
+            ),
+        )
+        get_db().commit()
+        cur.close()
+    except Exception as e:
+        print(
+            f"[COMMIT_AGENT] supersedes link insert failed for "
+            f"{source_blob[:8]}→{target_blob[:8]}: {e}",
+            file=sys.stderr,
+        )
+        try:
+            get_db().rollback()
+        except Exception:
+            pass
+        # Loud failure: log to immune_log so the failure is auditable
+        try:
+            log_immune_action(
+                action='AUTO_SUPERSEDE_LINK_FAILED',
+                blob_hash=target_blob,
+                patrol_type='commit_agent',
+                details={
+                    'new_blob': source_blob,
+                    'verdict_type': verdict_type,
+                    'error': str(e)[:300],
+                },
+            )
+        except Exception:
+            pass
+        return False
+
+    # Guard rail #2: mandatory immune_log entry on every auto-supersede.
+    try:
+        log_immune_action(
+            action='AUTO_SUPERSEDE',
+            blob_hash=target_blob,
+            patrol_type='commit_agent',
+            details={
+                'new_blob': source_blob,
+                'verdict_type': verdict_type,
+                'classifier_confidence': round(float(confidence or 0.0), 4),
+                'cosine': cosine,
+                'rationale': (rationale or '')[:300],
+            },
+        )
+    except Exception as e:
+        print(f"[COMMIT_AGENT] immune_log write failed (non-fatal): {e}", file=sys.stderr)
+
+    return True
+
+
+@app.route('/v2/commit_checked', methods=['POST'])
+def commit_checked():
+    """Commit Agent v1.0 — Plan B from CC/CW argue 2026-04-07.
+
+    Pre-commit dedup wrapper around create_commit. Calls /v2/retrieve to
+    classify the proposed content against existing memories, then either:
+        - refused_as_duplicate (intent=auto, recommended_action=refuse_as_duplicate)
+        - written_with_supersession (high-confidence supersedable_predecessor or duplicate)
+        - written_new (no duplicates, no predecessors)
+        - written_with_warning (intent=new override on a duplicate)
+        - refused_invalid (write_screening structural fail)
+
+    POST body (mirrors /v2/commit plus an `intent` field):
+        content (object/array, required)
+        branch (str, default 'command-center')
+        message (str, default 'Memory commit')
+        author (str, default 'claude')
+        type (str, default 'memory') — content_type
+        tags (array, optional)
+        intent (str, optional) — 'auto' (default) | 'new' | 'supersedes:HASH'
+        force_branch (bool, optional) — forwarded to create_commit
+
+    Three guard rails on auto-supersede:
+        1. cross_references.source='commit_agent' (filterable, reversible)
+        2. immune_log entry on every link creation (auditable, never silent)
+        3. classifier confidence >= 0.90 OR verdict_type='duplicate' required
+
+    Loud-failure fallback: if /v2/retrieve is unavailable, falls back to raw
+    create_commit with an immune_log entry action='RETRIEVAL_AGENT_UNAVAILABLE'.
+    Better to commit than to lose work.
+
+    Plan source: 2f947c3a + 392f17ce + 552c7205 (Boswell)
+    Plan file: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
+    """
+    data = request.get_json() or {}
+    content = data.get('content')
+    message = data.get('message', 'Memory commit')
+    branch = data.get('branch', 'command-center')
+    author = data.get('author', 'claude')
+    content_type = data.get('type', 'memory')
+    tags = data.get('tags', [])
+    intent = data.get('intent', 'auto')
+    force_branch = data.get('force_branch', False)
+
+    if not content:
+        return jsonify({'error': 'content required'}), 400
+
+    # Step 1: structural write screening (reuses v3.5.0 + amendment 307a4bae)
+    screen_error, screen_status = _screen_content(content, content_type=content_type)
+    if screen_error:
+        return jsonify({
+            'decision': 'refused_invalid',
+            'reason': 'structural_screening_failed',
+            'detail': screen_error.get_json() if hasattr(screen_error, 'get_json') else None,
+        }), screen_status
+
+    # Auto-ensure the cross_references.source column exists (migration 022).
+    ensure_commit_agent_schema()
+
+    tenant_id = get_tenant_id()
+
+    # Step 2: parse intent
+    intent_normalized = (intent or 'auto').strip().lower()
+    explicit_supersedes_hash = None
+    if intent_normalized.startswith('supersedes:'):
+        explicit_supersedes_hash = intent_normalized.split(':', 1)[1].strip()
+        intent_normalized = 'supersedes'
+    if intent_normalized not in ('auto', 'new', 'supersedes'):
+        intent_normalized = 'auto'
+
+    # Step 3: call /v2/retrieve unless intent overrides bypass it
+    retrieval = None
+    retrieval_unavailable = False
+    if intent_normalized in ('auto', 'supersedes'):
+        retrieval = _commit_agent_call_retrieve(
+            content=json.dumps(content) if not isinstance(content, str) else content,
+            branch_hint=branch,
+            tenant_id=tenant_id,
+        )
+        if retrieval is None:
+            retrieval_unavailable = True
+            try:
+                log_immune_action(
+                    action='RETRIEVAL_AGENT_UNAVAILABLE',
+                    blob_hash=None,
+                    patrol_type='commit_agent',
+                    details={'branch': branch, 'content_type': content_type},
+                )
+            except Exception:
+                pass
+
+    # Step 4: decision tree
+    recommended_action = (retrieval or {}).get('summary', {}).get('recommended_action', 'write_as_new')
+    verdicts = (retrieval or {}).get('verdicts', [])
+
+    # 3a: refused_as_duplicate (auto only — explicit intent always writes)
+    if (
+        intent_normalized == 'auto'
+        and recommended_action == 'refuse_as_duplicate'
+        and not retrieval_unavailable
+    ):
+        # Find the duplicate(s) — typically the first verdict with verdict_type='duplicate'
+        duplicate_verdict = next(
+            (v for v in verdicts if v.get('verdict_type') == 'duplicate'),
+            None,
+        )
+        return jsonify({
+            'decision': 'refused_as_duplicate',
+            'existing_blob_hash': duplicate_verdict.get('blob_hash') if duplicate_verdict else None,
+            'existing_commit_hash': duplicate_verdict.get('commit_hash') if duplicate_verdict else None,
+            'rationale': duplicate_verdict.get('rationale') if duplicate_verdict else None,
+            'verdicts_consulted': verdicts,
+            'override_hint': "Pass intent='new' to force write, or intent='supersedes:HASH' to link explicitly.",
+        }), 409
+
+    # All other paths write the commit. Use create_commit() via test request context.
+    commit_payload = {
+        'content': content,
+        'message': message,
+        'branch': branch,
+        'author': author,
+        'type': content_type,
+        'tags': tags,
+    }
+    if force_branch:
+        commit_payload['force_branch'] = True
+
+    try:
+        with app.test_request_context(
+            method='POST',
+            path='/v2/commit',
+            content_type='application/json',
+            json=commit_payload,
+        ):
+            # Preserve any auth context from the outer request
+            outer_auth = getattr(g, 'mcp_auth', None)
+            if outer_auth is not None:
+                g.mcp_auth = outer_auth
+            commit_result = create_commit()
+    except Exception as e:
+        print(f"[COMMIT_AGENT] create_commit failed: {e}", file=sys.stderr)
+        return jsonify({
+            'decision': 'write_failed',
+            'error': str(e)[:300],
+        }), 500
+
+    # Extract commit_result data
+    if isinstance(commit_result, tuple):
+        commit_resp, commit_status = commit_result[0], commit_result[1]
+    else:
+        commit_resp, commit_status = commit_result, 200
+
+    if commit_status not in (200, 201):
+        # create_commit refused the write — propagate
+        return commit_resp, commit_status
+
+    commit_data = commit_resp.get_json() if hasattr(commit_resp, 'get_json') else commit_resp
+    new_blob_hash = commit_data.get('blob_hash')
+    new_commit_hash = commit_data.get('commit_hash')
+
+    # Step 5: post-commit link creation (only on supersession paths)
+    links_created = []
+
+    if intent_normalized == 'new':
+        # 3d: explicit override — log and return
+        try:
+            log_immune_action(
+                action='EXPLICIT_INTENT_NEW_BY_CALLER',
+                blob_hash=new_blob_hash,
+                patrol_type='commit_agent',
+                details={
+                    'branch': branch,
+                    'content_type': content_type,
+                    'verdicts_consulted_count': len(verdicts),
+                },
+            )
+        except Exception:
+            pass
+        return jsonify({
+            'decision': 'written_with_warning',
+            'commit_hash': new_commit_hash,
+            'blob_hash': new_blob_hash,
+            'warning': 'Caller used intent=new to bypass dedup.',
+            'verdicts_consulted': verdicts,
+            'commit_response': commit_data,
+        })
+
+    if intent_normalized == 'supersedes' and explicit_supersedes_hash:
+        # 3e: explicit supersedes — create the link with guard rails applied
+        target_verdict = next(
+            (v for v in verdicts if (v.get('blob_hash') or '').startswith(explicit_supersedes_hash)),
+            None,
+        )
+        ok = _commit_agent_create_supersedes_link(
+            source_blob=new_blob_hash,
+            target_blob=explicit_supersedes_hash,
+            source_branch=branch,
+            target_branch=(target_verdict or {}).get('branch'),
+            verdict_type='explicit_supersedes',
+            confidence=1.0,  # explicit caller intent = full confidence
+            cosine=(target_verdict or {}).get('cosine'),
+            rationale='Explicit caller intent (intent=supersedes:HASH)',
+            tenant_id=tenant_id,
+        )
+        if ok:
+            links_created.append({
+                'target_blob': explicit_supersedes_hash,
+                'verdict_type': 'explicit_supersedes',
+                'confidence': 1.0,
+            })
+        return jsonify({
+            'decision': 'written_with_supersession',
+            'commit_hash': new_commit_hash,
+            'blob_hash': new_blob_hash,
+            'links_created': links_created,
+            'commit_response': commit_data,
+        })
+
+    # 3b: auto write_with_supersession_link path
+    # Apply guard rail #3: only fire on duplicate (any confidence) or
+    # supersedable_predecessor with confidence >= AUTO_SUPERSEDE_CONFIDENCE_THRESHOLD.
+    if (
+        intent_normalized == 'auto'
+        and recommended_action == 'write_with_supersession_link'
+        and verdicts
+        and not retrieval_unavailable
+    ):
+        for v in verdicts:
+            vtype = v.get('verdict_type')
+            confidence = v.get('confidence') or 0.0
+            target_blob = v.get('blob_hash')
+            if not target_blob:
+                continue
+            # Guard rail #3: high-confidence gate
+            if vtype == 'duplicate':
+                pass  # always act on duplicates
+            elif vtype == 'supersedable_predecessor' and confidence >= AUTO_SUPERSEDE_CONFIDENCE_THRESHOLD:
+                pass  # high-confidence supersedable
+            else:
+                # near_duplicate, related_but_distinct, low-confidence supersedable —
+                # return as suggestion only, no auto-action
+                continue
+            ok = _commit_agent_create_supersedes_link(
+                source_blob=new_blob_hash,
+                target_blob=target_blob,
+                source_branch=branch,
+                target_branch=v.get('branch'),
+                verdict_type=vtype,
+                confidence=confidence,
+                cosine=v.get('cosine'),
+                rationale=v.get('rationale', ''),
+                tenant_id=tenant_id,
+            )
+            if ok:
+                links_created.append({
+                    'target_blob': target_blob,
+                    'verdict_type': vtype,
+                    'confidence': round(float(confidence), 4),
+                })
+
+        return jsonify({
+            'decision': 'written_with_supersession' if links_created else 'written_new',
+            'commit_hash': new_commit_hash,
+            'blob_hash': new_blob_hash,
+            'links_created': links_created,
+            'verdicts_consulted': verdicts,
+            'commit_response': commit_data,
+        })
+
+    # 3c: write_as_new (no duplicates, no actionable predecessors)
+    response = {
+        'decision': 'written_new',
+        'commit_hash': new_commit_hash,
+        'blob_hash': new_blob_hash,
+        'verdicts_consulted': verdicts,
+        'commit_response': commit_data,
+    }
+    if retrieval_unavailable:
+        response['retrieval_status'] = 'unavailable_fallback'
+        response['warning'] = 'Retrieval Agent unavailable; committed without dedup check.'
+    return jsonify(response)
+
+
 @app.route('/v2/semantic-search', methods=['GET'])
 def semantic_search():
     """Semantic search using vector embeddings.
