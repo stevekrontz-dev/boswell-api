@@ -5059,6 +5059,69 @@ def cleanup_links():
     })
 
 
+@app.route('/v2/commits/silt', methods=['POST'])
+def silt_commits_manual():
+    """
+    Manually silt commits by hash. For misroutes, duplicates, retraction, supersession.
+    Sets silt_status='silted', silted_at=NOW(), silt_reason='manual: <reason>'.
+    Silted commits drop out of default 'surface' searches but remain accessible
+    via depth='deep' or 'silt'. Reversible via boswell_resurrect.
+
+    Request body (JSON):
+    - commit_hashes: list of full commit hashes (required, non-empty)
+    - reason: free-text justification (required, stored for audit)
+    - dry_run: bool (default False) - if True, return what would be silted without changing state
+    """
+    data = request.get_json() or {}
+    commit_hashes = data.get('commit_hashes', [])
+    reason = (data.get('reason') or '').strip()
+    dry_run = bool(data.get('dry_run', False))
+
+    if not commit_hashes or not isinstance(commit_hashes, list):
+        return jsonify({'error': 'commit_hashes (non-empty list) required'}), 400
+    if not reason:
+        return jsonify({'error': 'reason (non-empty string) required for audit trail'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+    tenant_id = get_tenant_id()
+
+    # Find which commits exist and what their current silt state is
+    cur.execute("""
+        SELECT commit_hash, message, silt_status FROM commits
+        WHERE tenant_id = %s AND commit_hash = ANY(%s)
+    """, (tenant_id, commit_hashes))
+    rows = cur.fetchall()
+    found = {row['commit_hash']: row for row in rows}
+
+    targets = [h for h in commit_hashes if h in found and found[h]['silt_status'] is None]
+    already_silted = [h for h in commit_hashes if h in found and found[h]['silt_status'] is not None]
+    not_found = [h for h in commit_hashes if h not in found]
+
+    silted_count = 0
+    if not dry_run and targets:
+        cur.execute("""
+            UPDATE commits SET silt_status = 'silted', silted_at = NOW(),
+                silt_reason = %s
+            WHERE tenant_id = %s AND commit_hash = ANY(%s)
+              AND silt_status IS NULL
+        """, (f'manual: {reason}', tenant_id, targets))
+        silted_count = cur.rowcount
+        db.commit()
+
+    cur.close()
+    return jsonify({
+        'status': 'previewed' if dry_run else 'silted',
+        'dry_run': dry_run,
+        'reason': reason,
+        'silted_count': silted_count if not dry_run else len(targets),
+        'targets': targets,
+        'already_silted': already_silted,
+        'not_found': not_found,
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
+
+
 @app.route('/v2/links/debug-branch', methods=['POST'])
 def debug_branch_detection():
     """Debug branch detection for a specific blob."""
@@ -11667,6 +11730,19 @@ MCP_TOOLS = [
         }
     },
     {
+        "name": "boswell_silt",
+        "description": "Manually silt (bury) commits by hash. Use for duplicates, misroutes, supersession, or retraction. Silted commits drop out of default 'surface' searches but remain accessible via depth='deep' or 'silt'. Requires a reason for audit trail. Reversible via boswell_resurrect.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "commit_hashes": {"type": "array", "items": {"type": "string"}, "description": "List of full commit hashes to silt"},
+                "reason": {"type": "string", "description": "Required: why these commits are being silted (e.g. 'duplicate of <hash>', 'wrong branch', 'superseded by <hash>'). Stored in silt_reason for audit."},
+                "dry_run": {"type": "boolean", "description": "If true, preview which commits would be silted without changing state (default false)", "default": False}
+            },
+            "required": ["commit_hashes", "reason"]
+        }
+    },
+    {
         "name": "boswell_candidates",
         "description": "View staging buffer — what's in working memory. Shows bookmarks with salience, replay count, and expiry.",
         "inputSchema": {
@@ -12128,6 +12204,13 @@ def dispatch_mcp_tool(tool_name, args):
             if field in args:
                 payload[field] = args[field]
         return invoke_view(run_consolidation, method='POST', json_data=payload)
+
+    elif tool_name == "boswell_silt":
+        payload = {}
+        for field in ["commit_hashes", "reason", "dry_run"]:
+            if field in args:
+                payload[field] = args[field]
+        return invoke_view(silt_commits_manual, method='POST', json_data=payload)
 
     elif tool_name == "boswell_candidates":
         qs = {}
