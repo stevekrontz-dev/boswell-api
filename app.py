@@ -1043,19 +1043,28 @@ def check_novelty(embedding, branch, tenant_id):
         return {'novelty_score': 1.0, 'is_novel': True}
 
 
-# Per-content-type write screening caps (amendment 307a4bae, 2026-04-07).
-# Replaces v3.5.0's flat 8KB tripwire with per-type limits. The tripwire
-# stays for content_types where "big = mistake" is still true; relaxes for
-# content_types where "big = real structure" (plans, skills).
+# Per-content-type write screening caps.
+# History:
+#   v3.5.0 (Feb 26): flat 8KB tripwire on all writes
+#   amendment 307a4bae (2026-04-07 evening): per-content-type caps —
+#       memory/task/transcript kept at 8KB, plan raised to 32KB, skill to 16KB
+#   2026-04-08 fix: memory cap REMOVED entirely. Steve's directive verbatim:
+#       "i dont like censorship. not even for disk space"
+#       The 8KB memory tripwire was rejecting legitimate session-end summaries
+#       (~9.7KB) within hours of being shipped. Boswell exists to preserve
+#       context — a rule that REJECTS context is hostile to that mission.
+#       A short failed memory loses 100% of value; a long preserved memory
+#       loses 0%. None means no cap, full stop.
+#
 # See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
 CONTENT_SIZE_CAPS = {
-    'memory': 8192,       # tripwire stays — if a memory needs more, it's two memories
+    'memory': None,       # NO CAP — Steve's directive 2026-04-08, see history above
     'plan': 32768,        # plans carry phases/tests/predecessor links — preserve verbatim
     'skill': 16384,       # behavioral skills are prose-heavy and need room for examples
     'task': 8192,         # tasks should be terse pointers to plans, not plans themselves
     'transcript': 8192,   # transcripts are metadata pointers, not the content itself
 }
-DEFAULT_CONTENT_SIZE_CAP = 8192  # unknown content_types get the tripwire
+DEFAULT_CONTENT_SIZE_CAP = 8192  # unknown content_types get the tripwire by default
 
 
 def _screen_content(content, content_type: str = 'memory') -> tuple:
@@ -1063,6 +1072,7 @@ def _screen_content(content, content_type: str = 'memory') -> tuple:
 
     Returns (error_response, status_code) if rejected, or (None, None) if OK.
     Checks: JSON structure, empty content, bare primitives, per-content-type size cap.
+    Cap=None for a content_type means no size limit (memory as of 2026-04-08).
     """
     # Must be a dict or list (no bare primitives)
     if not isinstance(content, (dict, list)):
@@ -1078,17 +1088,18 @@ def _screen_content(content, content_type: str = 'memory') -> tuple:
     if isinstance(content, list) and len(content) == 0:
         return jsonify({'error': 'Content cannot be an empty array'}), 400
 
-    # Per-content-type size cap (amendment 307a4bae)
+    # Per-content-type size cap (None = no cap, never reject for size)
     cap = CONTENT_SIZE_CAPS.get(content_type, DEFAULT_CONTENT_SIZE_CAP)
-    content_bytes = len(json.dumps(content).encode('utf-8'))
-    if content_bytes > cap:
-        return jsonify({
-            'error': f'Content too large ({content_bytes / 1024:.1f}KB). '
-                     f'Maximum for content_type={content_type!r} is {cap // 1024}KB.',
-            'size_bytes': content_bytes,
-            'limit_bytes': cap,
-            'content_type': content_type,
-        }), 413
+    if cap is not None:
+        content_bytes = len(json.dumps(content).encode('utf-8'))
+        if content_bytes > cap:
+            return jsonify({
+                'error': f'Content too large ({content_bytes / 1024:.1f}KB). '
+                         f'Maximum for content_type={content_type!r} is {cap // 1024}KB.',
+                'size_bytes': content_bytes,
+                'limit_bytes': cap,
+                'content_type': content_type,
+            }), 413
 
     return None, None
 
