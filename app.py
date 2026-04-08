@@ -2365,10 +2365,19 @@ def retrieve_with_verdicts():
         summary: counts by band AND by verdict_type, plus recommended_action
         phase: "2-haiku-classified" or "1-passthrough"
 
-    KNOWN GAP (future work): cosine 0.50-0.70 mid-band has no guardian.
-    Patrol covers 0.05-0.50 (contradiction band); this endpoint covers 0.70+.
-    The 0.50-0.70 strip is uncovered. Probably fine in practice (most real
-    near-dupes are >0.85), but worth a note for future maintainers.
+    COSINE BANDS (post-2026-04-08 empirical fix):
+        cosine ≥ 0.85 → 'high' band (definite duplicate zone)
+        0.70 ≤ cosine < 0.85 → 'mid' band (likely near-duplicate)
+        0.50 ≤ cosine < 0.70 → 'low' band (paraphrase candidates — Haiku judges)
+        cosine < 0.50 → dropped (too noisy)
+    Items with no embedding distance (BM25-only hits) get band='bm25_only'.
+
+    The original plan assumed near-duplicates lived at cosine ≥ 0.85 and
+    documented 0.50-0.85 as a "future work mid-band gap." Real-world testing
+    on the canonical reproducer (818eb823/ba68b4b6 pair, cosine ~0.54) showed
+    paraphrased duplicates actually live in that gap. The threshold was
+    lowered from 0.70 to 0.50 to close it. Haiku is the final judge on
+    whether a low-band match is a duplicate or merely related.
 
     See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
     """
@@ -2434,10 +2443,22 @@ def retrieve_with_verdicts():
                 or branch_map.get(r['blob_hash'], '').lower() == branch_hint.lower()
             ]
 
-    # Filter to cosine ≥ 0.70 (distance ≤ 0.30) and band candidates.
+    # Filter to cosine ≥ 0.50 (distance ≤ 0.50) and band candidates.
     # pgvector cosine distance: 0 = identical, 1 = orthogonal.
-    #   distance ≤ 0.15 → cosine similarity ≥ 0.85 (high band)
-    #   0.15 < distance ≤ 0.30 → 0.70 ≤ cosine < 0.85 (mid band)
+    #   distance ≤ 0.15 → cosine similarity ≥ 0.85 (high band — definite duplicate zone)
+    #   0.15 < distance ≤ 0.30 → 0.70 ≤ cosine < 0.85 (mid band — likely near-duplicate)
+    #   0.30 < distance ≤ 0.50 → 0.50 ≤ cosine < 0.70 (low band — paraphrase candidates)
+    #
+    # 2026-04-08 EMPIRICAL FIX (post-test): the canonical reproducer pair
+    # 818eb823/ba68b4b6 sits at cosine ~0.54, INSIDE what was originally
+    # documented as the "0.50-0.85 mid-band gap" future-work item. The plan
+    # assumed near-duplicates live at cosine ≥ 0.85. Real-world data showed
+    # the actual duplicate-zone for paraphrased commits is 0.50-0.70. The
+    # threshold has been lowered from 0.70 to 0.50 to close the gap, and
+    # Haiku is the final judge on whether a low-band match is actually a
+    # duplicate vs related-but-distinct. The cost of letting more candidates
+    # reach Haiku is small (~$0.001/call extra); the cost of missing the
+    # canonical regression case is the entire reason this feature exists.
     #
     # Build TWO parallel structures:
     #   internal_candidates — has content (passed to Haiku classifier)
@@ -2454,9 +2475,14 @@ def retrieve_with_verdicts():
                 cosine = round(1.0 - float(distance), 4)
             except (TypeError, ValueError):
                 continue
-            if cosine < 0.70:
+            if cosine < 0.50:
                 continue
-            band = 'high' if cosine >= 0.85 else 'mid'
+            if cosine >= 0.85:
+                band = 'high'
+            elif cosine >= 0.70:
+                band = 'mid'
+            else:
+                band = 'low'
 
         blob_hash = r.get('blob_hash')
         internal_candidates.append({
@@ -2504,6 +2530,7 @@ def retrieve_with_verdicts():
     summary = {
         'high_count': sum(1 for c in response_candidates if c['band'] == 'high'),
         'mid_count': sum(1 for c in response_candidates if c['band'] == 'mid'),
+        'low_count': sum(1 for c in response_candidates if c['band'] == 'low'),
         'bm25_only_count': sum(1 for c in response_candidates if c['band'] == 'bm25_only'),
         'total_count': len(response_candidates),
     }
