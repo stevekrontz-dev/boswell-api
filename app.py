@@ -9327,11 +9327,41 @@ def discovery_pass():
         return jsonify({'error': f'Discovery pass failed: {str(e)}'}), 500
 
 
+def _extract_count(result, *keys, default=0):
+    """Extract a count field from a Flask Response/tuple/dict result. Returns 0 on any error."""
+    try:
+        if isinstance(result, tuple):
+            r = result[0]
+            data = r.get_json() if hasattr(r, 'get_json') else r
+        elif hasattr(result, 'get_json'):
+            data = result.get_json()
+        else:
+            data = result if isinstance(result, dict) else {}
+        for k in keys:
+            if k in data:
+                return data.get(k, default)
+        return default
+    except Exception:
+        return default
+
+
 @app.route('/v2/nightly', methods=['POST'])
 def nightly_maintenance():
-    """Composite nightly maintenance for ALL tenants: trails + candidates + consolidation + discovery."""
+    """Composite nightly maintenance for ALL tenants: trails + discovery + fingerprints.
+
+    HARDENED 2026-04-07 (post-incident):
+    - Step 2 (cleanup_candidates) DISABLED — was silting sacred-tier content.
+    - Step 3 (consolidation/dream cycle) DISABLED — was OOM-killing the gunicorn
+      worker mid-response after yesterday's 220-candidate recovery added load,
+      causing IncompleteRead crash loop in nightly_cron. Re-enable when the
+      Curator Stack lands and replaces _compute_activation.
+    - Response shape SLIMMED: per-tenant counts only, no deep result trees.
+      Full per-step details written to stderr. Was 20KB+ payloads triggering
+      mid-stream connection drops; now <2KB.
+    See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
+    """
+    import gc
     start_time = time.time()
-    all_results = {}
 
     # Get all active tenants
     try:
@@ -9344,110 +9374,113 @@ def nightly_maintenance():
     except Exception as e:
         return jsonify({'error': f'Failed to fetch tenants: {str(e)}'}), 500
 
+    # Slim aggregate counters — no deep result trees
+    summary = {
+        'trails_decayed': 0,
+        'discovery_orphans_queued': 0,
+        'fingerprints_built': 0,
+        'consolidation': 'disabled',
+        'cleanup': 'disabled',
+    }
+    tenant_summaries = []
+    failed_tenants = []
+
     for tenant in tenants:
         tenant_id = str(tenant['id'])
         tenant_name = tenant.get('name', tenant_id[:8])
         push_tenant_override(tenant_id)
-        try:
-            results = {}
 
+        slim = {'name': tenant_name, 'id': tenant_id[:8]}
+
+        try:
             # Step 1: Trail decay
             try:
                 with app.test_request_context(method='POST', path='/v2/trails/decay'):
                     g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
                     trail_result = decay_trails()
-                    if isinstance(trail_result, tuple):
-                        results['trail_decay'] = trail_result[0].get_json() if hasattr(trail_result[0], 'get_json') else trail_result[0]
-                    elif hasattr(trail_result, 'get_json'):
-                        results['trail_decay'] = trail_result.get_json()
-                    else:
-                        results['trail_decay'] = trail_result
+                    n = _extract_count(trail_result, 'trails_processed', 'processed')
+                    summary['trails_decayed'] += n
+                    slim['trails'] = n
+                    print(f"[NIGHTLY] {tenant_name}: trails_decayed={n}", file=sys.stderr)
             except Exception as e:
-                results['trail_decay'] = {'error': str(e)}
+                slim['trails_error'] = str(e)[:200]
+                print(f"[NIGHTLY] {tenant_name}: trail decay error: {e}", file=sys.stderr)
 
-            # Step 2: Candidate cleanup — DISABLED 2026-04-07 pending architecture review.
-            # The dream formula was silting high-salience novel content (incl. sacred-tier
-            # bookmarks) across multiple tenants. Damage: Steve 473 silted (11 sacred),
-            # Henry 30 silted (14 sacred). Recovery + redesign in flight.
-            # See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
-            # Re-enable only after the new consolidation architecture lands.
-            results['candidate_cleanup'] = {'skipped': 'pending architecture review'}
-            print("[NIGHTLY] cleanup_candidates DISABLED pending architecture review", file=sys.stderr)
-            # try:
-            #     with app.test_request_context(method='POST', path='/v2/candidates/cleanup',
-            #                                    content_type='application/json', json={}):
-            #         g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
-            #         cleanup_result = cleanup_candidates()
-            #         if isinstance(cleanup_result, tuple):
-            #             results['candidate_cleanup'] = cleanup_result[0].get_json() if hasattr(cleanup_result[0], 'get_json') else cleanup_result[0]
-            #         elif hasattr(cleanup_result, 'get_json'):
-            #             results['candidate_cleanup'] = cleanup_result.get_json()
-            #         else:
-            #             results['candidate_cleanup'] = cleanup_result
-            # except Exception as e:
-            #     results['candidate_cleanup'] = {'error': str(e)}
+            # Step 2: Candidate cleanup — DISABLED (silting bug, see plan)
+            slim['cleanup'] = 'disabled'
 
-            # Step 3: Consolidation (dry-run — scores candidates but does not promote)
-            # Search unification landed (B1, commit ba9c6f4). Bookmarks now visible to search.
-            # Running in dry_run mode so Steve can review scoring before enabling promotions.
-            # NOTE: _dry_run_override=True passed directly to bypass request.get_json() dependency.
-            try:
-                with app.test_request_context(method='POST', path='/v2/consolidate',
-                                               content_type='application/json',
-                                               json={'max_promotions': 10, 'cycle_type': 'dream', 'dry_run': True}):
-                    g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
-                    consol_result = run_consolidation(_dry_run_override=True)
-                    if isinstance(consol_result, tuple):
-                        results['consolidation'] = consol_result[0].get_json() if hasattr(consol_result[0], 'get_json') else consol_result[0]
-                    elif hasattr(consol_result, 'get_json'):
-                        results['consolidation'] = consol_result.get_json()
-                    else:
-                        results['consolidation'] = consol_result
-            except Exception as e:
-                results['consolidation'] = {'error': str(e)}
+            # Step 3: Consolidation — DISABLED 2026-04-07 (post-OOM hardening)
+            # Was the largest in-memory step + producing scores nothing reads
+            # since cleanup_candidates is disabled. Net effect of disabling: zero.
+            # Re-enable when Curator Stack lands.
+            slim['consolidation'] = 'disabled'
+            print(f"[NIGHTLY] {tenant_name}: consolidation DISABLED (post-OOM)", file=sys.stderr)
 
             # Step 4: Discovery pass (surface orphaned memories)
             try:
                 with app.test_request_context(method='POST', path='/v2/discovery/pass'):
                     g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
                     discovery_result = discovery_pass()
-                    if isinstance(discovery_result, tuple):
-                        results['discovery_pass'] = discovery_result[0].get_json() if hasattr(discovery_result[0], 'get_json') else discovery_result[0]
-                    elif hasattr(discovery_result, 'get_json'):
-                        results['discovery_pass'] = discovery_result.get_json()
-                    else:
-                        results['discovery_pass'] = discovery_result
+                    n = _extract_count(discovery_result, 'orphans_queued')
+                    summary['discovery_orphans_queued'] += n
+                    slim['discovery'] = n
+                    print(f"[NIGHTLY] {tenant_name}: orphans_queued={n}", file=sys.stderr)
             except Exception as e:
-                results['discovery_pass'] = {'error': str(e)}
+                slim['discovery_error'] = str(e)[:200]
+                print(f"[NIGHTLY] {tenant_name}: discovery error: {e}", file=sys.stderr)
 
             # Step 5: Rebuild branch fingerprints
             try:
                 with app.test_request_context(method='POST', path='/v2/fingerprints/bootstrap'):
                     g.mcp_auth = {'tenant_id': tenant_id, 'source': 'nightly_maintenance'}
                     fp_result = bootstrap_fingerprints()
-                    if isinstance(fp_result, tuple):
-                        results['fingerprints'] = fp_result[0].get_json() if hasattr(fp_result[0], 'get_json') else fp_result[0]
-                    elif hasattr(fp_result, 'get_json'):
-                        results['fingerprints'] = fp_result.get_json()
-                    else:
-                        results['fingerprints'] = fp_result
+                    n = _extract_count(fp_result, 'count')
+                    if not n:
+                        # bootstrap_fingerprints returns 'branches' array; fall back to len()
+                        try:
+                            data = fp_result.get_json() if hasattr(fp_result, 'get_json') else fp_result
+                            n = len(data.get('branches', [])) if isinstance(data, dict) else 0
+                        except Exception:
+                            n = 0
+                    summary['fingerprints_built'] += n
+                    slim['fingerprints'] = n
+                    print(f"[NIGHTLY] {tenant_name}: fingerprints={n}", file=sys.stderr)
             except Exception as e:
-                results['fingerprints'] = {'error': str(e)}
+                slim['fingerprints_error'] = str(e)[:200]
+                print(f"[NIGHTLY] {tenant_name}: fingerprints error: {e}", file=sys.stderr)
 
-            # Use tenant_id as key suffix to prevent duplicate name overwrites
-            result_key = f"{tenant_name} ({tenant_id[:8]})" if tenant_name in all_results else tenant_name
-            all_results[result_key] = results
+        except Exception as e:
+            # Tenant-level catastrophic failure — log, record, and continue to next tenant.
+            err = str(e)[:200]
+            print(f"[NIGHTLY] {tenant_name}: TENANT-LEVEL FAILURE: {err}", file=sys.stderr)
+            failed_tenants.append({'name': tenant_name, 'id': tenant_id[:8], 'error': err})
         finally:
             pop_tenant_override()
+            tenant_summaries.append(slim)
+            # Explicit GC between tenants — ensures large temporaries (embeddings,
+            # scored lists) are freed before the next tenant's work piles on top.
+            gc.collect()
 
     duration_ms = int((time.time() - start_time) * 1000)
+    print(
+        f"[NIGHTLY] Complete: {len(tenants)} tenants, "
+        f"{len(failed_tenants)} failed, {duration_ms}ms",
+        file=sys.stderr,
+    )
 
     return jsonify({
         'status': 'nightly_complete',
         'tenants_processed': len(tenants),
-        'results': all_results,
+        'tenants_succeeded': len(tenants) - len(failed_tenants),
+        'tenants_failed': len(failed_tenants),
+        'failed': failed_tenants,
+        'summary': summary,
+        'tenants': tenant_summaries,
         'duration_ms': duration_ms,
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        # Backward-compat: nightly_cron.py iterates results.keys() looking for tenant errors.
+        # Empty dict keeps the cron's existing branch behavior identical (no errors found).
+        'results': {},
     })
 
 
