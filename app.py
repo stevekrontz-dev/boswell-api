@@ -28,7 +28,7 @@ import numpy as np
 try:
     VERSION = open(os.path.join(os.path.dirname(__file__), 'VERSION')).read().strip()
 except Exception:
-    VERSION = '3.4.0'
+    VERSION = '3.7.0'
 
 # Anthropic for HyDE query expansion (opt-in)
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
