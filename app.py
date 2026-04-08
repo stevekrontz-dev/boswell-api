@@ -1060,21 +1060,26 @@ def check_novelty(embedding, branch, tenant_id):
 #       memory/task/transcript kept at 8KB, plan raised to 32KB, skill to 16KB
 #   2026-04-08 fix: memory cap REMOVED entirely. Steve's directive verbatim:
 #       "i dont like censorship. not even for disk space"
-#       The 8KB memory tripwire was rejecting legitimate session-end summaries
-#       (~9.7KB) within hours of being shipped. Boswell exists to preserve
-#       context — a rule that REJECTS context is hostile to that mission.
-#       A short failed memory loses 100% of value; a long preserved memory
-#       loses 0%. None means no cap, full stop.
+#   2026-04-08 (later, Fix 6 sprint): ALL CAPS REMOVED. The memory directive
+#       above generalized. Steve verbatim: "i think we should raise the cap.
+#       things are evolving larger just because of scope complexity. we dont
+#       want to hinder that." The 8KB transcript cap was rejecting CW chat
+#       captures from cw_capture.py (Fix 6) because real conversations are
+#       100KB+. The 32KB plan cap is approaching its ceiling on the librarian
+#       and Plan B work. Same principle the memory removal codified: a short
+#       failed write loses 100% of value, a long preserved write loses 0%.
+#       Boswell exists to preserve context — rejecting context for size is
+#       hostile to its mission. None means no cap, full stop, all types.
 #
-# See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
+# See: C:\\Users\\Steve\\.claude\\plans\\atomic-prancing-teacup.md (Fix 6)
 CONTENT_SIZE_CAPS = {
-    'memory': None,       # NO CAP — Steve's directive 2026-04-08, see history above
-    'plan': 32768,        # plans carry phases/tests/predecessor links — preserve verbatim
-    'skill': 16384,       # behavioral skills are prose-heavy and need room for examples
-    'task': 8192,         # tasks should be terse pointers to plans, not plans themselves
-    'transcript': 8192,   # transcripts are metadata pointers, not the content itself
+    'memory': None,       # NO CAP — Steve's directive 2026-04-08
+    'plan': None,         # NO CAP — extended 2026-04-08 (scope complexity growing)
+    'skill': None,        # NO CAP — extended 2026-04-08 (scope complexity growing)
+    'task': None,         # NO CAP — extended 2026-04-08 (scope complexity growing)
+    'transcript': None,   # NO CAP — extended 2026-04-08 (CW chat captures are 100KB+)
 }
-DEFAULT_CONTENT_SIZE_CAP = 8192  # unknown content_types get the tripwire by default
+DEFAULT_CONTENT_SIZE_CAP = None  # unknown content_types also uncapped — same principle
 
 
 def _screen_content(content, content_type: str = 'memory') -> tuple:
