@@ -3742,14 +3742,40 @@ def semantic_startup():
                 'done_count': done_count
             })
 
-        # Build landscape with health scores
-        for branch_name, plans in plans_by_branch.items():
-            total_tasks = sum(p['task_count'] for p in plans)
-            done_tasks = sum(p['done_count'] for p in plans)
+        # Query orphan task counts grouped by branch (tasks not linked to any plan).
+        # Orphans are legitimate by design — the MCP tool description tells callers to
+        # "omit plan_blob_hash for unorganized backlog tasks." But the prior metric
+        # ignored them entirely, undercounting branches with reactive/unplanned work.
+        cur.execute("""
+            SELECT branch,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE status = 'done') as done
+            FROM tasks
+            WHERE tenant_id = %s
+              AND plan_blob_hash IS NULL
+              AND status != 'deleted'
+              AND branch IS NOT NULL
+            GROUP BY branch
+        """, (get_tenant_id(),))
+        orphans_by_branch = {row['branch']: {'done': row['done'], 'total': row['total']} for row in cur.fetchall()}
+
+        # Build landscape with health scores: combine plan-linked + orphan tasks.
+        # Branches with only orphan tasks (no plans) now appear in the landscape too.
+        all_branches = set(plans_by_branch.keys()) | set(orphans_by_branch.keys())
+        for branch_name in all_branches:
+            plans = plans_by_branch.get(branch_name, [])
+            plan_total = sum(p['task_count'] for p in plans)
+            plan_done = sum(p['done_count'] for p in plans)
+            orphan_total = orphans_by_branch.get(branch_name, {}).get('total', 0)
+            orphan_done = orphans_by_branch.get(branch_name, {}).get('done', 0)
+            total_tasks = plan_total + orphan_total
+            done_tasks = plan_done + orphan_done
             health = f"{round(done_tasks / total_tasks * 100)}%" if total_tasks > 0 else "no tasks"
             work_landscape[branch_name] = {
                 'plans': plans,
-                'health': health
+                'health': health,
+                'plan_linked': {'done': plan_done, 'total': plan_total},
+                'orphans': {'done': orphan_done, 'total': orphan_total}
             }
 
         # Orphan backlog: tasks not under any plan
@@ -6332,15 +6358,56 @@ def work_landscape():
                 plans_by_branch[plan_branch] = []
             plans_by_branch[plan_branch].append(plan_entry)
 
-        # 2. Build landscape with health scores per branch
-        for branch_name, plans in plans_by_branch.items():
-            total_tasks = sum(p['task_count'] for p in plans)
-            done_tasks = sum(p['done_count'] for p in plans)
+        # Query orphan task counts grouped by branch (tasks not linked to any plan).
+        # Orphans are legitimate by design — the MCP tool description tells callers to
+        # "omit plan_blob_hash for unorganized backlog tasks." Including them in the
+        # health metric stops branches with reactive/unplanned work from showing 0%.
+        orphan_sql = """
+            SELECT branch,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE status = 'done') as done
+            FROM tasks
+            WHERE tenant_id = %s
+              AND plan_blob_hash IS NULL
+              AND status != 'deleted'
+              AND branch IS NOT NULL
+            GROUP BY branch
+        """
+        orphan_params = [tenant_id]
+        if filter_branch:
+            orphan_sql = """
+                SELECT branch,
+                       COUNT(*) as total,
+                       COUNT(*) FILTER (WHERE status = 'done') as done
+                FROM tasks
+                WHERE tenant_id = %s
+                  AND plan_blob_hash IS NULL
+                  AND status != 'deleted'
+                  AND LOWER(branch) = LOWER(%s)
+                GROUP BY branch
+            """
+            orphan_params.append(filter_branch)
+        cur.execute(orphan_sql, orphan_params)
+        orphans_by_branch = {row['branch']: {'done': row['done'], 'total': row['total']} for row in cur.fetchall()}
+
+        # 2. Build landscape with health scores per branch (plan-linked + orphan tasks).
+        # Branches with only orphan tasks (no plans) now appear in the landscape too.
+        all_branches = set(plans_by_branch.keys()) | set(orphans_by_branch.keys())
+        for branch_name in all_branches:
+            plans = plans_by_branch.get(branch_name, [])
+            plan_total = sum(p['task_count'] for p in plans)
+            plan_done = sum(p['done_count'] for p in plans)
+            orphan_total = orphans_by_branch.get(branch_name, {}).get('total', 0)
+            orphan_done = orphans_by_branch.get(branch_name, {}).get('done', 0)
+            total_tasks = plan_total + orphan_total
+            done_tasks = plan_done + orphan_done
             health = f"{round(done_tasks / total_tasks * 100)}%" if total_tasks > 0 else "no tasks"
 
             landscape[branch_name] = {
                 'plans': plans,
-                'health': health
+                'health': health,
+                'plan_linked': {'done': plan_done, 'total': plan_total},
+                'orphans': {'done': orphan_done, 'total': orphan_total}
             }
 
         # 3. Orphan backlog: tasks not under any plan
