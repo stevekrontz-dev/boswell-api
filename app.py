@@ -2175,6 +2175,39 @@ def _retrieve_cache_put(key: str, payload):
     _RETRIEVE_CACHE[key] = (time.time(), payload)
 
 
+# Plan B prerequisite: cross_references.source column for guard rail #1.
+# Auto-ensured on first /v2/commit_checked call (idempotent ALTER).
+# The standalone runner run_022_commit_agent_source_migration.py also adds
+# the partial index CONCURRENTLY for query performance.
+_commit_agent_schema_ensured = False
+
+
+def ensure_commit_agent_schema():
+    """Ensure cross_references.source column exists. Idempotent and fast."""
+    global _commit_agent_schema_ensured
+    if _commit_agent_schema_ensured:
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("""
+            ALTER TABLE cross_references
+                ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'manual';
+        """)
+        db.commit()
+        cur.close()
+        _commit_agent_schema_ensured = True
+        print("[STARTUP] cross_references.source column ensured", file=sys.stderr)
+    except Exception as e:
+        print(f"[STARTUP] commit agent schema check: {e}", file=sys.stderr)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # Don't retry on every request — the next deploy / manual runner can fix it
+        _commit_agent_schema_ensured = True
+
+
 def classify_retrieval_candidates(proposed_content: str, candidates: list) -> dict:
     """Plan A Phase 2 — single Haiku call to classify candidates by relationship.
 
