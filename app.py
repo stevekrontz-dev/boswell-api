@@ -9877,8 +9877,13 @@ def run_consolidation(_dry_run_override=None):
             # Architecture is ready: top-N candidates would be sent for LLM scoring
             pass
 
-        # Batch update all consolidation scores
-        if score_updates:
+        # Batch update all consolidation scores.
+        # SKIP in dry_run — fixes d9de6b2e: previously the score write ran before
+        # the dry_run guard at line 9896, so "preview" calls still mutated the
+        # candidates table and fed cleanup_candidates() the next night. See
+        # 6dd1673 ("dry_run parking brake wasn't neutral — 8 days of silent erosion").
+        # Callers can still inspect scores via the top_scores key in the response.
+        if score_updates and not dry_run:
             from psycopg2.extras import execute_values
             execute_values(cur, """
                 UPDATE candidate_memories AS cm
