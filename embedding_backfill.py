@@ -46,9 +46,12 @@ def main():
         duration = data.get('duration_ms', 0)
 
         total = blobs_filled + candidates_filled
-        if total > 0 or errors > 0:
-            print(f"[BACKFILL] {blobs_filled} blobs + {candidates_filled} candidates embedded in {duration}ms ({errors} errors)")
-        # Silent on zero work — runs every 5 min, usually nothing to do
+        # Fix 3: always log every cron run, regardless of work done.
+        # Sacred rule c36afb57: "NO SILENT FAILURES — exit 0 means success not silence,
+        # swallowed exceptions banned." The Mar 31 → Apr 4 2026 silent failure went
+        # 96 hours / 288 cron runs without anyone noticing because of the previous
+        # `if total > 0 or errors > 0` guard. Always log so Railway captures the run.
+        print(f"[BACKFILL] {blobs_filled} blobs + {candidates_filled} candidates embedded in {duration}ms ({errors} errors)")
 
         # Exit 0 unless errors outnumber successes during actual work.
         # Persistent bad blobs (e.g. empty content) shouldn't fail every run.

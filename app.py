@@ -746,6 +746,16 @@ def health_daemon():
     # Commit to health-status branch (best-effort)
     commit_result = commit_health_snapshot(snapshot)
 
+    # Fix 3: heartbeat for health_cron
+    hb_status = 'error' if overall_status == 'unhealthy' else 'ok'
+    write_heartbeat(
+        'health_cron',
+        hb_status,
+        f"overall={overall_status} checks_passed={summary['checks_passed']}/{summary['checks_total']} alerts_critical={critical_alerts}",
+        work_done=summary['checks_passed'],
+        expected_interval_minutes=5
+    )
+
     # Build response
     response = {
         'status': overall_status,
@@ -2217,6 +2227,95 @@ def ensure_commit_agent_schema():
             pass
         # Don't retry on every request — the next deploy / manual runner can fix it
         _commit_agent_schema_ensured = True
+
+
+# Migration 023: Cron heartbeats — silent-failure detection for Railway crons.
+# Embedding backfill cron silently produced zero embeddings for 96 hours
+# (Mar 31 → Apr 4 2026) before anyone noticed. This module + admin_alerts
+# Alert 6 makes that class of failure visible within 3x interval.
+_cron_heartbeats_schema_ensured = False
+
+
+def ensure_cron_heartbeats_schema():
+    """Ensure cron_heartbeats table exists. Idempotent and fast.
+
+    Called from each cron endpoint at the start of work. First call creates
+    the table; subsequent calls are no-ops via the cached flag. Failures are
+    logged loudly but never raise — the cron's actual work is more important
+    than the heartbeat surface.
+    """
+    global _cron_heartbeats_schema_ensured
+    if _cron_heartbeats_schema_ensured:
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cron_heartbeats (
+                service TEXT PRIMARY KEY,
+                last_run_at TIMESTAMPTZ NOT NULL,
+                last_status TEXT NOT NULL,
+                last_message TEXT,
+                work_done_count INT DEFAULT 0,
+                expected_interval_minutes INT NOT NULL DEFAULT 5
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cron_heartbeats_last_run
+                ON cron_heartbeats (last_run_at);
+        """)
+        db.commit()
+        cur.close()
+        _cron_heartbeats_schema_ensured = True
+        print("[STARTUP] cron_heartbeats table ensured", file=sys.stderr)
+    except Exception as e:
+        print(f"[STARTUP] cron_heartbeats schema check: {e}", file=sys.stderr)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # Don't retry on every request — the next deploy / manual runner can fix it
+        _cron_heartbeats_schema_ensured = True
+
+
+def write_heartbeat(service: str, status: str, message: str = None,
+                    work_done: int = 0, expected_interval_minutes: int = 5):
+    """Write or update a cron heartbeat row for the given service.
+
+    status must be one of: 'ok' | 'no_work' | 'error'.
+    Always writes — silent or noisy work both produce a heartbeat row, which
+    is the whole point of Fix 3. Loud-failure on the heartbeat write itself
+    (so a broken heartbeat doesn't pretend to be a healthy cron), but never
+    raises into the caller's transaction.
+
+    Plan source: atomic-prancing-teacup.md, Fix 3.
+    """
+    try:
+        ensure_cron_heartbeats_schema()
+        cur = get_cursor()
+        cur.execute("""
+            INSERT INTO cron_heartbeats
+                (service, last_run_at, last_status, last_message, work_done_count, expected_interval_minutes)
+            VALUES (%s, NOW(), %s, %s, %s, %s)
+            ON CONFLICT (service) DO UPDATE SET
+                last_run_at = EXCLUDED.last_run_at,
+                last_status = EXCLUDED.last_status,
+                last_message = EXCLUDED.last_message,
+                work_done_count = EXCLUDED.work_done_count,
+                expected_interval_minutes = EXCLUDED.expected_interval_minutes
+        """, (service, status, message, work_done, expected_interval_minutes))
+        get_db().commit()
+        cur.close()
+    except Exception as e:
+        # Loud failure on heartbeat write — but never raise into the caller.
+        # A broken heartbeat is a separate problem from a broken cron, and we
+        # don't want to take down the cron's actual work because the heartbeat
+        # path is broken.
+        print(f"[HEARTBEAT] Failed to write heartbeat for service={service}: {e}", file=sys.stderr)
+        try:
+            get_db().rollback()
+        except Exception:
+            pass
 
 
 def classify_retrieval_candidates(proposed_content: str, candidates: list) -> dict:
@@ -5265,6 +5364,19 @@ def backfill_embeddings():
     cur.close()
 
     duration_ms = int((time.time() - start_time) * 1000)
+
+    # Fix 3: write cron heartbeat — always, regardless of work done.
+    # No-work runs still produce a heartbeat so admin_alerts can distinguish
+    # "running but idle" from "silent for hours" (the Mar 31 → Apr 4 failure mode).
+    total_work = blobs_filled + candidates_filled
+    if errors_count > 0 and total_work == 0:
+        hb_status = 'error'
+    elif total_work > 0:
+        hb_status = 'ok'
+    else:
+        hb_status = 'no_work'
+    hb_msg = f"blobs={blobs_filled} candidates={candidates_filled} errors={errors_count} duration_ms={duration_ms}"
+    write_heartbeat('embedding_backfill', hb_status, hb_msg, total_work, expected_interval_minutes=5)
 
     response = {
         'status': 'completed',
@@ -8744,6 +8856,25 @@ def immune_patrol():
         'duration_seconds': results['duration_seconds']
     })
 
+    # Fix 3: heartbeat for immune patrol cron (daily ≈ 1440 min interval)
+    routes_done = len(results['routes_checked'])
+    findings_count = len(results['findings'])
+    quarantined_count = len(results['quarantined'])
+    errors_count = len(results['errors'])
+    if errors_count > 0 and routes_done == 0:
+        hb_status = 'error'
+    elif routes_done > 0:
+        hb_status = 'ok'
+    else:
+        hb_status = 'no_work'
+    write_heartbeat(
+        'immune_patrol',
+        hb_status,
+        f"routes={routes_done} findings={findings_count} quarantined={quarantined_count} errors={errors_count} duration_s={results['duration_seconds']}",
+        work_done=routes_done,
+        expected_interval_minutes=1440
+    )
+
     return jsonify(results)
 
 
@@ -10488,6 +10619,22 @@ def nightly_maintenance():
         f"[NIGHTLY] Complete: {len(tenants)} tenants, "
         f"{len(failed_tenants)} failed, {duration_ms}ms",
         file=sys.stderr,
+    )
+
+    # Fix 3: heartbeat for nightly_maintenance cron (daily ≈ 1440 min interval)
+    tenants_succeeded = len(tenants) - len(failed_tenants)
+    if len(failed_tenants) > 0 and tenants_succeeded == 0:
+        hb_status = 'error'
+    elif tenants_succeeded > 0:
+        hb_status = 'ok'
+    else:
+        hb_status = 'no_work'
+    write_heartbeat(
+        'nightly_maintenance',
+        hb_status,
+        f"tenants={tenants_succeeded}/{len(tenants)} trails={summary['trails_decayed']} discovery={summary['discovery_orphans_queued']} fingerprints={summary['fingerprints_built']} duration_ms={duration_ms}",
+        work_done=tenants_succeeded,
+        expected_interval_minutes=1440
     )
 
     return jsonify({
