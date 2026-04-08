@@ -1841,6 +1841,15 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
     if depth == 'silt':
         candidate_statuses = "('active', 'cooling', 'silt')"
 
+    # Fix 2-lite: also match commits whose MESSAGE contains the query string.
+    # The BM25 trigger at db/migrations/017_hybrid_search.sql:14-29 only indexes
+    # blob CONTENT, not commits.message. So a commit whose insight lives only in
+    # the message column (e.g. "SHIPPED: Messages drawer header-anchored drawers")
+    # was unfindable in keyword mode. ILIKE is sub-second on Steve's corpus and
+    # the librarian replaces this whole composition once it ships.
+    # Plan: atomic-prancing-teacup.md (Fix 2-lite)
+    ilike_pattern = f"%{query}%"
+
     if HIPPOCAMPAL_ENABLED:
         cur.execute(f"""
             SELECT * FROM (
@@ -1854,8 +1863,10 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
                 LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
                 WHERE b.tenant_id = %s
                   AND dc.commit_hash IS NULL
-                  AND b.search_vector IS NOT NULL
-                  AND b.search_vector @@ plainto_tsquery('english', %s)
+                  AND (
+                      (b.search_vector IS NOT NULL AND b.search_vector @@ plainto_tsquery('english', %s))
+                      OR (c.message IS NOT NULL AND c.message ILIKE %s)
+                  )
                   {silt_filter}
 
                 UNION ALL
@@ -1877,7 +1888,7 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
             ) combined
             ORDER BY rank DESC
             LIMIT %s
-        """, (query, tenant_id, query, query, tenant_id, query, limit))
+        """, (query, tenant_id, query, ilike_pattern, query, tenant_id, query, limit))
     else:
         cur.execute("""
             SELECT DISTINCT b.blob_hash, b.content, b.content_type, b.created_at,
@@ -1890,11 +1901,13 @@ def bm25_search(cur, query, tenant_id, limit=20, depth='surface'):
             LEFT JOIN deprecated_commits dc ON c.commit_hash = dc.commit_hash
             WHERE b.tenant_id = %s
               AND dc.commit_hash IS NULL
-              AND b.search_vector IS NOT NULL
-              AND b.search_vector @@ plainto_tsquery('english', %s)
+              AND (
+                  (b.search_vector IS NOT NULL AND b.search_vector @@ plainto_tsquery('english', %s))
+                  OR (c.message IS NOT NULL AND c.message ILIKE %s)
+              )
             ORDER BY rank DESC
             LIMIT %s
-        """, (query, tenant_id, query, limit))
+        """, (query, tenant_id, query, ilike_pattern, limit))
 
     results = []
     for row in cur.fetchall():
