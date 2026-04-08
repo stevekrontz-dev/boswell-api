@@ -2279,10 +2279,18 @@ def classify_retrieval_candidates(proposed_content: str, candidates: list) -> di
     )
 
     try:
+        # temperature=0 for determinism — empirically verified 2026-04-08:
+        # without it, per-candidate verdicts at borderline confidence drift
+        # run-to-run (e.g., 818eb823 toggling between related_but_distinct
+        # and unrelated across 3 sequential calls). Top-level decisions are
+        # stable but sub-decisions affect Plan B's auto-supersession at
+        # confidence ≥ 0.90, which would create different links on different
+        # runs for the same input. Determinism is the bug fix.
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2000,
             timeout=30,
+            temperature=0.0,
             messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
