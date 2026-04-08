@@ -6071,6 +6071,38 @@ def admin_alerts():
                 'details': {'p95_ms': round(p95_row['p95'], 1)}
             })
 
+        # Alert 6: Cron heartbeat stale — any cron silent past 3x its expected interval.
+        # Closes Boswell open task 9fd4cd44 and surfaces the failure mode that hit
+        # Mar 31 → Apr 4 2026 (embedding backfill silently produced zero embeddings
+        # for 96 hours straight). Wrapped in its own try/except so a missing table
+        # (edge case: admin_alerts called before any cron has fired post-deploy)
+        # doesn't break the other 5 alerts.
+        # Plan source: atomic-prancing-teacup.md (Fix 4)
+        try:
+            cur.execute('''
+                SELECT service, last_run_at, expected_interval_minutes,
+                       EXTRACT(EPOCH FROM (NOW() - last_run_at)) / 60 AS minutes_silent
+                FROM cron_heartbeats
+                WHERE NOW() - last_run_at > (expected_interval_minutes * 3) * INTERVAL '1 minute'
+                ORDER BY minutes_silent DESC
+            ''')
+            for row in cur.fetchall():
+                alerts.append({
+                    'severity': 'critical',
+                    'type': 'cron_silent',
+                    'message': f"Cron '{row['service']}' silent for {int(row['minutes_silent'])} min (expected every {row['expected_interval_minutes']} min)",
+                    'details': {
+                        'service': row['service'],
+                        'last_run_at': str(row['last_run_at']),
+                        'minutes_silent': int(row['minutes_silent']),
+                        'expected_interval_minutes': row['expected_interval_minutes'],
+                    }
+                })
+        except Exception as e:
+            # Don't break the other alerts if cron_heartbeats doesn't exist yet.
+            # Log loudly per sacred rule c36afb57.
+            print(f"[ALERT-6] cron_heartbeats query failed (table may not exist yet): {e}", file=sys.stderr)
+
         cur.close()
 
         # Sort by severity
