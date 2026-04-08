@@ -1043,11 +1043,26 @@ def check_novelty(embedding, branch, tenant_id):
         return {'novelty_score': 1.0, 'is_novel': True}
 
 
-def _screen_content(content) -> tuple:
+# Per-content-type write screening caps (amendment 307a4bae, 2026-04-07).
+# Replaces v3.5.0's flat 8KB tripwire with per-type limits. The tripwire
+# stays for content_types where "big = mistake" is still true; relaxes for
+# content_types where "big = real structure" (plans, skills).
+# See: C:\\Users\\Steve\\.claude\\plans\\keen-watching-kettle.md
+CONTENT_SIZE_CAPS = {
+    'memory': 8192,       # tripwire stays — if a memory needs more, it's two memories
+    'plan': 32768,        # plans carry phases/tests/predecessor links — preserve verbatim
+    'skill': 16384,       # behavioral skills are prose-heavy and need room for examples
+    'task': 8192,         # tasks should be terse pointers to plans, not plans themselves
+    'transcript': 8192,   # transcripts are metadata pointers, not the content itself
+}
+DEFAULT_CONTENT_SIZE_CAP = 8192  # unknown content_types get the tripwire
+
+
+def _screen_content(content, content_type: str = 'memory') -> tuple:
     """Write screening gate — structural validation only.
 
     Returns (error_response, status_code) if rejected, or (None, None) if OK.
-    Checks: JSON structure, empty content, bare primitives, size limit (8KB).
+    Checks: JSON structure, empty content, bare primitives, per-content-type size cap.
     """
     # Must be a dict or list (no bare primitives)
     if not isinstance(content, (dict, list)):
@@ -1063,14 +1078,16 @@ def _screen_content(content) -> tuple:
     if isinstance(content, list) and len(content) == 0:
         return jsonify({'error': 'Content cannot be an empty array'}), 400
 
-    # Size limit: 8KB
-    content_str = json.dumps(content)
-    if len(content_str.encode('utf-8')) > 8192:
-        size_kb = len(content_str.encode('utf-8')) / 1024
+    # Per-content-type size cap (amendment 307a4bae)
+    cap = CONTENT_SIZE_CAPS.get(content_type, DEFAULT_CONTENT_SIZE_CAP)
+    content_bytes = len(json.dumps(content).encode('utf-8'))
+    if content_bytes > cap:
         return jsonify({
-            'error': f'Content too large ({size_kb:.1f}KB). Maximum is 8KB.',
-            'size_bytes': len(content_str.encode('utf-8')),
-            'limit_bytes': 8192
+            'error': f'Content too large ({content_bytes / 1024:.1f}KB). '
+                     f'Maximum for content_type={content_type!r} is {cap // 1024}KB.',
+            'size_bytes': content_bytes,
+            'limit_bytes': cap,
+            'content_type': content_type,
         }), 413
 
     return None, None
@@ -1090,8 +1107,8 @@ def create_commit():
     if not content:
         return jsonify({'error': 'Content required'}), 400
 
-    # Write screening gate (v3.5.0)
-    screen_error, screen_status = _screen_content(content)
+    # Write screening gate (v3.5.0 + amendment 307a4bae per-content-type caps)
+    screen_error, screen_status = _screen_content(content, content_type=memory_type)
     if screen_error:
         return screen_error, screen_status
 
