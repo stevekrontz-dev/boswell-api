@@ -2132,6 +2132,48 @@ RETRIEVAL_RECOMMENDED_ACTIONS = (
     'write_as_new',
 )
 
+# Plan A Phase 4: LRU cache for /v2/retrieve responses.
+# Bypassed when purpose=commit_check — the dedup case must always be fresh.
+# Cache only matters for purpose=question and purpose=context_assembly, which
+# tolerate 1-hour staleness. Per-worker (gunicorn workers don't share state),
+# best-effort, capped at 100 entries to bound memory.
+_RETRIEVE_CACHE = {}  # {key: (timestamp, payload_dict)}
+_RETRIEVE_CACHE_MAX = 100
+_RETRIEVE_CACHE_TTL_SECONDS = 3600  # 1 hour
+
+
+def _retrieve_cache_key(content: str, branch_hint, tenant_id: str, purpose: str) -> str:
+    """SHA-256 hash of (content + branch_hint + tenant_id + purpose).
+    Purpose included so question vs context_assembly don't collide on same content."""
+    import hashlib
+    h = hashlib.sha256()
+    for piece in (content or '', branch_hint or '', tenant_id or '', purpose or ''):
+        h.update(piece.encode('utf-8'))
+        h.update(b'\x00')
+    return h.hexdigest()
+
+
+def _retrieve_cache_get(key: str):
+    entry = _RETRIEVE_CACHE.get(key)
+    if not entry:
+        return None
+    ts, payload = entry
+    if time.time() - ts > _RETRIEVE_CACHE_TTL_SECONDS:
+        _RETRIEVE_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _retrieve_cache_put(key: str, payload):
+    if len(_RETRIEVE_CACHE) >= _RETRIEVE_CACHE_MAX:
+        # FIFO eviction by timestamp — good enough for this use case
+        try:
+            oldest_key = min(_RETRIEVE_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _RETRIEVE_CACHE.pop(oldest_key, None)
+        except ValueError:
+            pass
+    _RETRIEVE_CACHE[key] = (time.time(), payload)
+
 
 def classify_retrieval_candidates(proposed_content: str, candidates: list) -> dict:
     """Plan A Phase 2 — single Haiku call to classify candidates by relationship.
@@ -2313,8 +2355,20 @@ def retrieve_with_verdicts():
     if HIPPOCAMPAL_ENABLED:
         ensure_hippocampal_tables()
 
-    cur = get_cursor()
     tenant_id = get_tenant_id()
+
+    # Phase 4: cache check (bypassed for commit_check — always fresh for dedup)
+    cache_key = None
+    if purpose != 'commit_check' and not skip_classification:
+        cache_key = _retrieve_cache_key(content, branch_hint, tenant_id, purpose)
+        cached_payload = _retrieve_cache_get(cache_key)
+        if cached_payload is not None:
+            # Return a shallow copy with cache marker so callers can tell
+            response = dict(cached_payload)
+            response['cached'] = True
+            return jsonify(response)
+
+    cur = get_cursor()
     fetch_mult = 4 if branch_hint else 2
 
     # Run hybrid search (mirrors search_memories hybrid mode)
@@ -2437,10 +2491,16 @@ def retrieve_with_verdicts():
         'branch_hint': branch_hint,
         'verdicts': response_candidates,
         'summary': summary,
+        'cached': False,
     }
     if classification is not None and classification.get('error'):
         response_payload['classification_error'] = classification['error']
         response_payload['phase'] = '1-passthrough-fallback'
+
+    # Phase 4: cache successful classified responses (never cache errors or
+    # commit_check responses — cache_key is None in those cases)
+    if cache_key is not None and classification is not None and not classification.get('error'):
+        _retrieve_cache_put(cache_key, response_payload)
 
     return jsonify(response_payload)
 
