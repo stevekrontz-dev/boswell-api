@@ -2117,32 +2117,180 @@ def search_memories():
     return jsonify({'query': query, 'mode': mode, 'results': results, 'count': len(results)})
 
 
+RETRIEVAL_VERDICT_TYPES = (
+    'duplicate',
+    'near_duplicate',
+    'supersedable_predecessor',
+    'related_but_distinct',
+    'unrelated',
+)
+
+RETRIEVAL_RECOMMENDED_ACTIONS = (
+    'refuse_as_duplicate',
+    'write_with_supersession_link',
+    'write_with_relationship_link',
+    'write_as_new',
+)
+
+
+def classify_retrieval_candidates(proposed_content: str, candidates: list) -> dict:
+    """Plan A Phase 2 — single Haiku call to classify candidates by relationship.
+
+    Args:
+        proposed_content: the text being checked for prior work
+        candidates: list of dicts with {blob_hash, content, message, cosine}
+
+    Returns:
+        dict with:
+            verdicts: {blob_hash: {verdict_type, confidence, rationale}}
+            recommended_action: one of RETRIEVAL_RECOMMENDED_ACTIONS
+            error: str or None
+
+    Falls back to {verdicts: {}, recommended_action: 'write_as_new', error: ...}
+    on any failure (Haiku down, malformed JSON, missing API key) — loud failure
+    via stderr, never silent.
+
+    Plan: bf298d68 (Boswell), Phase 2 of Plan A
+    """
+    client = get_anthropic_client()
+    if not client:
+        return {'verdicts': {}, 'recommended_action': 'write_as_new',
+                'error': 'anthropic_client_unavailable'}
+    if not candidates:
+        return {'verdicts': {}, 'recommended_action': 'write_as_new', 'error': None}
+
+    # Build indexed candidate block for the prompt. Truncate content to keep
+    # input tokens bounded — 400 chars per candidate × 25 max = 10KB max input.
+    cand_block_lines = []
+    for i, c in enumerate(candidates):
+        msg = (c.get('message') or '')[:120]
+        content_preview = (c.get('content') or '')[:400]
+        cosine = c.get('cosine')
+        cand_block_lines.append(
+            f"[{i}] cosine={cosine} message=\"{msg}\"\n    content: {content_preview}"
+        )
+    candidates_text = '\n\n'.join(cand_block_lines)
+
+    prompt = (
+        "You are the Boswell Retrieval Agent. Given a proposed piece of content "
+        "and a list of candidate prior memories, classify each candidate's "
+        "relationship to the proposed content.\n\n"
+        "Use exactly one of: duplicate, near_duplicate, supersedable_predecessor, "
+        "related_but_distinct, unrelated.\n\n"
+        "Definitions:\n"
+        "- duplicate: same claim, same framing — restatement of existing content\n"
+        "- near_duplicate: same claim, different framing — equivalent meaning\n"
+        "- supersedable_predecessor: older work that the new content broadens, "
+        "sharpens, or corrects\n"
+        "- related_but_distinct: same domain, distinct claim — useful context, "
+        "not a write conflict\n"
+        "- unrelated: surfaced by search but not actually relevant on judgment\n\n"
+        "Be strict — when in doubt between duplicate and near_duplicate, choose "
+        "duplicate. When in doubt between supersedable_predecessor and "
+        "related_but_distinct, choose supersedable_predecessor.\n\n"
+        f"PROPOSED CONTENT:\n{proposed_content[:2000]}\n\n"
+        f"CANDIDATES:\n{candidates_text}\n\n"
+        "Respond with ONLY a JSON object (no markdown fence, no commentary) "
+        "in this exact shape:\n"
+        '{\n'
+        '  "verdicts": [\n'
+        '    {"index": 0, "verdict_type": "duplicate", "confidence": 0.95, "rationale": "..."},\n'
+        '    {"index": 1, "verdict_type": "unrelated", "confidence": 0.8, "rationale": "..."}\n'
+        '  ],\n'
+        '  "recommended_action": "refuse_as_duplicate"\n'
+        '}\n\n'
+        'recommended_action must be one of: refuse_as_duplicate, '
+        'write_with_supersession_link, write_with_relationship_link, write_as_new.'
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2000,
+            timeout=30,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        # Strip markdown fence if Haiku ignored instructions and added one
+        if text.startswith('```'):
+            lines = text.split('\n')
+            if lines[-1].strip() == '```':
+                lines = lines[:-1]
+            if lines[0].startswith('```'):
+                lines = lines[1:]
+            text = '\n'.join(lines).strip()
+
+        parsed = json.loads(text)
+
+        verdicts_by_hash = {}
+        for v in parsed.get('verdicts', []):
+            try:
+                idx = int(v.get('index'))
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(candidates):
+                continue
+            vtype = v.get('verdict_type', 'unrelated')
+            if vtype not in RETRIEVAL_VERDICT_TYPES:
+                vtype = 'unrelated'
+            try:
+                confidence = float(v.get('confidence', 0.5))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            confidence = max(0.0, min(1.0, confidence))
+            blob_hash = candidates[idx].get('blob_hash')
+            if blob_hash:
+                verdicts_by_hash[blob_hash] = {
+                    'verdict_type': vtype,
+                    'confidence': round(confidence, 4),
+                    'rationale': str(v.get('rationale', ''))[:300],
+                }
+
+        recommended = parsed.get('recommended_action', 'write_as_new')
+        if recommended not in RETRIEVAL_RECOMMENDED_ACTIONS:
+            recommended = 'write_as_new'
+
+        return {
+            'verdicts': verdicts_by_hash,
+            'recommended_action': recommended,
+            'error': None,
+        }
+    except Exception as e:
+        # Loud failure, never silent (per sacred-five #5)
+        print(f"[RETRIEVE] Haiku classification error: {e}", file=sys.stderr)
+        return {
+            'verdicts': {},
+            'recommended_action': 'write_as_new',
+            'error': str(e)[:200],
+        }
+
+
 @app.route('/v2/retrieve', methods=['POST'])
 def retrieve_with_verdicts():
     """Retrieval Agent v1.0 — Plan A from CC/CW argue 2026-04-07.
 
     Pre-commit semantic dedup judgment layer. Wraps the existing hybrid search
     (BM25 + pgvector + RRF + supersession-aware rerank), filters to cosine ≥ 0.70,
-    and bands candidates into high/mid for downstream classification.
+    bands candidates into high/mid, and (Phase 2) calls Haiku to classify each
+    candidate into one of 5 verdict types.
 
-    PHASE STATUS: Phase 1 — passthrough stub. Returns banded candidates without
-    Haiku classification. Phase 2 will add classify_retrieval_candidates() to
-    produce the 5 verdict types (duplicate, near_duplicate, supersedable_predecessor,
-    related_but_distinct, unrelated).
+    PHASE STATUS: Phase 2 — Haiku classification live. Falls back to Phase 1
+    passthrough behavior if the Anthropic client is unavailable.
 
     POST body:
         content (str, required) — text to check for prior work
         branch_hint (str, optional) — narrows post-search filtering to a branch
         purpose (str, optional) — commit_check | question | context_assembly | other
         limit (int, optional) — max candidates to return (default 10, max 25)
+        skip_classification (bool, optional) — bypass Haiku, return Phase 1 shape
 
     Response:
         verdicts: array of {blob_hash, commit_hash, message, content_type,
-                            cosine, band, source}
-        summary: counts by band
-        phase: "1-passthrough"
+                            cosine, band, source, verdict_type, confidence, rationale}
+        summary: counts by band AND by verdict_type, plus recommended_action
+        phase: "2-haiku-classified" or "1-passthrough"
 
-    KNOWN GAP (Phase 2 future work): cosine 0.50-0.70 mid-band has no guardian.
+    KNOWN GAP (future work): cosine 0.50-0.70 mid-band has no guardian.
     Patrol covers 0.05-0.50 (contradiction band); this endpoint covers 0.70+.
     The 0.50-0.70 strip is uncovered. Probably fine in practice (most real
     near-dupes are >0.85), but worth a note for future maintainers.
@@ -2153,6 +2301,7 @@ def retrieve_with_verdicts():
     content = (data.get('content') or '').strip()
     branch_hint = data.get('branch_hint')
     purpose = data.get('purpose', 'commit_check')
+    skip_classification = bool(data.get('skip_classification', False))
     try:
         limit = min(int(data.get('limit', 10)), 25)
     except (TypeError, ValueError):
@@ -2202,11 +2351,15 @@ def retrieve_with_verdicts():
     # pgvector cosine distance: 0 = identical, 1 = orthogonal.
     #   distance ≤ 0.15 → cosine similarity ≥ 0.85 (high band)
     #   0.15 < distance ≤ 0.30 → 0.70 ≤ cosine < 0.85 (mid band)
-    candidates = []
+    #
+    # Build TWO parallel structures:
+    #   internal_candidates — has content (passed to Haiku classifier)
+    #   response_candidates — slim, no content (returned to caller)
+    internal_candidates = []
+    response_candidates = []
     for r in reranked:
         distance = r.get('distance')
         if distance is None:
-            # BM25-only hit (no embedding distance computed) — include but mark
             band = 'bm25_only'
             cosine = None
         else:
@@ -2218,38 +2371,78 @@ def retrieve_with_verdicts():
                 continue
             band = 'high' if cosine >= 0.85 else 'mid'
 
-        candidates.append({
-            'blob_hash': r.get('blob_hash'),
+        blob_hash = r.get('blob_hash')
+        internal_candidates.append({
+            'blob_hash': blob_hash,
+            'message': r.get('message'),
+            'content': r.get('content'),  # for the Haiku classifier
+            'cosine': cosine,
+        })
+        response_candidates.append({
+            'blob_hash': blob_hash,
             'commit_hash': r.get('commit_hash'),
             'message': r.get('message'),
             'content_type': r.get('content_type'),
             'cosine': cosine,
             'band': band,
             'source': r.get('source'),
-            # Phase 2 will add: verdict_type, rationale (from Haiku batch call)
+            # verdict_type / confidence / rationale filled in below if Haiku is live
         })
-        if len(candidates) >= limit:
+        if len(response_candidates) >= limit:
             break
 
     cur.close()
 
+    # Phase 2: call Haiku to classify candidates by relationship.
+    # Skip if explicitly requested OR if there are no candidates to classify.
+    classification = None
+    if not skip_classification and internal_candidates:
+        classification = classify_retrieval_candidates(content, internal_candidates)
+        # Merge verdicts back into the response candidates
+        verdicts_map = classification.get('verdicts', {})
+        for cand in response_candidates:
+            v = verdicts_map.get(cand['blob_hash'])
+            if v:
+                cand['verdict_type'] = v['verdict_type']
+                cand['confidence'] = v['confidence']
+                cand['rationale'] = v['rationale']
+            else:
+                # Haiku didn't return a verdict for this candidate (truncation,
+                # parse failure, etc.) — mark as unclassified, never silently 'unrelated'
+                cand['verdict_type'] = 'unclassified'
+                cand['confidence'] = None
+                cand['rationale'] = None
+
+    # Build summary — counts by band, and (if classified) counts by verdict_type
     summary = {
-        'high_count': sum(1 for c in candidates if c['band'] == 'high'),
-        'mid_count': sum(1 for c in candidates if c['band'] == 'mid'),
-        'bm25_only_count': sum(1 for c in candidates if c['band'] == 'bm25_only'),
-        'total_count': len(candidates),
-        # Phase 2 will add: duplicate_count, near_duplicate_count,
-        # supersedable_count, related_count, recommended_action
+        'high_count': sum(1 for c in response_candidates if c['band'] == 'high'),
+        'mid_count': sum(1 for c in response_candidates if c['band'] == 'mid'),
+        'bm25_only_count': sum(1 for c in response_candidates if c['band'] == 'bm25_only'),
+        'total_count': len(response_candidates),
     }
 
-    return jsonify({
-        'phase': '1-passthrough',
+    if classification is not None:
+        for vt in RETRIEVAL_VERDICT_TYPES:
+            summary[f'{vt}_count'] = sum(
+                1 for c in response_candidates if c.get('verdict_type') == vt
+            )
+        summary['unclassified_count'] = sum(
+            1 for c in response_candidates if c.get('verdict_type') == 'unclassified'
+        )
+        summary['recommended_action'] = classification.get('recommended_action', 'write_as_new')
+
+    response_payload = {
+        'phase': '2-haiku-classified' if classification is not None else '1-passthrough',
         'purpose': purpose,
         'branch_hint': branch_hint,
-        'verdicts': candidates,
+        'verdicts': response_candidates,
         'summary': summary,
-        'note': 'Phase 1 stub — banded candidates only. Phase 2 will add Haiku verdict_type per candidate.',
-    })
+    }
+    if classification is not None and classification.get('error'):
+        response_payload['classification_error'] = classification['error']
+        response_payload['phase'] = '1-passthrough-fallback'
+
+    return jsonify(response_payload)
 
 
 @app.route('/v2/semantic-search', methods=['GET'])
