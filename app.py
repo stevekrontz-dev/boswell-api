@@ -8802,7 +8802,18 @@ PATROL_ROUTES = [
     {'name': 'CENTROID_DRIFT', 'detector': patrol_centroid_drift},
     {'name': 'ORPHAN_BLOB', 'detector': patrol_orphan_blobs},
     {'name': 'BROKEN_LINK', 'detector': patrol_broken_links},
-    {'name': 'ISOLATED_CLUSTER', 'detector': patrol_isolated_clusters},
+    # DISABLED 2026-04-09 — ISOLATED_CLUSTER rule is structurally broken.
+    # The detector treats "no trails or cross-references" as anomalous, but
+    # trails in Boswell are EMERGENT (form by traversal, strengthen by use,
+    # decay by neglect). New memories have zero trails by definition; sparse
+    # personal memories have zero trails by definition. The first run after
+    # the immune-patrol-cron service was repaired quarantined 4294 commits
+    # this way — including 4 SACRED commits, 20+ BIOGRAPHY commits, the
+    # active sprint output, and session_summary commits written seconds
+    # before the patrol scanned them. See finding 9e239db6 on boswell branch
+    # and atomic-prancing-teacup.md → POST-CLOSEOUT RC-9 for details.
+    # Replacement rule shape filed for librarian plan.
+    # {'name': 'ISOLATED_CLUSTER', 'detector': patrol_isolated_clusters},
     {'name': 'DUPLICATE_EMBEDDING', 'detector': patrol_duplicate_embeddings},
     {'name': 'STALE_CHECKPOINT', 'detector': patrol_stale_checkpoints},
     {'name': 'CONTRADICTION', 'detector': patrol_contradictions},
