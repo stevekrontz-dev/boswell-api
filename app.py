@@ -5927,6 +5927,54 @@ def admin_tenant_detail(tenant_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/admin/tenants/<tenant_id>', methods=['PATCH'])
+@require_admin
+def admin_tenant_patch(tenant_id):
+    """
+    Rename a tenant (and only rename — nothing else is mutable here).
+
+    Fixes the F6/audit-da6c20a2 footgun where user-owned signups produce
+    tenant.name = admin email (e.g. "admin@tintatlanta.com") that later needs
+    to become a real org label (e.g. "Tint Atlanta"). This is the controlled
+    path — audit-logged, admin-gated, rejects blanks and length-bounded.
+
+    Request body: {"name": "Tint Atlanta"}
+    Returns: {"tenant_id": "...", "name": "Tint Atlanta", "previous_name": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get('name') or '').strip()
+    if not new_name:
+        return jsonify({'error': 'name is required'}), 400
+    if len(new_name) < 2 or len(new_name) > 120:
+        return jsonify({'error': 'name must be 2-120 characters'}), 400
+
+    db = get_db()
+    cur = get_cursor()
+    try:
+        cur.execute('SELECT name FROM tenants WHERE id = %s', (tenant_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({'error': 'Tenant not found'}), 404
+        previous_name = row['name']
+
+        cur.execute(
+            'UPDATE tenants SET name = %s WHERE id = %s',
+            (new_name, tenant_id)
+        )
+        db.commit()
+        print(f"[ADMIN] Renamed tenant {tenant_id}: {previous_name!r} -> {new_name!r}", flush=True)
+        return jsonify({
+            'tenant_id': tenant_id,
+            'name': new_name,
+            'previous_name': previous_name,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+
+
 @app.route('/v2/admin/create-tenant', methods=['POST'])
 @require_admin
 def admin_create_tenant():
