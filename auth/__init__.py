@@ -273,6 +273,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
             or request.path.startswith('/party')
             or request.path.startswith('/assets/')
             or request.path.startswith('/oauth/')
+            or request.path.startswith('/signup/')  # F4: public GitHub signup (askboswell.com)
             or static_ext in ('svg', 'png', 'ico', 'json', 'js', 'css', 'woff', 'woff2', 'ttf')):
         return None
 

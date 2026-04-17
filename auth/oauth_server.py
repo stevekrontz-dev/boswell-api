@@ -271,6 +271,58 @@ def init_oauth(get_db, get_cursor):
     def authorize_get():
         return _render_login(dict(request.args))
 
+    @oauth_bp.route('/signup/github/start', methods=['GET'])
+    def signup_github_start():
+        """F4: kick off GitHub OAuth for the public askboswell.com signup modal.
+
+        Differs from /oauth/authorize in that there is no MCP client context:
+        no redirect_uri, no client_id, no PKCE challenge. The callback at
+        /oauth/callback/github notices state['signup']=True, provisions the
+        account if needed, mints a session JWT, and redirects to `return_to`
+        (or /dashboard) with the token in the URL fragment.
+
+        Query params:
+          return_to (optional): URL to land on after signup. Defaults to
+                                the dashboard at this origin. Must be https
+                                and on an allowlisted host (askboswell.com,
+                                this origin, or localhost for dev).
+          invite_code (optional): threaded through for pro-plan party beta.
+        """
+        if not GITHUB_CLIENT_ID:
+            return make_response('GitHub OAuth is not configured on this server.', 503)
+
+        return_to = (request.args.get('return_to') or '').strip()
+        if return_to:
+            try:
+                parsed = urlparse(return_to)
+            except Exception:
+                parsed = None
+            allowed_hosts = {'askboswell.com', 'www.askboswell.com', 'localhost', '127.0.0.1'}
+            try:
+                own_host = urlparse(_get_base_url()).hostname
+            except Exception:
+                own_host = None
+            if own_host:
+                allowed_hosts.add(own_host)
+            host_ok = parsed and parsed.hostname in allowed_hosts
+            scheme_ok = parsed and parsed.scheme in ('https', 'http' if parsed.hostname in ('localhost', '127.0.0.1') else 'https')
+            if not (parsed and host_ok and scheme_ok):
+                return make_response('return_to host not allowed', 400)
+
+        state_data = {'signup': True}
+        if return_to:
+            state_data['rt'] = return_to
+        invite_code = (request.args.get('invite_code') or '').strip()
+        if invite_code:
+            state_data['ic'] = invite_code
+        gh_state = _encode_state(state_data)
+        callback_url = _get_base_url() + '/oauth/callback/github'
+        github_url = (
+            f'https://github.com/login/oauth/authorize?'
+            f'{urlencode({"client_id": GITHUB_CLIENT_ID, "redirect_uri": callback_url, "scope": "user:email", "state": gh_state})}'
+        )
+        return redirect(github_url)
+
     @oauth_bp.route('/oauth/authorize', methods=['POST'])
     def authorize_post():
         """Email/password login."""
@@ -371,6 +423,8 @@ def init_oauth(get_db, get_cursor):
         # Extract invite code from state (party beta flow)
         invite_code = stashed.get('ic', '')
         is_party_flow = stashed.get('party', False)
+        is_public_signup = stashed.get('signup', False)  # F4: public askboswell.com signup
+        signup_return_to = stashed.get('rt', '')         # where to land on success
 
         # Find or create user
         try:
@@ -379,6 +433,17 @@ def init_oauth(get_db, get_cursor):
             return make_response(f'Account setup failed: {e}', 500)
 
         print(f'[OAUTH] GitHub login: {email} → tenant={tenant_id}', file=sys.stderr)
+
+        # Public signup flow (F4): mint a session JWT and redirect back to
+        # askboswell.com / dashboard. Token goes in the URL fragment so it
+        # doesn't land in server access logs or Referer headers.
+        if is_public_signup:
+            from . import generate_jwt
+            session_jwt = generate_jwt(user_id=user_id, email=user_email, tenant_id=tenant_id)
+            target = signup_return_to or (_get_base_url() + '/dashboard')
+            # Use fragment (#) not query (?) — fragments are client-side-only
+            sep = '&' if '#' in target else '#'
+            return redirect(f'{target}{sep}token={session_jwt}')
 
         # Party flow: redirect to /party/success with signed API key
         if is_party_flow and invite_code:
