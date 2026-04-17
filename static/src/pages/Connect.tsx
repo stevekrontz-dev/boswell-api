@@ -33,12 +33,20 @@ export default function Connect() {
 
   const handleCreateKey = async () => {
     setLoading(true);
-    const data = await createApiKey();
-    if (data.api_key) {
-      setNewKey(data.api_key);
-      loadApiKeys();
+    try {
+      const data = await createApiKey();
+      const raw = data.key ?? data.api_key;
+      if (raw) {
+        setNewKey(raw);
+        loadApiKeys();
+      } else {
+        alert(`Failed to create key: ${data.error || 'unknown error'}`);
+      }
+    } catch (e) {
+      alert(`Failed to create key: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const copyToClipboard = (text: string) => {
