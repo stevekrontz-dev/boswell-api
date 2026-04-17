@@ -17,33 +17,55 @@ from auth import encrypt_api_key
 
 DEFAULT_BRANCHES = ['command-center', 'work', 'personal', 'research']
 
+# Branch templates per tenant type. command-center is always injected
+# regardless (required for sacred manifest + behavioral skill commits).
+TENANT_TEMPLATES = {
+    'individual': ['command-center', 'personal', 'work', 'research'],
+    'organization': ['command-center', 'operations', 'customers', 'marketing', 'finance', 'strategy'],
+}
 
-def provision_tenant(cursor, email: str, user_id: str = None, branches: list = None) -> dict:
+
+def provision_tenant(
+    cursor,
+    email: str,
+    user_id: str = None,
+    branches: list = None,
+    tenant_type: str = 'individual',
+) -> dict:
     """Create tenant, default branches, API key, sacred manifest, and behavioral skill.
 
     This is the single source of truth for provisioning. Called by:
     - POST /v2/onboard/provision (CLI signup, no Stripe)
     - handle_checkout_completed() in stripe_handler.py (Stripe checkout)
     - POST /v2/admin/create-tenant (admin provisioning)
+    - POST /signup/org (org signup — F6, once built)
 
     Args:
         cursor: Active database cursor (caller owns the transaction).
         email: User email, used as tenant name.
         user_id: Existing user ID. If None, a new UUID is generated.
-        branches: Custom branch list. If None, uses DEFAULT_BRANCHES.
-                  command-center is always included (required for sacred manifest).
+        branches: Explicit branch list. Wins over tenant_type template if set.
+                  command-center is always injected.
+        tenant_type: 'individual' (default) or 'organization'. Picks the
+                  default branch template when `branches` is not supplied.
+                  Individual default = [personal, work, research]; organization
+                  default = [operations, customers, marketing, finance, strategy].
 
     Returns:
         dict with keys: tenant_id, user_id, api_key (raw), api_key_encrypted,
-                        key_hash, key_id, branches
+                        key_hash, key_id, branches, tenant_type
     """
     now = datetime.utcnow().isoformat() + 'Z'
 
     if not user_id:
         user_id = str(uuid.uuid4())
 
-    # Resolve branch list
-    branch_list = list(branches) if branches else list(DEFAULT_BRANCHES)
+    # Resolve branch list. Explicit branches arg wins; else template by type;
+    # unknown type falls back to individual.
+    if branches:
+        branch_list = list(branches)
+    else:
+        branch_list = list(TENANT_TEMPLATES.get(tenant_type, TENANT_TEMPLATES['individual']))
     if 'command-center' not in branch_list:
         branch_list.insert(0, 'command-center')
 
@@ -92,6 +114,7 @@ def provision_tenant(cursor, email: str, user_id: str = None, branches: list = N
         'key_hash': key_hash,
         'key_id': key_id,
         'branches': branch_list,
+        'tenant_type': tenant_type,
     }
 
 
