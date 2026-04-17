@@ -52,7 +52,7 @@ def init_api_keys(get_db, get_cursor):
             "created_at": "timestamp"
         }
         """
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         name = data.get('name', '').strip() or 'Unnamed Key'
 
         user_id = g.current_user.get('sub')
