@@ -27,6 +27,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    // F5: cross-domain session handoff from askboswell.com (or /signup/github/*).
+    // If a token arrives in the URL fragment, accept it, stash it in
+    // localStorage, strip the fragment, then fall through to normal startup.
+    const hash = window.location.hash;
+    const handoffMatch = hash.match(/[#&]token=([^&]+)/);
+    if (handoffMatch) {
+      const handoffToken = decodeURIComponent(handoffMatch[1]);
+      localStorage.setItem('boswell_token', handoffToken);
+      // Strip the fragment so the token isn't left visible in the URL bar.
+      const cleanHash = hash.replace(/[#&]token=[^&]*/, '').replace(/^#?/, '');
+      window.history.replaceState(null, '', window.location.pathname + window.location.search + (cleanHash ? `#${cleanHash}` : ''));
+      // Fetch profile to populate boswell_user; don't block render on it.
+      getCurrentUser(handoffToken).then(profile => {
+        const u = { id: profile.id, email: profile.email, name: profile.name, is_admin: profile.is_admin || false };
+        setToken(handoffToken);
+        setUser(u as User);
+        localStorage.setItem('boswell_user', JSON.stringify(u));
+      }).catch(() => {
+        // Token rejected — fall through to normal login
+        localStorage.removeItem('boswell_token');
+      }).finally(() => setIsLoading(false));
+      return;
+    }
+
     const storedToken = localStorage.getItem('boswell_token');
     const storedUser = localStorage.getItem('boswell_user');
     if (storedToken && storedUser) {

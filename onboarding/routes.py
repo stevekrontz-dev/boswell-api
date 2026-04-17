@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
 
-from auth import hash_password
+from auth import hash_password, generate_jwt
 from billing.provisioning import provision_tenant
 
 onboarding_bp = Blueprint('onboarding', __name__, url_prefix='/v2/onboard')
@@ -138,11 +138,18 @@ def init_onboarding(get_db, get_cursor):
 
             print(f"[ONBOARD] Provisioned {email}: user={user_id} tenant={tenant_id}", flush=True)
 
+            # F5: mint a session JWT so the signup UI can hand off to the
+            # dashboard without forcing a second login on the Railway host.
+            # Frontend should redirect to <dashboard>/dashboard#token=<jwt>
+            # and the dashboard stores it in localStorage on load.
+            session_jwt = generate_jwt(user_id=user_id, email=email, tenant_id=tenant_id)
+
             return jsonify({
                 'user_id': user_id,
                 'tenant_id': tenant_id,
                 'api_key': api_key,
                 'branches': branches,
+                'token': session_jwt,
                 'message': 'Account created. Save your API key - you won\'t see it again.'
             }), 201
 
@@ -248,6 +255,9 @@ def init_onboarding(get_db, get_cursor):
             db.commit()
             print(f"[ONBOARD-ORG] Provisioned org={org_name} admin={admin_email} tenant={result['tenant_id']}", flush=True)
 
+            # F5: session JWT for cross-domain handoff to the dashboard.
+            session_jwt = generate_jwt(user_id=user_id, email=admin_email, tenant_id=result['tenant_id'])
+
             return jsonify({
                 'user_id': user_id,
                 'tenant_id': result['tenant_id'],
@@ -256,6 +266,7 @@ def init_onboarding(get_db, get_cursor):
                 'entity_type': entity_type,
                 'api_key': result['api_key'],
                 'branches': result['branches'],
+                'token': session_jwt,
                 'message': 'Org account created. Save this API key — it will not be shown again.'
             }), 201
 
