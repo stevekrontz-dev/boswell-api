@@ -55,11 +55,35 @@ export default function Connect() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDownloadExtension = () => {
-    if (newKey) {
-      window.location.href = `${API_BASE}/api/extension/download?api_key=${newKey}`;
-    } else {
+  const handleDownloadExtension = async () => {
+    if (!newKey) {
       alert('Please generate an API key first to download the extension.');
+      return;
+    }
+    try {
+      const token = localStorage.getItem('boswell_token');
+      const res = await fetch(`${API_BASE}/api/extension/download`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token && { 'Authorization': `Bearer ${token}` }),
+        },
+        body: JSON.stringify({ api_key: newKey }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        alert(`Download failed: ${err.error || res.statusText}`);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'boswell.mcpb';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 

@@ -111,9 +111,34 @@ export default function Dashboard() {
     }
   };
 
-  const downloadUrl = profile?.api_key
-    ? `${API_BASE}/api/extension/download?api_key=${profile.api_key}`
-    : null;
+  const handleDownloadExtension = async () => {
+    if (!profile?.api_key) return;
+    try {
+      const token = localStorage.getItem('boswell_token');
+      const res = await fetch(`${API_BASE}/api/extension/download`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token && { 'Authorization': `Bearer ${token}` }),
+        },
+        body: JSON.stringify({ api_key: profile.api_key }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        alert(`Download failed: ${err.error || res.statusText}`);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'boswell.mcpb';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   if (loading) {
     return (
@@ -193,10 +218,11 @@ export default function Dashboard() {
       <div className="card rounded-2xl p-6 reveal delay-1">
         <h2 className="font-display text-xl text-parchment-50 mb-4">Install Boswell</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {downloadUrl && (
-            <a
-              href={downloadUrl}
-              className="flex items-center gap-4 p-4 rounded-xl border border-parchment-200/10 hover:border-ember-500/30 bg-ink-900/50 transition-all group"
+          {profile?.api_key && (
+            <button
+              type="button"
+              onClick={handleDownloadExtension}
+              className="flex items-center gap-4 p-4 rounded-xl border border-parchment-200/10 hover:border-ember-500/30 bg-ink-900/50 transition-all group text-left w-full"
             >
               <div className="w-12 h-12 rounded-full bg-ember-500/10 border border-ember-500/20 flex items-center justify-center group-hover:bg-ember-500/20 transition-colors">
                 <svg className="w-6 h-6 text-ember-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -207,7 +233,7 @@ export default function Dashboard() {
                 <div className="font-medium text-parchment-50">Claude Desktop</div>
                 <div className="text-sm text-parchment-200/50">Download .mcpb bundle</div>
               </div>
-            </a>
+            </button>
           )}
           <a
             href="/dashboard/connect"

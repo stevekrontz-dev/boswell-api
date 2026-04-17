@@ -11386,59 +11386,43 @@ app.register_blueprint(party_bp)
 # EXTENSION DOWNLOAD (W4P2 - CC4)
 # =============================================================================
 
-@app.route('/api/extension/download', methods=['GET'])
+@app.route('/api/extension/download', methods=['POST'])
 @require_auth
 def download_extension():
-    """
-    Download personalized .mcpb bundle for Claude Desktop.
+    """Download personalized .mcpb bundle for Claude Desktop.
 
-    The bundle is pre-configured with the user's API credentials.
-    Requires authentication via session token or GODMODE_PASSWORD.
+    POST body: {"api_key": "bos_..."}. The key is embedded in the bundle so
+    the user's Claude Desktop can authenticate against Boswell. POST-with-body
+    (not GET-with-query-param) keeps the key out of URL logs, browser history,
+    and Referer headers.
     """
     from flask import Response
     from extension.builder.bundler import generate_bundle_for_user
 
     user_id = g.get('current_user', 'steve')
 
-    # Get tenant_id for this user
     cur = get_cursor()
-    cur.execute(
-        'SELECT id, name FROM tenants WHERE name = %s OR id::text = %s LIMIT 1',
-        (user_id, get_tenant_id())
-    )
-    tenant_row = cur.fetchone()
+    try:
+        cur.execute(
+            'SELECT id, name FROM tenants WHERE name = %s OR id::text = %s LIMIT 1',
+            (user_id, get_tenant_id())
+        )
+        tenant_row = cur.fetchone()
+    finally:
+        cur.close()
 
     if not tenant_row:
-        cur.close()
         return jsonify({'error': 'Tenant not found'}), 404
 
     tenant_id = str(tenant_row['id'])
     display_name = tenant_row['name']
 
-    # Get or create an API key for this tenant
-    cur.execute(
-        'SELECT key_hash FROM api_keys WHERE tenant_id = %s AND revoked_at IS NULL LIMIT 1',
-        (tenant_id,)
-    )
-    key_row = cur.fetchone()
-
-    if key_row:
-        # Return error - we can't retrieve the actual key, only the hash
-        # User needs to use an existing key or create a new one via /api/keys
-        cur.close()
-        return jsonify({
-            'error': 'API key required. Create one via POST /api/keys first, then use that key.',
-            'hint': 'The download endpoint needs your actual API key. Create one and save it.'
-        }), 400
-
-    cur.close()
-
-    # Alternative: Accept API key as query param for download
-    api_key = request.args.get('api_key')
+    data = request.get_json(silent=True) or {}
+    api_key = data.get('api_key')
     if not api_key:
         return jsonify({
-            'error': 'api_key query parameter required',
-            'hint': 'GET /api/extension/download?api_key=bos_xxx'
+            'error': 'api_key required in JSON body',
+            'hint': "POST /api/extension/download with body {\"api_key\": \"bos_xxx\"}"
         }), 400
 
     try:
