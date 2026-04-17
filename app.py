@@ -254,6 +254,26 @@ def close_db(exception):
     if db is not None:
         db.close()
 
+
+@app.errorhandler(Exception)
+def handle_uncaught(err):
+    """Return JSON for any uncaught exception on API routes so the dashboard
+    can surface a real error message instead of HTML '<!doctype'."""
+    import traceback as _tb
+    from werkzeug.exceptions import HTTPException
+    if isinstance(err, HTTPException):
+        path = request.path or ''
+        if path.startswith(('/v2/', '/api/', '/auth/', '/mcp')):
+            return jsonify({'error': err.name, 'error_description': err.description}), err.code
+        return err
+    print(f'[UNCAUGHT] {request.method} {request.path}: {err!r}', file=sys.stderr)
+    _tb.print_exc(file=sys.stderr)
+    return jsonify({
+        'error': 'internal_server_error',
+        'error_description': f'{type(err).__name__}: {err}'
+    }), 500
+
+
 # Phase 3: Audit Logging
 AUDIT_ENABLED = os.environ.get('AUDIT_ENABLED', 'true').lower() == 'true'
 
