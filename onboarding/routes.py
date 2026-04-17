@@ -154,6 +154,119 @@ def init_onboarding(get_db, get_cursor):
             cur.close()
 
     # ------------------------------------------------------------------
+    # POST /v2/onboard/provision-org
+    # Public endpoint — creates an ORG tenant (vs user-owned) with its first
+    # admin user. Differs from /provision in three ways:
+    #   1. tenant.name = org_name (not admin email)
+    #   2. tenant_type = 'organization' → org branch template from TENANT_TEMPLATES
+    #   3. Semantics: the admin user is the first member, not the owner-as-identity
+    # Member invite flow (roles, seat billing) is a follow-on task.
+    # ------------------------------------------------------------------
+
+    @onboarding_bp.route('/provision-org', methods=['POST'])
+    def provision_org():
+        """
+        Create a new Boswell ORG account via CLI (no Stripe required).
+
+        Request body:
+            {
+              "org_name": "Tint Atlanta",
+              "admin_email": "admin@tintatlanta.com",
+              "admin_password": "securepass123",
+              "entity_type": "llc"   (optional, informational for now)
+            }
+
+        Returns 201:
+            {
+              "user_id": "uuid",
+              "tenant_id": "uuid",
+              "tenant_name": "Tint Atlanta",
+              "tenant_type": "organization",
+              "api_key": "bos_xxx...",
+              "branches": ["command-center", "operations", "customers", ...],
+              "message": "Org account created. Save this API key — it will not be shown again."
+            }
+        """
+        client_ip = request.remote_addr or 'unknown'
+        if _is_rate_limited(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Try again later.'}), 429
+
+        data = request.get_json(silent=True) or {}
+        org_name = (data.get('org_name') or '').strip()
+        admin_email = (data.get('admin_email') or '').strip().lower()
+        admin_password = data.get('admin_password') or ''
+        entity_type = (data.get('entity_type') or '').strip() or None
+
+        if not org_name:
+            return jsonify({'error': 'org_name is required'}), 400
+        if len(org_name) < 2 or len(org_name) > 120:
+            return jsonify({'error': 'org_name must be 2-120 characters'}), 400
+        if not admin_email:
+            return jsonify({'error': 'admin_email is required'}), 400
+        if not _validate_email(admin_email):
+            return jsonify({'error': 'Invalid admin_email format'}), 400
+        if not admin_password:
+            return jsonify({'error': 'admin_password is required'}), 400
+        if len(admin_password) < 8:
+            return jsonify({'error': 'admin_password must be at least 8 characters'}), 400
+
+        db = get_db()
+        cur = get_cursor()
+
+        try:
+            cur.execute('SELECT id FROM users WHERE email = %s', (admin_email,))
+            if cur.fetchone():
+                return jsonify({'error': 'Email already registered'}), 409
+
+            user_id = str(uuid.uuid4())
+            password_hash = hash_password(admin_password)
+            now = datetime.utcnow().isoformat() + 'Z'
+
+            cur.execute(
+                '''INSERT INTO users (id, email, password_hash, status, plan, created_at)
+                   VALUES (%s, %s, %s, 'active', 'free', %s)''',
+                (user_id, admin_email, password_hash, now)
+            )
+
+            result = provision_tenant(
+                cur,
+                admin_email,
+                user_id=user_id,
+                tenant_type='organization',
+                tenant_name=org_name,
+            )
+
+            cur.execute(
+                '''UPDATE users SET
+                       tenant_id = %s,
+                       api_key_encrypted = %s,
+                       updated_at = %s
+                   WHERE id = %s''',
+                (result['tenant_id'], result['api_key_encrypted'], now, user_id)
+            )
+
+            db.commit()
+            print(f"[ONBOARD-ORG] Provisioned org={org_name} admin={admin_email} tenant={result['tenant_id']}", flush=True)
+
+            return jsonify({
+                'user_id': user_id,
+                'tenant_id': result['tenant_id'],
+                'tenant_name': org_name,
+                'tenant_type': 'organization',
+                'entity_type': entity_type,
+                'api_key': result['api_key'],
+                'branches': result['branches'],
+                'message': 'Org account created. Save this API key — it will not be shown again.'
+            }), 201
+
+        except Exception as e:
+            db.rollback()
+            print(f"[ONBOARD-ORG] Provision failed for org={org_name}: {e}", flush=True)
+            return jsonify({'error': f'Org provisioning failed: {str(e)}'}), 500
+        finally:
+            cur.close()
+
+    # ------------------------------------------------------------------
     # POST /v2/onboard/seed-manifest
     # Requires API key auth (X-API-Key header)
     # ------------------------------------------------------------------

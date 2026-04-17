@@ -252,6 +252,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/oauth/authorize', '/oauth/token', '/oauth/register',
         '/oauth/callback/github',
         '/v2/onboard/provision',  # Public signup — no auth required
+        '/v2/onboard/provision-org',  # Public org signup — no auth required
         '/v2/auth/register',      # Public registration
         '/v2/auth/login',         # Login endpoint — must be public
         '/v2/auth/password-reset/request',  # Password reset request

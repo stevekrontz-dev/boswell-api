@@ -31,6 +31,7 @@ def provision_tenant(
     user_id: str = None,
     branches: list = None,
     tenant_type: str = 'individual',
+    tenant_name: str = None,
 ) -> dict:
     """Create tenant, default branches, API key, sacred manifest, and behavioral skill.
 
@@ -71,12 +72,15 @@ def provision_tenant(
 
     # --- Tenant ---
     tenant_id = str(uuid.uuid4())
+    # tenant.name is the human-visible label. For individual signups we fall back
+    # to email (legacy behavior); for orgs the caller supplies org_name.
+    name_to_store = tenant_name or email
     cursor.execute(
         '''INSERT INTO tenants (id, name, created_at)
            VALUES (%s, %s, %s)''',
-        (tenant_id, email, now)
+        (tenant_id, name_to_store, now)
     )
-    print(f"[PROVISION] Created tenant {tenant_id} for {email}", flush=True)
+    print(f"[PROVISION] Created tenant {tenant_id} name={name_to_store} type={tenant_type}", flush=True)
 
     # --- Branches ---
     for branch_name in branch_list:
