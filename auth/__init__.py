@@ -85,21 +85,97 @@ def verify_jwt(token: str) -> dict:
 
 
 def hash_password(password: str) -> str:
-    """Hash password using SHA256 with salt."""
+    """LEGACY: hash password using salt+SHA256 for backward compatibility only.
+
+    Never call for NEW passwords — use hash_password_v2 instead. Left in
+    place so the migration period can still verify existing users whose
+    rows haven't been upgraded to Argon2id yet.
+    """
     salt = secrets.token_hex(16)
     hashed = hashlib.sha256((salt + password).encode()).hexdigest()
     return f"{salt}:{hashed}"
 
 
-def verify_password(password: str, stored_hash: str) -> bool:
-    """Verify password against stored hash. Uses hmac.compare_digest so the
-    comparison time doesn't leak hash bits to a timing attacker."""
+def _verify_password_legacy(password: str, stored_hash: str) -> bool:
+    """Verify against the legacy salt+SHA256 format. Constant-time."""
     try:
         salt, hashed = stored_hash.split(':')
         candidate = hashlib.sha256((salt + password).encode()).hexdigest()
         return hmac.compare_digest(candidate, hashed)
     except ValueError:
         return False
+
+
+# Argon2id password hasher. Defaults are chosen to be stronger than the
+# argon2-cffi defaults (time_cost=2) because we expect small-volume auth
+# in prod; security outweighs a few hundred ms per login.
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError, InvalidHashError
+    _ph = PasswordHasher(
+        time_cost=3,
+        memory_cost=64 * 1024,  # 64 MiB
+        parallelism=1,
+    )
+    ARGON2_AVAILABLE = True
+except Exception:
+    _ph = None
+    VerifyMismatchError = None
+    InvalidHashError = None
+    ARGON2_AVAILABLE = False
+
+
+def hash_password_v2(password: str) -> str:
+    """Hash a new password with Argon2id. Use this for all new registrations
+    and for rehashing existing users on login. Returns an encoded string
+    that embeds algorithm + params + salt + hash, so verify doesn't need
+    external config."""
+    if not ARGON2_AVAILABLE:
+        raise RuntimeError('argon2-cffi not available — cannot create v2 hashes')
+    return _ph.hash(password)
+
+
+def verify_password(
+    password: str,
+    legacy_hash: str = None,
+    v2_hash: str = None,
+) -> tuple[bool, bool]:
+    """Verify a password against either the v2 (Argon2id) or legacy
+    (salt+SHA256) stored hash.
+
+    Returns (ok, needs_rehash):
+      - ok: True if password matches either hash.
+      - needs_rehash: True if the match came from the legacy hash (caller
+        should compute hash_password_v2 and write password_hash_v2), or if
+        the Argon2id parameters on the stored v2 hash are weaker than
+        current policy (argon2 exposes .check_needs_rehash).
+
+    Either/both hashes may be None (e.g. legacy-only row has v2_hash=None;
+    freshly-registered user has legacy_hash=None). Prefers v2 when both
+    exist.
+    """
+    # Prefer v2 if provided
+    if v2_hash and ARGON2_AVAILABLE:
+        try:
+            _ph.verify(v2_hash, password)
+            try:
+                needs_rehash = bool(_ph.check_needs_rehash(v2_hash))
+            except Exception:
+                needs_rehash = False
+            return True, needs_rehash
+        except (VerifyMismatchError, InvalidHashError):
+            # Fall through to legacy attempt only if v2 itself is malformed,
+            # not on a clean mismatch. A clean mismatch is authoritative.
+            if v2_hash:
+                return False, False
+        except Exception:
+            return False, False
+
+    # Fall back to legacy — on success, caller should migrate to v2.
+    if legacy_hash:
+        ok = _verify_password_legacy(password, legacy_hash)
+        return ok, ok  # needs_rehash == the success case itself
+    return False, False
 
 
 def require_jwt(f):

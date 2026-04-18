@@ -7,7 +7,7 @@ Task: W1P1 - User Registration (BLOCKING)
 import re
 import uuid
 from flask import Blueprint, request, jsonify
-from . import generate_jwt, hash_password, is_rate_limited
+from . import generate_jwt, hash_password, hash_password_v2, is_rate_limited
 
 registration_bp = Blueprint('registration', __name__, url_prefix='/v2/auth')
 
@@ -96,15 +96,17 @@ def init_registration(get_db, get_cursor):
                 cur.close()
                 return jsonify({'error': 'Email already registered'}), 409
 
-            # Create user
+            # Create user. New registrations go straight to Argon2id in
+            # password_hash_v2; password_hash (legacy) is left NULL. We
+            # still set status='pending_payment' as before.
             user_id = str(uuid.uuid4())
-            password_hash = hash_password(password)
+            password_hash_v2 = hash_password_v2(password)
 
             cur.execute(
-                '''INSERT INTO users (id, email, password_hash, name, status, terms_accepted_at, created_at)
+                '''INSERT INTO users (id, email, password_hash_v2, name, status, terms_accepted_at, created_at)
                    VALUES (%s, %s, %s, %s, 'pending_payment', NOW(), NOW())
                    RETURNING created_at''',
-                (user_id, email, password_hash, name or None)
+                (user_id, email, password_hash_v2, name or None)
             )
             created_at = cur.fetchone()['created_at']
 

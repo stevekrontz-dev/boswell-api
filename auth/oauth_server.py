@@ -335,13 +335,39 @@ def init_oauth(get_db, get_cursor):
 
         cur = get_cursor()
         try:
-            cur.execute('SELECT id, email, password_hash, tenant_id, status FROM users WHERE email = %s', (email,))
+            cur.execute('SELECT id, email, password_hash, password_hash_v2, tenant_id, status FROM users WHERE email = %s', (email,))
             user = cur.fetchone()
         finally:
             cur.close()
 
-        if not user or not user.get('password_hash') or not verify_password(password, user['password_hash']):
+        if not user:
             return _render_login(params, 'Invalid email or password')
+
+        ok, needs_rehash = verify_password(
+            password,
+            legacy_hash=user.get('password_hash'),
+            v2_hash=user.get('password_hash_v2'),
+        )
+        if not ok:
+            return _render_login(params, 'Invalid email or password')
+
+        # Lazy-upgrade legacy hash to Argon2id on successful legacy-match.
+        if needs_rehash:
+            try:
+                from . import hash_password_v2
+                new_v2 = hash_password_v2(password)
+                scur = get_cursor()
+                sdb = get_db()
+                try:
+                    scur.execute(
+                        'UPDATE users SET password_hash_v2 = %s WHERE id = %s',
+                        (new_v2, str(user['id']))
+                    )
+                    sdb.commit()
+                finally:
+                    scur.close()
+            except Exception:
+                pass  # Don't block login on upgrade failure.
 
         if user['status'] != 'active':
             return _render_login(params, 'Account not active')

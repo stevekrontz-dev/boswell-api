@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
 
-from auth import hash_password, generate_jwt
+from auth import hash_password, hash_password_v2, generate_jwt
 from billing.provisioning import provision_tenant
 
 onboarding_bp = Blueprint('onboarding', __name__, url_prefix='/v2/onboard')
@@ -105,15 +105,17 @@ def init_onboarding(get_db, get_cursor):
                 cur.close()
                 return jsonify({'error': 'Email already registered'}), 409
 
-            # 2. Create the user row
+            # 2. Create the user row. Argon2id (password_hash_v2); legacy
+            # password_hash left NULL. See migration 024 for the dual-column
+            # strategy.
             user_id = str(uuid.uuid4())
-            password_hash = hash_password(password)
+            password_hash_v2 = hash_password_v2(password)
             now = datetime.utcnow().isoformat() + 'Z'
 
             cur.execute(
-                '''INSERT INTO users (id, email, password_hash, status, plan, created_at)
+                '''INSERT INTO users (id, email, password_hash_v2, status, plan, created_at)
                    VALUES (%s, %s, %s, 'active', 'free', %s)''',
-                (user_id, email, password_hash, now)
+                (user_id, email, password_hash_v2, now)
             )
 
             # 3. Provision tenant, branches, API key, sacred manifest, skill (shared logic)
@@ -226,13 +228,13 @@ def init_onboarding(get_db, get_cursor):
                 return jsonify({'error': 'Email already registered'}), 409
 
             user_id = str(uuid.uuid4())
-            password_hash = hash_password(admin_password)
+            password_hash_v2 = hash_password_v2(admin_password)
             now = datetime.utcnow().isoformat() + 'Z'
 
             cur.execute(
-                '''INSERT INTO users (id, email, password_hash, status, plan, created_at)
+                '''INSERT INTO users (id, email, password_hash_v2, status, plan, created_at)
                    VALUES (%s, %s, %s, 'active', 'free', %s)''',
-                (user_id, admin_email, password_hash, now)
+                (user_id, admin_email, password_hash_v2, now)
             )
 
             result = provision_tenant(
