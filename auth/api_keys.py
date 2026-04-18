@@ -8,7 +8,7 @@ import secrets
 import hashlib
 import uuid
 from flask import Blueprint, request, jsonify, g
-from . import require_jwt
+from . import require_jwt, is_rate_limited
 
 api_keys_bp = Blueprint('api_keys', __name__, url_prefix='/v2/auth/keys')
 
@@ -52,6 +52,14 @@ def init_api_keys(get_db, get_cursor):
             "created_at": "timestamp"
         }
         """
+        # Rate limit per user so a compromised JWT can't spray-mint keys:
+        # 10 new keys per hour per user is generous for normal rotation
+        # and well below any runaway scenario.
+        _uid = g.current_user.get('sub') if hasattr(g, 'current_user') else None
+        rate_key = _uid or (request.remote_addr or 'unknown')
+        if is_rate_limited('auth_keys_create', rate_key, limit=10, window_seconds=3600):
+            return jsonify({'error': 'Too many key-creation requests. Try again later.'}), 429
+
         data = request.get_json(silent=True) or {}
         name = data.get('name', '').strip() or 'Unnamed Key'
 

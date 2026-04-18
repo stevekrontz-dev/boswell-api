@@ -5,7 +5,7 @@ Task: W1P2 - User Login (BLOCKING CC3)
 """
 
 from flask import Blueprint, request, jsonify
-from . import generate_jwt, verify_password
+from . import generate_jwt, verify_password, is_rate_limited
 
 login_bp = Blueprint('login', __name__, url_prefix='/v2/auth')
 
@@ -34,6 +34,13 @@ def init_login(get_db, get_cursor):
             }
         }
         """
+        # Rate limit by IP: 20 login attempts per hour. Single-tenant prod
+        # realistically sees low dozens per day, so 20/hour is well above
+        # the legitimate ceiling while choking a credential-stuffing run.
+        ip = request.remote_addr or 'unknown'
+        if is_rate_limited('auth_login', ip, limit=20, window_seconds=3600):
+            return jsonify({'error': 'Too many login attempts. Try again later.'}), 429
+
         data = request.get_json() or {}
 
         email = data.get('email', '').strip().lower()

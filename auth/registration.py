@@ -7,7 +7,7 @@ Task: W1P1 - User Registration (BLOCKING)
 import re
 import uuid
 from flask import Blueprint, request, jsonify
-from . import generate_jwt, hash_password
+from . import generate_jwt, hash_password, is_rate_limited
 
 registration_bp = Blueprint('registration', __name__, url_prefix='/v2/auth')
 
@@ -55,6 +55,13 @@ def init_registration(get_db, get_cursor):
             "message": "Registration successful"
         }
         """
+        # Rate limit by IP: 5 registrations per hour. Tight because sign-up
+        # is the single most expensive operation (provisions tenant, seeds
+        # manifest, generates key) and has the highest abuse potential.
+        ip = request.remote_addr or 'unknown'
+        if is_rate_limited('auth_register', ip, limit=5, window_seconds=3600):
+            return jsonify({'error': 'Too many signups from this IP. Try again later.'}), 429
+
         data = request.get_json() or {}
 
         # Validate required fields

@@ -7,11 +7,42 @@ Domain: Auth & Multi-tenancy
 import os
 import jwt
 import hmac
+import time
 import hashlib
 import secrets
+from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import request, jsonify, g
+
+
+# In-memory per-IP rate limiter. Single-worker is fine for single-tenant
+# production; a multi-worker deploy would want a shared backend (Redis)
+# since each worker keeps its own counter. For now the brute-force ceiling
+# is N * worker_count, which is still orders of magnitude below unlimited.
+_auth_rate_buckets: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+
+
+def is_rate_limited(bucket: str, key: str, limit: int, window_seconds: int) -> bool:
+    """Check + record a request against an in-memory rate bucket.
+
+    Returns True if the request would exceed `limit` in the rolling
+    `window_seconds` window. Otherwise records the request and returns False.
+
+    Example:
+        if is_rate_limited('auth_login', request.remote_addr or 'unknown',
+                           limit=20, window_seconds=3600):
+            return jsonify({'error': 'Too many attempts'}), 429
+    """
+    now = time.time()
+    window_start = now - window_seconds
+    hits = _auth_rate_buckets[bucket][key]
+    # Drop expired entries in-place
+    hits[:] = [t for t in hits if t > window_start]
+    if len(hits) >= limit:
+        return True
+    hits.append(now)
+    return False
 
 # JWT Configuration
 # Fail-fast: if JWT_SECRET is missing, refuse to start. The prior fallback

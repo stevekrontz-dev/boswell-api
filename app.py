@@ -11296,6 +11296,14 @@ def auth_password():
     Password fallback authentication.
     Uses GODMODE_PASSWORD for single-user mode.
     """
+    # Rate limit by IP: 20 attempts/hour. GODMODE_PASSWORD is the highest
+    # privilege credential in the system — no legitimate flow needs >20
+    # tries per hour.
+    from auth import is_rate_limited
+    ip = request.remote_addr or 'unknown'
+    if is_rate_limited('auth_password', ip, limit=20, window_seconds=3600):
+        return jsonify({'error': 'Too many attempts. Try again later.'}), 429
+
     data = request.get_json() or {}
     password = data.get('password')
 
