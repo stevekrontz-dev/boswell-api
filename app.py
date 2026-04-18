@@ -5929,6 +5929,58 @@ def admin_tenant_detail(tenant_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/admin/schema/apply-024', methods=['POST'])
+@require_admin
+def admin_apply_migration_024():
+    """One-shot runner for migration 024 (password_hash_v2 + DROP NOT NULL
+    on password_hash). Idempotent via IF NOT EXISTS / ALTER-is-no-op. To be
+    removed in a follow-up commit after a single successful run.
+    """
+    cur = get_cursor()
+    db = get_db()
+    try:
+        migration_path = os.path.join(os.path.dirname(__file__), 'db', 'migrations', '024_password_hash_v2.sql')
+        if not os.path.exists(migration_path):
+            return jsonify({'error': f'migration file not found: {migration_path}'}), 500
+        with open(migration_path, 'r') as f:
+            sql = f.read()
+        cur.execute(sql)
+        db.commit()
+
+        cur.execute("""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = 'users' AND column_name IN ('password_hash', 'password_hash_v2')
+            ORDER BY column_name
+        """)
+        cols = [
+            {'name': r['column_name'], 'type': r['data_type'], 'nullable': r['is_nullable']}
+            for r in cur.fetchall()
+        ]
+
+        cur.execute("SELECT COUNT(*) AS n FROM users")
+        total = cur.fetchone()['n']
+        cur.execute("SELECT COUNT(*) AS n FROM users WHERE password_hash_v2 IS NOT NULL")
+        migrated = cur.fetchone()['n']
+        cur.execute("SELECT COUNT(*) AS n FROM users WHERE password_hash IS NOT NULL")
+        legacy_populated = cur.fetchone()['n']
+
+        return jsonify({
+            'applied': True,
+            'columns': cols,
+            'coverage': {
+                'users_total': total,
+                'on_v2': migrated,
+                'legacy_populated': legacy_populated,
+            },
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+
+
 @app.route('/v2/admin/commits/backfill-bootloader-weights', methods=['POST'])
 @require_admin
 def admin_backfill_bootloader_weights():
