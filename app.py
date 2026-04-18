@@ -13,6 +13,7 @@ except ImportError:
     PGVECTOR_AVAILABLE = False
     register_vector = None
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -5655,9 +5656,11 @@ def require_admin(f):
                 except Exception:
                     pass
 
-        # Also allow GODMODE_PASSWORD as fallback for CLI usage
+        # Also allow GODMODE_PASSWORD as fallback for CLI usage. Constant-time
+        # compare so the string-match time doesn't leak a bitwise side channel.
         godmode = os.environ.get('GODMODE_PASSWORD')
-        if not user_id and godmode and request.headers.get('X-Godmode-Password') == godmode:
+        supplied = request.headers.get('X-Godmode-Password') or ''
+        if not user_id and godmode and hmac.compare_digest(supplied, godmode):
             g.admin_user_id = 'godmode'
             return f(*args, **kwargs)
 
@@ -10934,8 +10937,10 @@ def require_auth(f):
     def decorated(*args, **kwargs):
         session = get_session_from_request()
         if not session:
-            # Also allow GODMODE_PASSWORD for backward compatibility
-            if request.headers.get('X-Godmode-Password') == GODMODE_PASSWORD:
+            # Also allow GODMODE_PASSWORD for backward compatibility. Constant-time
+            # compare so we don't leak character-by-character match timing.
+            supplied = request.headers.get('X-Godmode-Password') or ''
+            if GODMODE_PASSWORD and hmac.compare_digest(supplied, GODMODE_PASSWORD):
                 return f(*args, **kwargs)
             return jsonify({'error': 'Authentication required'}), 401
         g.current_user = session['user_id']
@@ -10958,7 +10963,9 @@ def auth_register_options():
     # If credentials exist, require authentication
     if count > 0:
         session = get_session_from_request()
-        if not session and request.headers.get('X-Godmode-Password') != GODMODE_PASSWORD:
+        supplied_gp = request.headers.get('X-Godmode-Password') or ''
+        gp_ok = bool(GODMODE_PASSWORD) and hmac.compare_digest(supplied_gp, GODMODE_PASSWORD)
+        if not session and not gp_ok:
             cur.close()
             return jsonify({'error': 'Authentication required to add new passkey'}), 401
 
@@ -11295,7 +11302,9 @@ def auth_password():
     if not password:
         return jsonify({'error': 'password is required'}), 400
 
-    if password != GODMODE_PASSWORD:
+    # Constant-time compare — /auth/password is the single-user CLI fallback
+    # and the highest-privilege password in the system.
+    if not GODMODE_PASSWORD or not hmac.compare_digest(password, GODMODE_PASSWORD):
         return jsonify({'error': 'Invalid password'}), 401
 
     user_id = 'steve'  # Single-user mode

@@ -6,6 +6,7 @@ Domain: Auth & Multi-tenancy
 
 import os
 import jwt
+import hmac
 import hashlib
 import secrets
 from datetime import datetime, timedelta
@@ -60,10 +61,12 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    """Verify password against stored hash."""
+    """Verify password against stored hash. Uses hmac.compare_digest so the
+    comparison time doesn't leak hash bits to a timing attacker."""
     try:
         salt, hashed = stored_hash.split(':')
-        return hashlib.sha256((salt + password).encode()).hexdigest() == hashed
+        candidate = hashlib.sha256((salt + password).encode()).hexdigest()
+        return hmac.compare_digest(candidate, hashed)
     except ValueError:
         return False
 
