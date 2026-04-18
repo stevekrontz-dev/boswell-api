@@ -11666,17 +11666,17 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_commit",
-        "description": "Preserve a decision, insight, or context to memory. ALWAYS capture WHY, not just WHAT—future instances need reasoning. Call after completing steps, solving problems, making decisions, or learning something new. Use content_type='plan' to create persistent work plans that group tasks.",
+        "description": "Preserve a decision, insight, or context to memory. ALWAYS capture WHY, not just WHAT—future instances need reasoning. Call after completing steps, solving problems, making decisions, or learning something new. Use content_type='plan' to create persistent work plans, content_type='skill' for behavioral instructions.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "branch": {"type": "string", "description": "Branch to commit to (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
                 "content": {"oneOf": [{"type": "object"}, {"type": "string"}], "description": "Memory content as JSON object or JSON string"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
-                "content_type": {"type": "string", "description": "Content type: 'memory' (default) or 'plan'. Plans require title and status fields in content.", "default": "memory"},
+                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'plan', 'skill' (behavioral instruction), or 'credential'", "default": "memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
                 "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"},
-                "content_type": {"type": "string", "description": "Content type: 'memory' (default) or 'skill' (behavioral instruction)"}
+                "bootloader_weight": {"type": "number", "description": "How eagerly this commit should be auto-loaded on conversation start (0.0-1.0). Omit for content-type defaults: skill=1.0, credential=0.8, plan=0.6, memory=0.0."}
             },
             "required": ["branch", "content", "message"]
         }
@@ -12194,12 +12194,28 @@ def dispatch_mcp_tool(tool_name, args):
                     return json.dumps({"error": "Content must parse to a JSON object, not " + type(content).__name__})
             except (json.JSONDecodeError, TypeError):
                 return json.dumps({"error": "Content string is not valid JSON: " + content[:100]})
+        content_type = args.get("content_type", "memory")
+        # Fix for d54c1d65: the dispatcher used to drop bootloader_weight, so
+        # every MCP-driven commit landed in the DB with weight=0.0 regardless
+        # of content_type. Skills especially need a non-zero weight so they
+        # get auto-loaded on conversation start. Weights are picked so skills
+        # > credentials > plans > memories.
+        default_weights = {
+            "skill": 1.0,
+            "credential": 0.8,
+            "plan": 0.6,
+            "memory": 0.0,
+        }
+        bootloader_weight = args.get("bootloader_weight")
+        if bootloader_weight is None:
+            bootloader_weight = default_weights.get(content_type, 0.0)
         payload = {
             "branch": args["branch"],
             "content": content,
             "message": args["message"],
             "author": "claude",
-            "type": args.get("content_type", "memory")
+            "type": content_type,
+            "bootloader_weight": bootloader_weight,
         }
         if "tags" in args:
             payload["tags"] = args["tags"]
