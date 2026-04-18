@@ -5927,6 +5927,83 @@ def admin_tenant_detail(tenant_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/admin/commits/backfill-bootloader-weights', methods=['POST'])
+@require_admin
+def admin_backfill_bootloader_weights():
+    """One-off backfill of bootloader_weight on commits that shipped with the
+    MCP dispatcher bug (d54c1d65) — everything ended up at 0.0 regardless of
+    content_type. This UPDATE is safe by construction:
+        - only touches rows where bootloader_weight = 0
+        - only touches skill/credential/plan content types
+        - never lowers a weight, only raises memory-type rows are left alone
+        - never touches a memory-type row that was manually boosted.
+
+    Request body: {"dry_run": true|false, "tenant_id": "..." (optional)}
+    """
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get('dry_run', True))
+    scope_tenant = data.get('tenant_id')
+
+    weight_map = [('skill', 1.0), ('credential', 0.8), ('plan', 0.6)]
+    cur = get_cursor()
+    db = get_db()
+    try:
+        summary = {}
+        for content_type, target_weight in weight_map:
+            params = [content_type]
+            tenant_clause = ''
+            if scope_tenant:
+                tenant_clause = 'AND c.tenant_id = %s'
+                params.append(scope_tenant)
+            cur.execute(f"""
+                SELECT COUNT(*) AS n
+                FROM commits c
+                JOIN tree_entries t ON t.tree_hash = c.tree_hash
+                JOIN blobs b ON b.blob_hash = t.blob_hash
+                WHERE COALESCE(c.bootloader_weight, 0) = 0
+                  AND b.content_type = %s
+                  {tenant_clause}
+            """, params)
+            row = cur.fetchone()
+            candidate_count = row['n'] if row else 0
+
+            updated = 0
+            if not dry_run and candidate_count > 0:
+                cur.execute(f"""
+                    UPDATE commits
+                    SET bootloader_weight = %s
+                    WHERE commit_hash IN (
+                        SELECT c.commit_hash
+                        FROM commits c
+                        JOIN tree_entries t ON t.tree_hash = c.tree_hash
+                        JOIN blobs b ON b.blob_hash = t.blob_hash
+                        WHERE COALESCE(c.bootloader_weight, 0) = 0
+                          AND b.content_type = %s
+                          {tenant_clause}
+                    )
+                """, [target_weight, content_type] + (params[1:] if scope_tenant else []))
+                updated = cur.rowcount
+
+            summary[content_type] = {
+                'target_weight': target_weight,
+                'candidate_count': candidate_count,
+                'updated': updated,
+            }
+
+        if not dry_run:
+            db.commit()
+        return jsonify({
+            'dry_run': dry_run,
+            'tenant_id': scope_tenant,
+            'summary': summary,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+
+
 @app.route('/v2/admin/tenants/<tenant_id>', methods=['PATCH'])
 @require_admin
 def admin_tenant_patch(tenant_id):
