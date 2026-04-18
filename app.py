@@ -8961,12 +8961,27 @@ def immune_patrol():
                                 'reason': reason
                             })
                     except Exception as qe:
+                        # Roll back on quarantine failure so the batch doesn't
+                        # poison subsequent routes' statements.
+                        try:
+                            get_db().rollback()
+                        except Exception:
+                            pass
                         results['errors'].append({
                             'route': route['name'],
                             'error': f"Quarantine failed: {str(qe)}"
                         })
 
         except Exception as e:
+            # Postgres aborts the whole transaction on a statement error (e.g.
+            # statement_timeout hit inside patrol_contradictions). Without this
+            # rollback, every subsequent route returns InFailedSqlTransaction
+            # and the full patrol 502s — observed empty quarantine runs since
+            # 2026-04-09 traced back to exactly this path.
+            try:
+                get_db().rollback()
+            except Exception:
+                pass
             results['errors'].append({'route': route['name'], 'error': str(e)})
 
     # Update branch health scores
