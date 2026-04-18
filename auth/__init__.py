@@ -13,7 +13,18 @@ from functools import wraps
 from flask import request, jsonify, g
 
 # JWT Configuration
-JWT_SECRET = os.environ.get('JWT_SECRET', secrets.token_hex(32))
+# Fail-fast: if JWT_SECRET is missing, refuse to start. The prior fallback
+# `secrets.token_hex(32)` ran at import time — every Railway restart would
+# mint a fresh random secret, silently invalidating all issued tokens, and
+# multi-worker containers would hold inconsistent secrets across workers.
+# A hidden, ongoing vuln. Better to hard-fail at boot so an ops alarm fires
+# than to degrade tokens silently.
+JWT_SECRET = os.environ.get('JWT_SECRET')
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET environment variable is required. "
+        "Refusing to start without one."
+    )
 JWT_ALGORITHM = 'HS256'
 JWT_EXPIRY_HOURS = int(os.environ.get('JWT_EXPIRY_HOURS', 168))
 
