@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from flask import Flask, request, jsonify, g, send_from_directory, has_request_context
 from flask_cors import CORS
@@ -69,7 +70,6 @@ def generate_hyde_document(query: str) -> str:
         )
         return response.content[0].text
     except Exception as e:
-        import sys
         print(f"[HYDE] Error generating hypothetical document: {e}", file=sys.stderr)
         return None
 
@@ -171,8 +171,7 @@ def get_active_dek():
 # Database URL from environment (Railway provides this)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# Startup logging for debugging
-import sys
+# Startup logging for debugging (sys is imported at the top now)
 print(f"[STARTUP] DATABASE_URL set: {bool(DATABASE_URL)}", file=sys.stderr)
 if DATABASE_URL:
     # Log sanitized URL (hide password)
