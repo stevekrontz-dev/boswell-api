@@ -5942,24 +5942,49 @@ SQL_PROBES = {
     'passkey_user_id_uuid_check': {
         'description': (
             'Returns rows in passkey_{credentials,challenges,sessions} '
-            'whose user_id does not match a UUID shape. Zero rows → the '
-            'VARCHAR→UUID migration is a clean ALTER. Non-zero → inspect '
-            'the pattern to design a conversion step. Authored by CW R2.'
+            'whose user_id does not match a UUID shape (cast to text). '
+            'Zero rows → any pending VARCHAR→UUID migration is a clean '
+            'ALTER (or already done). Non-zero → inspect the pattern to '
+            'design a conversion step. Authored by CW R2.'
         ),
         'sql': """
-            SELECT 'passkey_credentials' AS source, user_id, created_at
+            SELECT 'passkey_credentials' AS source, user_id::text AS user_id, created_at
               FROM passkey_credentials
-             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+             WHERE user_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
             UNION ALL
-            SELECT 'passkey_challenges' AS source, user_id, created_at
+            SELECT 'passkey_challenges' AS source, user_id::text AS user_id, created_at
               FROM passkey_challenges
-             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+             WHERE user_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
             UNION ALL
-            SELECT 'passkey_sessions' AS source, user_id, created_at
+            SELECT 'passkey_sessions' AS source, user_id::text AS user_id, created_at
               FROM passkey_sessions
-             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+             WHERE user_id::text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
             ORDER BY created_at ASC
             LIMIT 200
+        """,
+    },
+    'passkey_schema_inspect': {
+        'description': (
+            'Reports the current schema for the three passkey tables: '
+            'column types, nullability, and whether RLS is enabled. '
+            'Discovered during T2 prep that live schema drifted from '
+            'migration 010 (which declared user_id VARCHAR(255) but '
+            'live shows uuid). This probe makes the live state '
+            'authoritative so future migrations plan against reality.'
+        ),
+        'sql': """
+            SELECT
+              c.table_name,
+              c.column_name,
+              c.data_type,
+              c.is_nullable,
+              t.rowsecurity AS rls_enabled
+            FROM information_schema.columns c
+            LEFT JOIN pg_tables t
+              ON t.tablename = c.table_name AND t.schemaname = 'public'
+            WHERE c.table_name IN ('passkey_credentials', 'passkey_challenges', 'passkey_sessions')
+              AND c.column_name IN ('user_id', 'id', 'tenant_id')
+            ORDER BY c.table_name, c.ordinal_position
         """,
     },
 }
