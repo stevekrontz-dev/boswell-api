@@ -8664,11 +8664,30 @@ def patrol_isolated_clusters() -> list:
 
 
 def patrol_duplicate_embeddings(threshold: float = 0.05) -> list:
-    """Detect near-identical embeddings (possible duplicates)."""
+    """Detect near-identical embeddings (possible duplicates).
+
+    Excludes content types that are *expected* to produce near-identical
+    embeddings as a normal side effect — periodic telemetry, heartbeats,
+    etc. Treating those as findings is a category error: they're not
+    spurious duplicates, they're the intended shape of the signal.
+
+    Historical context: through 2026-01 to 2026-04-09, `commit_health_snapshot`
+    wrote a new blob every 5 minutes. The writer was then disabled, but
+    thousands of historical `health_snapshot` rows remain in the blobs
+    table. Every patrol run was finding pairs among them and quarantining
+    them (up to 100/run observed on 2026-04-19). Filtering at the query
+    prevents the pollution at the source.
+    """
+    # Content types that are structurally allowed to near-duplicate themselves.
+    # Add new types here as patterns emerge; don't remove without a replacement
+    # dedup strategy at the writer.
+    EXCLUDED_CONTENT_TYPES = ('health_snapshot',)
+
     findings = []
     cur = get_cursor()
 
-    # Find pairs of blobs with very similar embeddings
+    # Find pairs of blobs with very similar embeddings, skipping pairs where
+    # either side is an excluded content type.
     cur.execute('''
         SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
                b1.embedding <=> b2.embedding AS distance
@@ -8678,9 +8697,11 @@ def patrol_duplicate_embeddings(threshold: float = 0.05) -> list:
           AND b1.tenant_id = %s
           AND COALESCE(b1.quarantined, FALSE) = FALSE
           AND COALESCE(b2.quarantined, FALSE) = FALSE
+          AND b1.content_type NOT IN %s
+          AND b2.content_type NOT IN %s
           AND b1.embedding <=> b2.embedding < %s
         LIMIT 50
-    ''', (get_tenant_id(), threshold))
+    ''', (get_tenant_id(), EXCLUDED_CONTENT_TYPES, EXCLUDED_CONTENT_TYPES, threshold))
 
     seen = set()
     for row in cur.fetchall():
