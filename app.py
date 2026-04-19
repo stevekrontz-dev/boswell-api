@@ -11063,478 +11063,16 @@ def nightly_maintenance():
 
 
 # =============================================================================
-# PASSKEY AUTHENTICATION ENDPOINTS (WebAuthn / Face ID)
-# Author: CC2 - Swarm task beta-4
+# LEGACY /auth/* PASSKEY FLOW — REMOVED 2026-04-19
+# Deprecated by Steve decision: "it was just so i could open the thing with my face.
+# its not load bearing". Verified unused on 2026-04-19 via passkey_usage_recent
+# probe — 0 credentials, 0 sessions, 0 challenges. Route handlers INSERTed into
+# columns that had drifted out of the live schema (device_type, backed_up,
+# transports, friendly_name, last_used_at) and would 500 on any invocation.
+# The passkey_auth.py module remains — still referenced defensively by
+# require_admin as a session-token fallback — but the three passkey tables
+# are empty and the routes are gone.
 # =============================================================================
-
-from passkey_auth import (
-    generate_registration_options,
-    generate_authentication_options,
-    verify_registration_response,
-    verify_authentication_response,
-    generate_session_token,
-    hash_session_token,
-    base64url_to_bytes
-)
-
-GODMODE_PASSWORD = os.environ.get('GODMODE_PASSWORD')
-
-
-def get_session_from_request():
-    """Extract and validate session from request."""
-    # Check Authorization header
-    auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-    else:
-        # Check cookie
-        token = request.cookies.get('boswell_session')
-
-    if not token:
-        return None
-
-    token_hash = hash_session_token(token)
-    cur = get_cursor()
-    cur.execute(
-        '''SELECT user_id, expires_at FROM passkey_sessions
-           WHERE token = %s AND expires_at > NOW()''',
-        (token_hash,)
-    )
-    row = cur.fetchone()
-    cur.close()
-
-    if row:
-        return {'user_id': row['user_id'], 'expires_at': str(row['expires_at'])}
-    return None
-
-
-def require_auth(f):
-    """Decorator to require authentication."""
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        session = get_session_from_request()
-        if not session:
-            # Also allow GODMODE_PASSWORD for backward compatibility. Constant-time
-            # compare so we don't leak character-by-character match timing.
-            supplied = request.headers.get('X-Godmode-Password') or ''
-            if GODMODE_PASSWORD and hmac.compare_digest(supplied, GODMODE_PASSWORD):
-                return f(*args, **kwargs)
-            return jsonify({'error': 'Authentication required'}), 401
-        g.current_user = session['user_id']
-        return f(*args, **kwargs)
-    return decorated
-
-
-@app.route('/auth/register/options', methods=['POST'])
-def auth_register_options():
-    """
-    Start passkey registration.
-    First user to register becomes admin.
-    Requires GODMODE_PASSWORD for initial setup.
-    """
-    # Check if any credentials exist
-    cur = get_cursor()
-    cur.execute('SELECT COUNT(*) as count FROM passkey_credentials')
-    count = cur.fetchone()['count']
-
-    # If credentials exist, require authentication
-    if count > 0:
-        session = get_session_from_request()
-        supplied_gp = request.headers.get('X-Godmode-Password') or ''
-        gp_ok = bool(GODMODE_PASSWORD) and hmac.compare_digest(supplied_gp, GODMODE_PASSWORD)
-        if not session and not gp_ok:
-            cur.close()
-            return jsonify({'error': 'Authentication required to add new passkey'}), 401
-
-    data = request.get_json() or {}
-    user_id = data.get('user_id', 'steve')  # Default to steve for single-user mode
-    user_name = data.get('user_name', user_id)
-    display_name = data.get('display_name', 'Steve Krontz')
-
-    # Get existing credentials for this user
-    cur.execute(
-        'SELECT credential_id FROM passkey_credentials WHERE user_id = %s',
-        (user_id,)
-    )
-    existing = [bytes(row['credential_id']) for row in cur.fetchall()]
-
-    # Generate options
-    options, challenge = generate_registration_options(
-        user_id=user_id,
-        user_name=user_name,
-        user_display_name=display_name,
-        existing_credentials=existing
-    )
-
-    # Store challenge
-    cur.execute(
-        '''INSERT INTO passkey_challenges (user_id, challenge, type)
-           VALUES (%s, %s, 'registration')''',
-        (user_id, challenge)
-    )
-    get_db().commit()
-    cur.close()
-
-    return jsonify(options)
-
-
-@app.route('/auth/register/verify', methods=['POST'])
-def auth_register_verify():
-    """Verify passkey registration and store credential."""
-    data = request.get_json() or {}
-    credential = data.get('credential')
-    user_id = data.get('user_id', 'steve')
-    friendly_name = data.get('friendly_name', 'My Passkey')
-
-    if not credential:
-        return jsonify({'error': 'credential is required'}), 400
-
-    cur = get_cursor()
-    db = get_db()
-
-    try:
-        # Get the challenge
-        cur.execute(
-            '''SELECT challenge FROM passkey_challenges
-               WHERE user_id = %s AND type = 'registration'
-               AND expires_at > NOW()
-               ORDER BY created_at DESC LIMIT 1''',
-            (user_id,)
-        )
-        row = cur.fetchone()
-        if not row:
-            return jsonify({'error': 'No valid challenge found. Start registration again.'}), 400
-
-        expected_challenge = bytes(row['challenge'])
-
-        # Verify the registration
-        result = verify_registration_response(
-            credential=credential,
-            expected_challenge=expected_challenge
-        )
-
-        # Store the credential
-        cur.execute(
-            '''INSERT INTO passkey_credentials
-               (user_id, credential_id, public_key, device_type, backed_up, transports, friendly_name)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)
-               RETURNING id''',
-            (
-                user_id,
-                result['credential_id'],
-                result['public_key'],
-                result['device_type'],
-                result['backed_up'],
-                result.get('transports', ['internal']),
-                friendly_name
-            )
-        )
-
-        # Clean up used challenge
-        cur.execute(
-            "DELETE FROM passkey_challenges WHERE user_id = %s AND type = 'registration'",
-            (user_id,)
-        )
-
-        db.commit()
-        cur.close()
-
-        return jsonify({
-            'status': 'registered',
-            'user_id': user_id,
-            'friendly_name': friendly_name
-        })
-
-    except ValueError as e:
-        db.rollback()
-        cur.close()
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        db.rollback()
-        cur.close()
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/auth/login/options', methods=['POST'])
-def auth_login_options():
-    """Start passkey authentication."""
-    data = request.get_json() or {}
-    user_id = data.get('user_id', 'steve')
-
-    cur = get_cursor()
-
-    # Get user's credentials
-    cur.execute(
-        '''SELECT credential_id, transports FROM passkey_credentials
-           WHERE user_id = %s''',
-        (user_id,)
-    )
-    credentials = cur.fetchall()
-
-    if not credentials:
-        cur.close()
-        return jsonify({'error': 'No passkeys registered. Please register first.'}), 404
-
-    # Generate options
-    options, challenge = generate_authentication_options(credentials)
-
-    # Store challenge
-    cur.execute(
-        '''INSERT INTO passkey_challenges (user_id, challenge, type)
-           VALUES (%s, %s, 'authentication')''',
-        (user_id, challenge)
-    )
-    get_db().commit()
-    cur.close()
-
-    return jsonify(options)
-
-
-@app.route('/auth/login/verify', methods=['POST'])
-def auth_login_verify():
-    """Verify passkey authentication and create session."""
-    data = request.get_json() or {}
-    credential = data.get('credential')
-    user_id = data.get('user_id', 'steve')
-
-    if not credential:
-        return jsonify({'error': 'credential is required'}), 400
-
-    cur = get_cursor()
-    db = get_db()
-
-    try:
-        # Get the challenge
-        cur.execute(
-            '''SELECT challenge FROM passkey_challenges
-               WHERE user_id = %s AND type = 'authentication'
-               AND expires_at > NOW()
-               ORDER BY created_at DESC LIMIT 1''',
-            (user_id,)
-        )
-        row = cur.fetchone()
-        if not row:
-            return jsonify({'error': 'No valid challenge found. Start login again.'}), 400
-
-        expected_challenge = bytes(row['challenge'])
-
-        # Get the stored credential
-        credential_id = base64url_to_bytes(credential.get('id', ''))
-        cur.execute(
-            '''SELECT * FROM passkey_credentials
-               WHERE user_id = %s AND credential_id = %s''',
-            (user_id, credential_id)
-        )
-        stored_credential = cur.fetchone()
-
-        if not stored_credential:
-            return jsonify({'error': 'Credential not found'}), 404
-
-        # Verify the authentication
-        verify_authentication_response(
-            credential=credential,
-            expected_challenge=expected_challenge,
-            stored_credential=stored_credential
-        )
-
-        # Update counter and last_used
-        cur.execute(
-            '''UPDATE passkey_credentials
-               SET counter = counter + 1, last_used_at = NOW()
-               WHERE id = %s''',
-            (stored_credential['id'],)
-        )
-
-        # Create session
-        session_token = generate_session_token()
-        token_hash = hash_session_token(session_token)
-
-        cur.execute(
-            '''INSERT INTO passkey_sessions (user_id, token, user_agent, ip_address)
-               VALUES (%s, %s, %s, %s)
-               RETURNING expires_at''',
-            (
-                user_id,
-                token_hash,
-                request.headers.get('User-Agent', '')[:500],
-                request.remote_addr
-            )
-        )
-        expires_at = cur.fetchone()['expires_at']
-
-        # Clean up used challenge
-        cur.execute(
-            "DELETE FROM passkey_challenges WHERE user_id = %s AND type = 'authentication'",
-            (user_id,)
-        )
-
-        db.commit()
-        cur.close()
-
-        response = jsonify({
-            'status': 'authenticated',
-            'user_id': user_id,
-            'expires_at': str(expires_at)
-        })
-
-        # Set cookie for browser use
-        response.set_cookie(
-            'boswell_session',
-            session_token,
-            httponly=True,
-            secure=True,
-            samesite='Lax',
-            max_age=7 * 24 * 60 * 60  # 7 days
-        )
-
-        # Also return token in body for API use
-        response_data = response.get_json()
-        response_data['token'] = session_token
-        response.set_data(json.dumps(response_data))
-
-        return response
-
-    except ValueError as e:
-        db.rollback()
-        cur.close()
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        db.rollback()
-        cur.close()
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/auth/session', methods=['GET'])
-def auth_session():
-    """Check current session status."""
-    session = get_session_from_request()
-    if session:
-        return jsonify({
-            'authenticated': True,
-            'user_id': session['user_id'],
-            'expires_at': session['expires_at']
-        })
-    return jsonify({'authenticated': False}), 401
-
-
-@app.route('/auth/logout', methods=['POST'])
-def auth_logout():
-    """Destroy current session."""
-    auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-    else:
-        token = request.cookies.get('boswell_session')
-
-    if token:
-        token_hash = hash_session_token(token)
-        cur = get_cursor()
-        cur.execute('DELETE FROM passkey_sessions WHERE token = %s', (token_hash,))
-        get_db().commit()
-        cur.close()
-
-    response = jsonify({'status': 'logged_out'})
-    response.delete_cookie('boswell_session')
-    return response
-
-
-@app.route('/auth/passkeys', methods=['GET'])
-@require_auth
-def list_passkeys():
-    """List all registered passkeys for current user."""
-    user_id = g.get('current_user', 'steve')
-    cur = get_cursor()
-    cur.execute(
-        '''SELECT id, friendly_name, device_type, created_at, last_used_at
-           FROM passkey_credentials WHERE user_id = %s
-           ORDER BY created_at DESC''',
-        (user_id,)
-    )
-    passkeys = cur.fetchall()
-    cur.close()
-
-    return jsonify({
-        'passkeys': [
-            {
-                'id': str(p['id']),
-                'friendly_name': p['friendly_name'],
-                'device_type': p['device_type'],
-                'created_at': str(p['created_at']),
-                'last_used_at': str(p['last_used_at']) if p['last_used_at'] else None
-            }
-            for p in passkeys
-        ]
-    })
-
-
-@app.route('/auth/password', methods=['POST'])
-def auth_password():
-    """
-    Password fallback authentication.
-    Uses GODMODE_PASSWORD for single-user mode.
-    """
-    # Rate limit by IP: 20 attempts/hour. GODMODE_PASSWORD is the highest
-    # privilege credential in the system — no legitimate flow needs >20
-    # tries per hour.
-    from auth import is_rate_limited
-    ip = request.remote_addr or 'unknown'
-    if is_rate_limited('auth_password', ip, limit=20, window_seconds=3600):
-        return jsonify({'error': 'Too many attempts. Try again later.'}), 429
-
-    data = request.get_json() or {}
-    password = data.get('password')
-
-    if not password:
-        return jsonify({'error': 'password is required'}), 400
-
-    # Constant-time compare — /auth/password is the single-user CLI fallback
-    # and the highest-privilege password in the system.
-    if not GODMODE_PASSWORD or not hmac.compare_digest(password, GODMODE_PASSWORD):
-        return jsonify({'error': 'Invalid password'}), 401
-
-    user_id = 'steve'  # Single-user mode
-
-    # Create session
-    cur = get_cursor()
-    db = get_db()
-
-    session_token = generate_session_token()
-    token_hash = hash_session_token(session_token)
-
-    cur.execute(
-        '''INSERT INTO passkey_sessions (user_id, token, user_agent, ip_address)
-           VALUES (%s, %s, %s, %s)
-           RETURNING expires_at''',
-        (
-            user_id,
-            token_hash,
-            request.headers.get('User-Agent', '')[:500],
-            request.remote_addr
-        )
-    )
-    expires_at = cur.fetchone()['expires_at']
-    db.commit()
-    cur.close()
-
-    response = jsonify({
-        'status': 'authenticated',
-        'user_id': user_id,
-        'token': session_token,
-        'expires_at': str(expires_at)
-    })
-
-    response.set_cookie(
-        'boswell_session',
-        session_token,
-        httponly=True,
-        secure=True,
-        samesite='Lax',
-        max_age=7 * 24 * 60 * 60
-    )
-
-    return response
-
 
 # =============================================================================
 # USER REGISTRATION (W1P1 - CC1)
@@ -11721,8 +11259,10 @@ app.register_blueprint(party_bp)
 # EXTENSION DOWNLOAD (W4P2 - CC4)
 # =============================================================================
 
+from auth import require_jwt as _require_jwt_for_download
+
 @app.route('/api/extension/download', methods=['POST'])
-@require_auth
+@_require_jwt_for_download
 def download_extension():
     """Download personalized .mcpb bundle for Claude Desktop.
 
@@ -11730,17 +11270,26 @@ def download_extension():
     the user's Claude Desktop can authenticate against Boswell. POST-with-body
     (not GET-with-query-param) keeps the key out of URL logs, browser history,
     and Referer headers.
+
+    Authenticated via Boswell JWT (Authorization: Bearer <jwt>). The legacy
+    @require_auth decorator was removed 2026-04-19 along with the passkey
+    /auth/* routes — it only accepted passkey-session tokens or GODMODE, not
+    the JWTs the dashboard actually sends.
     """
     from flask import Response
     from extension.builder.bundler import generate_bundle_for_user
 
-    user_id = g.get('current_user', 'steve')
+    # require_jwt sets g.current_user to the JWT payload dict.
+    payload = g.current_user
+    jwt_tenant_id = payload.get('tenant_id')
+    if not jwt_tenant_id:
+        return jsonify({'error': 'JWT missing tenant_id'}), 403
 
     cur = get_cursor()
     try:
         cur.execute(
-            'SELECT id, name FROM tenants WHERE name = %s OR id::text = %s LIMIT 1',
-            (user_id, get_tenant_id())
+            'SELECT id, name FROM tenants WHERE id::text = %s LIMIT 1',
+            (jwt_tenant_id,)
         )
         tenant_row = cur.fetchone()
     finally:
