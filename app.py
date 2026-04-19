@@ -12634,11 +12634,24 @@ def serve_assets(filename):
     """Serve static assets (JS, CSS, etc.)."""
     return send_from_directory(os.path.join(DASHBOARD_DIR, 'assets'), filename)
 
+# API path prefixes the SPA catch-all must NOT swallow. Any new backend
+# prefix needs to be added here or the SPA will silently shadow its 404s
+# with index.html (Agent 2 MEDIUM finding). Derived from registered
+# blueprints: /v2 (core + auth + billing + onboarding), /api (health,
+# extension), /oauth (MCP OAuth server), /signup (public GitHub signup),
+# /mcp (MCP transport health probe), /party (party beta routes).
+# /auth/ retained for 404-on-legacy-passkey-clients (routes removed
+# 2026-04-19 but catch keeps behavior predictable).
+_API_PREFIXES = ('v2/', 'api/', 'oauth/', 'signup/', 'auth/', 'mcp', 'party')
+
+
 @app.route('/<path:path>')
 def serve_spa(path):
     """Catch-all route for SPA - return index.html for client-side routing."""
-    # Don't catch API routes
-    if path.startswith('v2/') or path.startswith('api/') or path.startswith('auth/') or path.startswith('mcp') or path.startswith('party'):
+    # Don't catch API routes — JSON 404 keeps integrators in a predictable
+    # error shape rather than serving them an HTML page that tries to parse
+    # as JSON.
+    if any(path.startswith(p) for p in _API_PREFIXES):
         return jsonify({'error': 'Not found'}), 404
     # Check if it's a static file
     static_path = os.path.join(DASHBOARD_DIR, path)
