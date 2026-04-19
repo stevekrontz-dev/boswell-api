@@ -6087,45 +6087,6 @@ def admin_sql_probe():
         cur.close()
 
 
-@app.route('/v2/admin/schema/apply-026', methods=['POST'])
-@require_admin
-def admin_apply_migration_026():
-    """One-shot runner for migration 026 (stripe_webhook_events dedup table).
-
-    Paired with the C1 fix in billing/stripe_handler.py — the webhook handler
-    now INSERTs into this table with ON CONFLICT DO NOTHING and skips dispatch
-    on a row that already exists. Idempotent via IF NOT EXISTS. To be removed
-    in a follow-up commit after a single successful run.
-    """
-    cur = get_cursor()
-    db = get_db()
-    try:
-        migration_path = os.path.join(os.path.dirname(__file__), 'db', 'migrations', '026_stripe_webhook_events.sql')
-        if not os.path.exists(migration_path):
-            return jsonify({'error': f'migration file not found: {migration_path}'}), 500
-        with open(migration_path, 'r') as f:
-            sql = f.read()
-        cur.execute(sql)
-        db.commit()
-
-        cur.execute("""
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = 'stripe_webhook_events'
-            ORDER BY ordinal_position
-        """)
-        cols = [
-            {'name': r['column_name'], 'type': r['data_type'], 'nullable': r['is_nullable']}
-            for r in cur.fetchall()
-        ]
-        return jsonify({'applied': True, 'columns': cols})
-    except Exception as e:
-        db.rollback()
-        return jsonify({'error': str(e)}), 500
-    finally:
-        cur.close()
-
-
 @app.route('/v2/admin/commits/<commit_hash>/bootloader-weight', methods=['PATCH'])
 @require_admin
 def admin_set_commit_bootloader_weight(commit_hash):
