@@ -8982,43 +8982,77 @@ def patrol_contradictions() -> list:
     except Exception:
         last_patrol = None
 
-    # Find candidate pairs: cosine distance 0.05-0.50, at least one blob is new
+    # Find candidate pairs via LATERAL + ivfflat index instead of an O(n²)
+    # pairwise self-join. For each "seed" blob b1 (new since last patrol,
+    # or a sampled 200 blobs if no last patrol), use the embedding index
+    # to pull the 20 nearest neighbors, then filter by the 0.05-0.50 zone.
+    # Dedupe pair direction via least/greatest on blob_hash.
+    #
+    # The old self-join was the CONTRADICTION route's 60s-statement-timeout
+    # root cause — flagged by Agent 4 and CW R2. Pattern mirrors the Tier 3
+    # dedup sweep at line ~10611 (already in prod).
+    # Shared column list: normalize blob1/blob2 via least/greatest, and
+    # use CASE to attach the right content/created_at to each side so the
+    # downstream consumer keeps seeing pair['content1'/'content2'/'created1'/
+    # 'created2'] paired with pair['blob1'/'blob2'] respectively.
+    _select_cols = """
+        SELECT DISTINCT ON (least(b1.blob_hash, neighbor.blob_hash),
+                            greatest(b1.blob_hash, neighbor.blob_hash))
+               least(b1.blob_hash, neighbor.blob_hash) AS blob1,
+               greatest(b1.blob_hash, neighbor.blob_hash) AS blob2,
+               neighbor.distance,
+               CASE WHEN b1.blob_hash < neighbor.blob_hash
+                    THEN substring(b1.content, 1, 500)
+                    ELSE substring(neighbor.content, 1, 500) END AS content1,
+               CASE WHEN b1.blob_hash < neighbor.blob_hash
+                    THEN substring(neighbor.content, 1, 500)
+                    ELSE substring(b1.content, 1, 500) END AS content2,
+               CASE WHEN b1.blob_hash < neighbor.blob_hash
+                    THEN b1.created_at ELSE neighbor.created_at END AS created1,
+               CASE WHEN b1.blob_hash < neighbor.blob_hash
+                    THEN neighbor.created_at ELSE b1.created_at END AS created2
+    """
+    _lateral_join = """
+        CROSS JOIN LATERAL (
+            SELECT n.blob_hash, n.embedding, n.content, n.created_at,
+                   n.embedding <=> b1.embedding AS distance
+            FROM blobs n
+            WHERE n.tenant_id = %s
+              AND n.blob_hash <> b1.blob_hash
+              AND n.embedding IS NOT NULL
+              AND COALESCE(n.quarantined, FALSE) = FALSE
+            ORDER BY n.embedding <=> b1.embedding
+            LIMIT 20
+        ) neighbor
+        WHERE neighbor.distance BETWEEN 0.05 AND 0.50
+        ORDER BY least(b1.blob_hash, neighbor.blob_hash),
+                 greatest(b1.blob_hash, neighbor.blob_hash),
+                 neighbor.distance ASC
+        LIMIT 20
+    """
     if last_patrol:
-        cur.execute("""
-            SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
-                   b1.embedding <=> b2.embedding AS distance,
-                   substring(b1.content, 1, 500) as content1,
-                   substring(b2.content, 1, 500) as content2,
-                   b1.created_at as created1, b2.created_at as created2
-            FROM blobs b1
-            JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
-            WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
-              AND b1.tenant_id = %s
-              AND COALESCE(b1.quarantined, FALSE) = FALSE
-              AND COALESCE(b2.quarantined, FALSE) = FALSE
-              AND b1.embedding <=> b2.embedding BETWEEN 0.05 AND 0.50
-              AND (b1.created_at > %s OR b2.created_at > %s)
-            ORDER BY b1.embedding <=> b2.embedding ASC
-            LIMIT 20
-        """, (tenant_id, last_patrol, last_patrol))
+        cur.execute(_select_cols + """
+            FROM (
+                SELECT blob_hash, embedding, content, created_at
+                FROM blobs
+                WHERE tenant_id = %s
+                  AND embedding IS NOT NULL
+                  AND COALESCE(quarantined, FALSE) = FALSE
+                  AND created_at > %s
+                LIMIT 200
+            ) b1
+        """ + _lateral_join, (tenant_id, last_patrol, tenant_id))
     else:
-        # First run: sample across the full graph
-        cur.execute("""
-            SELECT b1.blob_hash as blob1, b2.blob_hash as blob2,
-                   b1.embedding <=> b2.embedding AS distance,
-                   substring(b1.content, 1, 500) as content1,
-                   substring(b2.content, 1, 500) as content2,
-                   b1.created_at as created1, b2.created_at as created2
-            FROM blobs b1
-            JOIN blobs b2 ON b1.blob_hash < b2.blob_hash AND b1.tenant_id = b2.tenant_id
-            WHERE b1.embedding IS NOT NULL AND b2.embedding IS NOT NULL
-              AND b1.tenant_id = %s
-              AND COALESCE(b1.quarantined, FALSE) = FALSE
-              AND COALESCE(b2.quarantined, FALSE) = FALSE
-              AND b1.embedding <=> b2.embedding BETWEEN 0.05 AND 0.50
-            ORDER BY b1.embedding <=> b2.embedding ASC
-            LIMIT 20
-        """, (tenant_id,))
+        cur.execute(_select_cols + """
+            FROM (
+                SELECT blob_hash, embedding, content, created_at
+                FROM blobs
+                WHERE tenant_id = %s
+                  AND embedding IS NOT NULL
+                  AND COALESCE(quarantined, FALSE) = FALSE
+                LIMIT 200
+            ) b1
+        """ + _lateral_join, (tenant_id, tenant_id))
 
     pairs = cur.fetchall()
 
