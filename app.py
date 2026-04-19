@@ -819,6 +819,222 @@ def health_daemon():
         return jsonify(response), 200
 
 
+# ==================== CRON HEALTH ALERTING ====================
+# Closes open task 9fd4cd44 (BUILD: Cron health alerting) by wiring active
+# notification on top of Alert 6 (the read-only detection in admin_alerts).
+# Detection was already in place from commit 7c79721 on 2026-04-08, but
+# nothing polled the alerts, so a silent cron could still go unobserved
+# until someone manually hit /v2/admin/alerts. This adds a push path.
+
+_ALERT_THROTTLE_HOURS = 12
+_ALERT_EMAIL_TO = os.environ.get('ALERT_EMAIL_TO', 'stevekrontz@gmail.com')
+
+
+def _ensure_alert_notifications_schema():
+    """Idempotent create of the alert_notifications table used for dedup."""
+    try:
+        cur = get_cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS alert_notifications (
+                alert_key          TEXT PRIMARY KEY,
+                alert_type         TEXT NOT NULL,
+                severity           TEXT NOT NULL,
+                message            TEXT,
+                first_seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_notified_at   TIMESTAMPTZ NULL,
+                notification_count INT NOT NULL DEFAULT 0,
+                resolved_at        TIMESTAMPTZ NULL
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alert_notifications_unresolved
+            ON alert_notifications (resolved_at)
+            WHERE resolved_at IS NULL
+        """)
+        get_db().commit()
+        cur.close()
+    except Exception as e:
+        print(f"[ALERT-CHECK] schema ensure failed: {e}", file=sys.stderr)
+        try:
+            get_db().rollback()
+        except Exception:
+            pass
+
+
+def _alert_key(a: dict) -> str:
+    """Stable per-alert identifier. 'cron_silent::<service>' for Alert 6;
+    type-only for the others (they don't have a secondary identifier that
+    changes within a condition)."""
+    details = a.get('details') or {}
+    atype = a.get('type') or 'unknown'
+    if atype == 'cron_silent':
+        return f"cron_silent::{details.get('service', 'unknown')}"
+    return f"{atype}::default"
+
+
+def _send_alert_email(alert: dict):
+    """Send a single alert email via Resend. Never raises."""
+    import resend
+    if not os.environ.get('RESEND_API_KEY'):
+        print(f"[ALERT-CHECK] RESEND_API_KEY not set — skipping email for {alert.get('type')}", file=sys.stderr)
+        return False
+    resend.api_key = os.environ.get('RESEND_API_KEY')
+    try:
+        severity = alert.get('severity', 'info').upper()
+        atype = alert.get('type', 'unknown')
+        msg = alert.get('message', '(no message)')
+        details_str = json.dumps(alert.get('details') or {}, indent=2, default=str)
+        resend.Emails.send({
+            "from": "Boswell Alerts <noreply@askboswell.com>",
+            "to": [_ALERT_EMAIL_TO],
+            "subject": f"[Boswell {severity}] {atype}",
+            "html": f"""
+                <div style="font-family: -apple-system, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+                  <h2 style="color: #1a1a2e; margin-bottom: 12px;">{severity}: {atype}</h2>
+                  <p style="color: #4a4a5a; line-height: 1.5; font-size: 15px;">{msg}</p>
+                  <pre style="background: #f5f5f7; padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto;">{details_str}</pre>
+                  <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
+                  <p style="color: #8a8a9a; font-size: 12px;">
+                    Fired at {datetime.utcnow().isoformat()}Z by /v2/health/alert-check.
+                    Throttled to one email per alert per {_ALERT_THROTTLE_HOURS}h.
+                  </p>
+                </div>
+            """
+        })
+        return True
+    except Exception as e:
+        print(f"[ALERT-CHECK] email send failed: {e}", file=sys.stderr)
+        return False
+
+
+@app.route('/v2/health/alert-check', methods=['POST'])
+def alert_check():
+    """Poll admin_alerts for critical alerts and send notifications.
+
+    Intended to be called on a Railway cron schedule (~30min). Gated by the
+    INTERNAL_SECRET header (is_internal_request) so it isn't exposed to the
+    public — an open endpoint could be hammered to exhaust Resend quota.
+
+    Behavior:
+      - Computes a stable alert_key per critical alert.
+      - UPSERTs alert_notifications to record the sighting.
+      - If last_notified_at is NULL or older than _ALERT_THROTTLE_HOURS,
+        sends an email via Resend and updates last_notified_at.
+      - For any existing un-resolved rows whose key was NOT in this tick's
+        critical set, marks resolved_at = NOW (cron came back online).
+
+    Returns: {checked_at, critical_count, notified_count, resolved_count}
+    """
+    from auth import is_internal_request
+
+    # Admin JWT bearer also acceptable — useful for manual triggering.
+    authorized = is_internal_request()
+    if not authorized:
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            try:
+                from auth import verify_jwt
+                payload = verify_jwt(auth_header[7:])
+                cur_admin = get_cursor()
+                try:
+                    cur_admin.execute('SELECT is_admin FROM users WHERE id = %s', (payload.get('sub'),))
+                    r = cur_admin.fetchone()
+                    if r and r.get('is_admin'):
+                        authorized = True
+                finally:
+                    cur_admin.close()
+            except Exception:
+                pass
+    if not authorized:
+        return jsonify({'error': 'internal or admin only'}), 401
+
+    _ensure_alert_notifications_schema()
+
+    current = get_current_alerts_internal()
+    critical = [a for a in current.get('alerts', []) if a.get('severity') == 'critical']
+    now_keys = {_alert_key(a) for a in critical}
+
+    notified = 0
+    seen_keys = []
+    cur = get_cursor()
+    db = get_db()
+    try:
+        # UPSERT each current critical + decide whether to notify
+        for alert in critical:
+            k = _alert_key(alert)
+            seen_keys.append(k)
+            cur.execute("""
+                INSERT INTO alert_notifications
+                    (alert_key, alert_type, severity, message, first_seen_at, last_seen_at)
+                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (alert_key) DO UPDATE SET
+                    last_seen_at = NOW(),
+                    severity = EXCLUDED.severity,
+                    message = EXCLUDED.message,
+                    resolved_at = NULL
+                RETURNING last_notified_at, notification_count
+            """, (k, alert.get('type'), alert.get('severity'), alert.get('message')))
+            row = cur.fetchone()
+            last_notified = row['last_notified_at']
+
+            should_notify = (
+                last_notified is None
+                or (datetime.now(last_notified.tzinfo) - last_notified).total_seconds()
+                   > _ALERT_THROTTLE_HOURS * 3600
+            )
+            if should_notify and _send_alert_email(alert):
+                cur.execute("""
+                    UPDATE alert_notifications
+                    SET last_notified_at = NOW(),
+                        notification_count = notification_count + 1
+                    WHERE alert_key = %s
+                """, (k,))
+                notified += 1
+
+        # Mark resolved: rows that are unresolved but not in current critical set
+        resolved_count = 0
+        if seen_keys:
+            cur.execute("""
+                UPDATE alert_notifications
+                SET resolved_at = NOW()
+                WHERE resolved_at IS NULL
+                  AND alert_key != ALL(%s)
+            """, (list(seen_keys),))
+            resolved_count = cur.rowcount
+        else:
+            cur.execute("""
+                UPDATE alert_notifications
+                SET resolved_at = NOW()
+                WHERE resolved_at IS NULL
+            """)
+            resolved_count = cur.rowcount
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+
+    # Heartbeat for this cron too — closing the recursive case.
+    write_heartbeat(
+        'alert_check',
+        'ok',
+        f"critical={len(critical)} notified={notified} resolved={resolved_count}",
+        work_done=notified,
+        expected_interval_minutes=30
+    )
+
+    return jsonify({
+        'checked_at': datetime.utcnow().isoformat() + 'Z',
+        'critical_count': len(critical),
+        'notified_count': notified,
+        'resolved_count': resolved_count,
+        'throttle_hours': _ALERT_THROTTLE_HOURS,
+    })
+
+
 # ==================== OAUTH DISCOVERY ====================
 # Boswell is its own OAuth Authorization Server. Auth0 proxy approach
 # failed because Auth0 returns opaque JWE tokens regardless of audience.
