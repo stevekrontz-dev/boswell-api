@@ -501,9 +501,38 @@ def create_checkout_session():
         db = get_db()
         cur = get_cursor()
 
-        # Check if user already has a Stripe customer ID
-        cur.execute('SELECT stripe_customer_id FROM users WHERE id = %s', (user_id,))
+        # C4 fix: refuse a second checkout if the user already has an active
+        # Stripe subscription. Before this guard, a pending_payment user could
+        # call /v2/billing/checkout twice and complete both — the webhook's
+        # ON CONFLICT (tenant_id) DO UPDATE at line ~167 would overwrite the
+        # first stripe_subscription_id with the second, orphaning the first
+        # subscription on Stripe's side while Stripe still charged for both.
+        # Real double-charge surface.
+        cur.execute(
+            'SELECT stripe_customer_id, stripe_subscription_id FROM users WHERE id = %s',
+            (user_id,)
+        )
         row = cur.fetchone()
+        existing_sub = row.get('stripe_subscription_id') if row else None
+        if existing_sub:
+            # Confirm the subscription is still considered active on Stripe's side.
+            # If it's already cancelled there, allow a fresh checkout; otherwise block.
+            try:
+                sub = stripe.Subscription.retrieve(existing_sub)
+                if sub.get('status') in ('active', 'trialing', 'past_due', 'unpaid', 'incomplete'):
+                    cur.close()
+                    return jsonify({
+                        'error': 'Subscription already active',
+                        'error_description': (
+                            'This account already has an active Stripe subscription. '
+                            'Cancel or change it via the billing portal before starting a new checkout.'
+                        ),
+                        'existing_subscription_id': existing_sub,
+                    }), 409
+            except stripe.error.InvalidRequestError:
+                # Subscription id no longer exists on Stripe — safe to proceed.
+                pass
+
         customer_id = row.get('stripe_customer_id') if row else None
 
         if not customer_id:
