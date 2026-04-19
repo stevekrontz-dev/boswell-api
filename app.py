@@ -11509,10 +11509,10 @@ MCP_TOOLS = [
                 "branch": {"type": "string", "description": "Branch to commit to (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
                 "content": {"oneOf": [{"type": "object"}, {"type": "string"}], "description": "Memory content as JSON object or JSON string"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
-                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'plan', 'skill' (behavioral instruction), or 'credential'", "default": "memory"},
+                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'plan' (active work plan), 'skill' (behavioral instruction), 'credential' (auth material), or 'methodology' (future-instance reasoning; weight=0.9 default)", "default": "memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
                 "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"},
-                "bootloader_weight": {"type": "number", "description": "How eagerly this commit should be auto-loaded on conversation start (0.0-1.0). Omit for content-type defaults: skill=1.0, credential=0.8, plan=0.6, memory=0.0."}
+                "bootloader_weight": {"type": "number", "description": "How eagerly this commit should be auto-loaded on conversation start (0.0-1.0). Omit for content-type defaults: skill=1.0, methodology=0.9, credential=0.8, plan=0.6, memory=0.0."}
             },
             "required": ["branch", "content", "message"]
         }
@@ -12037,9 +12037,18 @@ def dispatch_mcp_tool(tool_name, args):
         # get auto-loaded on conversation start. Weights are picked so skills
         # > credentials > plans > memories.
         default_weights = {
+            # behavioral — future machine action
             "skill": 1.0,
+            # credential — retrieval priority for auth/secret material
             "credential": 0.8,
+            # methodology — future instance reasoning (how-to-think, not how-to-do)
+            # Added per CW R2 ('skills/credentials/plans are about future
+            # machine action; methodology is about future instance reasoning
+            # — same importance class, different surface')
+            "methodology": 0.9,
+            # plan — active work plans
             "plan": 0.6,
+            # memory — default. explicit bootloader_weight may still promote.
             "memory": 0.0,
         }
         bootloader_weight = args.get("bootloader_weight")
