@@ -199,6 +199,21 @@ def get_tenant_id():
         return auth['tenant_id']
     return DEFAULT_TENANT
 
+
+def get_user_id():
+    """Get the active user ID. Returns None if the request is not associated
+    with a specific user (e.g. tenant-scoped API key without a user binding).
+
+    Used by get_db() to set the `app.current_user` Postgres GUC so RLS
+    policies keyed on user identity (users, api_keys, passkey_*) can work.
+    Before this helper existed, only `app.current_tenant` was set and every
+    user-scoped policy silently evaluated against an empty string.
+    """
+    auth = getattr(g, 'mcp_auth', None)
+    if auth and auth.get('user_id'):
+        return str(auth['user_id'])
+    return None
+
 def push_tenant_override(tenant_id):
     """Push tenant onto thread-local stack. Always pair with pop."""
     if not hasattr(_tenant_override, 'stack'):
@@ -236,9 +251,15 @@ def get_db():
                 register_vector(g.db)
             except Exception:
                 pass  # pgvector extension not in DB, skip
-        # Set tenant context for RLS
+        # Set tenant + user context for RLS policies.
+        # app.current_user is empty-string when there's no authenticated user
+        # (e.g. tenant-API-key path). RLS policies on user-scoped tables
+        # (users, api_keys, passkey_*) must handle empty-string explicitly —
+        # typically by evaluating to FALSE when the GUC is empty, which is
+        # the safe default.
         cur = g.db.cursor()
         cur.execute("SELECT set_config('app.current_tenant', %s, true)", (get_tenant_id(),))
+        cur.execute("SELECT set_config('app.current_user', %s, true)", (get_user_id() or '',))
         cur.close()
     return g.db
 
