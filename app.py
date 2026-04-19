@@ -6087,6 +6087,49 @@ def admin_sql_probe():
         cur.close()
 
 
+@app.route('/v2/admin/commits/<commit_hash>/bootloader-weight', methods=['PATCH'])
+@require_admin
+def admin_set_commit_bootloader_weight(commit_hash):
+    """Set the bootloader_weight on a specific commit. Used for post-hoc
+    adjustments when a commit shipped with the wrong weight (e.g. argue
+    briefs that shipped as content_type='memory' with weight=0 despite
+    being worth auto-loading).
+
+    Request body: {"weight": 0.9}  # required; any float in [0.0, 1.0]
+    """
+    data = request.get_json(silent=True) or {}
+    if 'weight' not in data:
+        return jsonify({'error': 'weight is required'}), 400
+    try:
+        w = float(data['weight'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'weight must be a number'}), 400
+    if w < 0.0 or w > 1.0:
+        return jsonify({'error': 'weight must be in [0.0, 1.0]'}), 400
+
+    cur = get_cursor()
+    db = get_db()
+    try:
+        cur.execute(
+            'UPDATE commits SET bootloader_weight = %s WHERE commit_hash = %s RETURNING commit_hash, bootloader_weight, message',
+            (w, commit_hash)
+        )
+        row = cur.fetchone()
+        if not row:
+            return jsonify({'error': f'commit {commit_hash[:12]}... not found'}), 404
+        db.commit()
+        return jsonify({
+            'commit_hash': row['commit_hash'],
+            'bootloader_weight': float(row['bootloader_weight']) if row['bootloader_weight'] is not None else None,
+            'message': row['message'],
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+
+
 @app.route('/v2/admin/commits/backfill-bootloader-weights', methods=['POST'])
 @require_admin
 def admin_backfill_bootloader_weights():
