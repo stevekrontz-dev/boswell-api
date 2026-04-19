@@ -54,10 +54,38 @@ def stripe_webhook():
         print(f"[STRIPE] Invalid signature: {e}", flush=True)
         return jsonify({'error': 'Invalid signature'}), 400
 
+    event_id = event.get('id')
     event_type = event['type']
     event_data = event['data']['object']
 
-    print(f"[STRIPE] Received event: {event_type}", flush=True)
+    print(f"[STRIPE] Received event: {event_type} id={event_id}", flush=True)
+
+    # C1 fix: dedup by event.id. Stripe retries on any non-2xx for up to 3
+    # days. Without this guard, a handler that 500'd AFTER a side effect had
+    # landed would re-run on retry and re-do the side effect.
+    #
+    # Race-safe via ON CONFLICT DO NOTHING; whichever worker wins the insert
+    # processes the event, everyone else returns 200 without dispatch.
+    get_db, get_cursor, _ = get_db_functions()
+    dedup_db = get_db()
+    dedup_cur = get_cursor()
+    try:
+        dedup_cur.execute(
+            """
+            INSERT INTO stripe_webhook_events (event_id, event_type)
+            VALUES (%s, %s)
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            (event_id, event_type)
+        )
+        first_insert = dedup_cur.rowcount == 1
+        dedup_db.commit()
+    finally:
+        dedup_cur.close()
+
+    if not first_insert:
+        print(f"[STRIPE] Duplicate event {event_id} — already processed, skipping dispatch", flush=True)
+        return jsonify({'status': 'duplicate', 'event_id': event_id}), 200
 
     try:
         if event_type == 'checkout.session.completed':
@@ -69,10 +97,32 @@ def stripe_webhook():
         else:
             print(f"[STRIPE] Unhandled event type: {event_type}", flush=True)
 
+        # Mark processed_at only on successful dispatch so a failure still
+        # lets Stripe retry (the row exists but processed_at is NULL — see
+        # next comment for why retries are still safe).
+        mark_cur = get_cursor()
+        try:
+            mark_cur.execute(
+                'UPDATE stripe_webhook_events SET processed_at = NOW() WHERE event_id = %s',
+                (event_id,)
+            )
+            dedup_db.commit()
+        finally:
+            mark_cur.close()
+
         return jsonify({'status': 'success'}), 200
 
     except Exception as e:
         print(f"[STRIPE] Error processing {event_type}: {e}", flush=True)
+        # NOTE: Row stays in stripe_webhook_events even on failure. That
+        # means Stripe's retry WILL be rejected as a duplicate. This is a
+        # deliberate tradeoff — duplicate rejection is safer than
+        # potential double-side-effects from re-running a partially-
+        # successful handler. Operations can inspect rows where
+        # processed_at IS NULL to find events that errored out and decide
+        # whether to replay manually. Future improvement: distinguish
+        # 'retryable' vs 'permanent' failure and DELETE the row on the
+        # former, leaving the Stripe retry path open.
         return jsonify({'error': str(e)}), 500
 
 
