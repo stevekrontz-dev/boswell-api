@@ -300,7 +300,20 @@ def handle_subscription_deleted(subscription):
                     updated_at = %s
                 WHERE tenant_id = %s
             """, (now, tenant_id))
-            print(f"[STRIPE] Subscription {subscription_id} canceled, downgraded to free - synced users table", flush=True)
+            # H1 fix: revoke the tenant's API keys. Previously the keys kept
+            # validating after cancellation because handle_subscription_deleted
+            # only touched plan/stripe_subscription_id. That meant a cancelled
+            # customer kept full API access until they rotated keys themselves
+            # — revenue leak unless every downstream route plan-gated. Keys are
+            # soft-deleted (revoked_at = NOW); hashes are retained so past
+            # audit lookups still resolve.
+            cur.execute("""
+                UPDATE api_keys SET
+                    revoked_at = %s
+                WHERE tenant_id = %s AND revoked_at IS NULL
+            """, (now, tenant_id))
+            keys_revoked = cur.rowcount
+            print(f"[STRIPE] Subscription {subscription_id} canceled, downgraded to free - synced users table, revoked {keys_revoked} api_key(s)", flush=True)
         else:
             print(f"[STRIPE] Subscription {subscription_id} not found for cancellation", flush=True)
 
