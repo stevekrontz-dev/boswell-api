@@ -5929,6 +5929,87 @@ def admin_tenant_detail(tenant_id):
         return jsonify({'error': str(e)}), 500
 
 
+# ============================================================
+# Allowlisted read-only diagnostic queries (CW R2 design).
+# Callers POST {"query": "<name>"} to /v2/admin/sql-probe. Query text is
+# never accepted from the client — only a name that resolves to a SQL
+# string registered here. POST (not GET) so the query name doesn't land
+# in access logs. Add new probes below with a `read_only: True` invariant
+# discipline (nothing that modifies state goes here — use a dedicated
+# admin endpoint instead).
+# ============================================================
+SQL_PROBES = {
+    'passkey_user_id_uuid_check': {
+        'description': (
+            'Returns rows in passkey_{credentials,challenges,sessions} '
+            'whose user_id does not match a UUID shape. Zero rows → the '
+            'VARCHAR→UUID migration is a clean ALTER. Non-zero → inspect '
+            'the pattern to design a conversion step. Authored by CW R2.'
+        ),
+        'sql': """
+            SELECT 'passkey_credentials' AS source, user_id, created_at
+              FROM passkey_credentials
+             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            UNION ALL
+            SELECT 'passkey_challenges' AS source, user_id, created_at
+              FROM passkey_challenges
+             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            UNION ALL
+            SELECT 'passkey_sessions' AS source, user_id, created_at
+              FROM passkey_sessions
+             WHERE user_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            ORDER BY created_at ASC
+            LIMIT 200
+        """,
+    },
+}
+
+
+@app.route('/v2/admin/sql-probe', methods=['POST'])
+@require_admin
+def admin_sql_probe():
+    """Execute an allowlisted read-only diagnostic query by name.
+
+    Never accepts SQL text from the caller — only a pre-registered query
+    name. See SQL_PROBES above for the registry. POST body:
+        {"query": "passkey_user_id_uuid_check"}
+    Returns:
+        {"query": name, "description": str, "row_count": N, "rows": [...]}
+    """
+    data = request.get_json(silent=True) or {}
+    name = data.get('query')
+    if not name:
+        return jsonify({
+            'error': 'query name required',
+            'available': sorted(SQL_PROBES.keys()),
+        }), 400
+    probe = SQL_PROBES.get(name)
+    if not probe:
+        return jsonify({
+            'error': f'unknown probe: {name}',
+            'available': sorted(SQL_PROBES.keys()),
+        }), 404
+
+    cur = get_cursor()
+    try:
+        cur.execute(probe['sql'])
+        rows = cur.fetchall()
+        # RealDictCursor rows — convert datetimes to str for JSON
+        out = []
+        for r in rows:
+            out.append({k: (str(v) if hasattr(v, 'isoformat') else v) for k, v in r.items()})
+        return jsonify({
+            'query': name,
+            'description': probe['description'],
+            'row_count': len(out),
+            'rows': out,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+
+
 @app.route('/v2/admin/commits/backfill-bootloader-weights', methods=['POST'])
 @require_admin
 def admin_backfill_bootloader_weights():
