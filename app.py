@@ -5984,6 +5984,24 @@ SQL_PROBES = {
             LIMIT 200
         """,
     },
+    'passkey_usage_recent': {
+        'description': (
+            'Reports recent passkey activity: credential count, when they '
+            'were last used, active (non-expired) session count. Used to '
+            'decide whether the legacy /auth/* single-user passkey flow is '
+            'safe to deprecate or whether anyone still depends on it.'
+        ),
+        'sql': """
+            SELECT
+              (SELECT COUNT(*) FROM passkey_credentials) AS credentials_total,
+              (SELECT MAX(last_used_at) FROM passkey_credentials) AS most_recent_credential_use,
+              (SELECT MAX(created_at) FROM passkey_credentials) AS most_recent_credential_created,
+              (SELECT COUNT(*) FROM passkey_sessions) AS sessions_total,
+              (SELECT COUNT(*) FROM passkey_sessions WHERE expires_at > NOW()) AS sessions_active,
+              (SELECT MAX(created_at) FROM passkey_sessions) AS most_recent_session_created,
+              (SELECT COUNT(*) FROM passkey_challenges WHERE expires_at > NOW()) AS pending_challenges
+        """,
+    },
     'passkey_schema_inspect': {
         'description': (
             'Reports the current schema for the three passkey tables: '
