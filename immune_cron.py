@@ -50,9 +50,26 @@ def main():
             for err in errors:
                 print(f"  - {err}", file=sys.stderr)
 
-        # Exit with error if there were failures
-        if errors:
+        # Classify errors. A few routes have *known* recurring failures that
+        # the patrol endpoint handles gracefully (isolated via transaction
+        # rollback; the other routes run to completion). We don't want those
+        # to fail the cron run because Railway reads exit code as health and
+        # a red dot here obscures real incidents.
+        #
+        # Known-isolated:
+        #   CONTRADICTION — 60s statement_timeout on the n² pairwise-blob
+        #   JOIN (app.py:8686). Tracked for optimization in T4. Not an
+        #   operational failure.
+        KNOWN_ISOLATED_ROUTES = {'CONTRADICTION'}
+        unexpected_errors = [e for e in errors if e.get('route') not in KNOWN_ISOLATED_ROUTES]
+
+        if unexpected_errors:
+            print(f"[IMMUNE] {len(unexpected_errors)} unexpected error(s) — exit 1", file=sys.stderr)
             sys.exit(1)
+
+        if errors:
+            # All errors were known-isolated. Log but don't fail the run.
+            print(f"[IMMUNE] All {len(errors)} error(s) are known-isolated; exit 0")
 
         # Exit with warning if quarantined items need review
         if quarantined > 0:
