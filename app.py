@@ -5986,20 +5986,33 @@ SQL_PROBES = {
     },
     'passkey_usage_recent': {
         'description': (
-            'Reports recent passkey activity: credential count, when they '
-            'were last used, active (non-expired) session count. Used to '
-            'decide whether the legacy /auth/* single-user passkey flow is '
-            'safe to deprecate or whether anyone still depends on it.'
+            'Reports recent passkey activity: credential count, session '
+            'counts, pending challenges. Used to decide whether the legacy '
+            '/auth/* single-user passkey flow is safe to deprecate.'
         ),
         'sql': """
             SELECT
               (SELECT COUNT(*) FROM passkey_credentials) AS credentials_total,
-              (SELECT MAX(last_used_at) FROM passkey_credentials) AS most_recent_credential_use,
               (SELECT MAX(created_at) FROM passkey_credentials) AS most_recent_credential_created,
               (SELECT COUNT(*) FROM passkey_sessions) AS sessions_total,
               (SELECT COUNT(*) FROM passkey_sessions WHERE expires_at > NOW()) AS sessions_active,
               (SELECT MAX(created_at) FROM passkey_sessions) AS most_recent_session_created,
               (SELECT COUNT(*) FROM passkey_challenges WHERE expires_at > NOW()) AS pending_challenges
+        """,
+    },
+    'passkey_column_inventory': {
+        'description': (
+            'Lists every column on passkey_{credentials,challenges,sessions}. '
+            'Schema has drifted from migration 010 in at least two ways '
+            '(user_id is uuid not varchar; last_used_at is absent on '
+            'passkey_credentials despite being declared in 010). This probe '
+            'enumerates reality so subsequent migrations plan correctly.'
+        ),
+        'sql': """
+            SELECT table_name, column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name IN ('passkey_credentials', 'passkey_challenges', 'passkey_sessions')
+            ORDER BY table_name, ordinal_position
         """,
     },
     'passkey_schema_inspect': {
