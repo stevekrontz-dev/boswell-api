@@ -7661,6 +7661,68 @@ def halt_status():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/cron_heartbeats', methods=['GET'])
+def get_cron_heartbeats():
+    """List all cron heartbeat rows ordered by most recent.
+
+    Used by the Boswell operational cockpit to surface stale crons.
+    A row is "stale" if NOW - last_run_at > 2 * expected_interval_minutes.
+    Tenant-agnostic — heartbeats describe the deployment, not a tenant.
+    """
+    # Auth still required (any authenticated tenant can read deployment health)
+    _ = get_tenant_id()
+    try:
+        ensure_cron_heartbeats_schema()
+        cur = get_cursor()
+        cur.execute("""
+            SELECT service, last_run_at, last_status, last_message,
+                   work_done_count, expected_interval_minutes,
+                   EXTRACT(EPOCH FROM (NOW() - last_run_at))/60 AS age_minutes
+            FROM cron_heartbeats
+            ORDER BY last_run_at DESC
+        """)
+        rows = []
+        for row in cur.fetchall():
+            d = dict(row)
+            d['last_run_at'] = d['last_run_at'].isoformat() if d.get('last_run_at') else None
+            d['age_minutes'] = round(float(d['age_minutes']), 1) if d.get('age_minutes') is not None else None
+            d['stale'] = (d['age_minutes'] is not None and
+                          d['age_minutes'] > 2 * (d['expected_interval_minutes'] or 5))
+            rows.append(d)
+        cur.close()
+        return jsonify({'heartbeats': rows, 'count': len(rows)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/v2/cron_heartbeats', methods=['POST'])
+def post_cron_heartbeat():
+    """Write/upsert a heartbeat row for a service.
+
+    Body: { service, status='ok'|'no_work'|'error', message?, work_done?, expected_interval_minutes? }
+
+    Used by external crons (e.g., the Boswell dashboard generator) to mark
+    successful runs. The Boswell immune system patrol watches this table.
+    """
+    _ = get_tenant_id()
+    body = request.get_json(silent=True) or {}
+    service = body.get('service')
+    status = body.get('status', 'ok')
+    if not service or status not in ('ok', 'no_work', 'error'):
+        return jsonify({'error': 'service required; status must be ok|no_work|error'}), 400
+    try:
+        write_heartbeat(
+            service=service,
+            status=status,
+            message=body.get('message'),
+            work_done=int(body.get('work_done', 0) or 0),
+            expected_interval_minutes=int(body.get('expected_interval_minutes', 5) or 5),
+        )
+        return jsonify({'status': 'written', 'service': service})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/v2/tasks/backfill-memory', methods=['POST'])
 def backfill_tasks_to_memory():
     """Backfill existing tasks into memory system for semantic search.
