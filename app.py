@@ -4072,13 +4072,12 @@ def semantic_startup():
         cur.execute("""
             SELECT b.blob_hash, b.content, b.created_at,
                    COALESCE(
-                       (SELECT closeout.content::jsonb->>'status'
+                       (SELECT safe_jsonb_field(closeout.content, 'status')
                         FROM blobs closeout
                         WHERE closeout.tenant_id = b.tenant_id
                           AND closeout.content_type = 'memory'
-                          AND closeout.content LIKE '{%'
-                          AND (closeout.content::jsonb->>'type') = 'plan_closeout'
-                          AND (closeout.content::jsonb->>'plan_blob') = b.blob_hash
+                          AND safe_jsonb_field(closeout.content, 'type') = 'plan_closeout'
+                          AND safe_jsonb_field(closeout.content, 'plan_blob') = b.blob_hash
                         ORDER BY closeout.created_at DESC, closeout.blob_hash DESC
                         LIMIT 1),
                        b.content::jsonb->>'status',
@@ -7140,10 +7139,9 @@ def update_plan(blob_hash):
                 '''SELECT blob_hash, created_at FROM blobs
                    WHERE tenant_id = %s
                      AND content_type = 'memory'
-                     AND content LIKE '{%%'
-                     AND (content::jsonb->>'type') = 'plan_closeout'
-                     AND (content::jsonb->>'plan_blob') = %s
-                     AND (content::jsonb->>'status') = %s
+                     AND safe_jsonb_field(content, 'type') = 'plan_closeout'
+                     AND safe_jsonb_field(content, 'plan_blob') = %s
+                     AND safe_jsonb_field(content, 'status') = %s
                    ORDER BY created_at DESC, blob_hash DESC
                    LIMIT 1''',
                 (tenant_id, blob_hash, status)
@@ -7246,13 +7244,12 @@ def work_landscape():
         plan_sql = """
             SELECT b.blob_hash, b.content, b.created_at,
                    COALESCE(
-                       (SELECT closeout.content::jsonb->>'status'
+                       (SELECT safe_jsonb_field(closeout.content, 'status')
                         FROM blobs closeout
                         WHERE closeout.tenant_id = b.tenant_id
                           AND closeout.content_type = 'memory'
-                          AND closeout.content LIKE '{%'
-                          AND (closeout.content::jsonb->>'type') = 'plan_closeout'
-                          AND (closeout.content::jsonb->>'plan_blob') = b.blob_hash
+                          AND safe_jsonb_field(closeout.content, 'type') = 'plan_closeout'
+                          AND safe_jsonb_field(closeout.content, 'plan_blob') = b.blob_hash
                         ORDER BY closeout.created_at DESC, closeout.blob_hash DESC
                         LIMIT 1),
                        b.content::jsonb->>'status',

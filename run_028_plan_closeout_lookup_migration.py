@@ -63,16 +63,14 @@ def main():
             SELECT COUNT(*) AS n
             FROM blobs
             WHERE content_type = 'memory'
-              AND content LIKE '{%'
-              AND (content::jsonb->>'type') = 'plan_closeout'
+              AND safe_jsonb_field(content, 'type') = 'plan_closeout'
         """)
         closeouts = cur.fetchone()['n']
         cur.execute("""
             SELECT COUNT(DISTINCT content::jsonb->>'plan_blob') AS n
             FROM blobs
             WHERE content_type = 'memory'
-              AND content LIKE '{%'
-              AND (content::jsonb->>'type') = 'plan_closeout'
+              AND safe_jsonb_field(content, 'type') = 'plan_closeout'
         """)
         distinct_plans = cur.fetchone()['n']
         print(f"[COVERAGE] {closeouts} plan_closeout memories covering {distinct_plans} distinct plans")
