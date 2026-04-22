@@ -4066,15 +4066,29 @@ def semantic_startup():
     my_tasks = []
     open_tasks = []  # Kept for backward compat in minimal/normal verbosity
     try:
-        # Get active plans (blobs with content_type='plan')
+        # Get active plans (content_type='plan'). Effective status is the
+        # newest plan_closeout memory's status (if any), else the plan blob's
+        # embedded status, else 'active'. See migration 028 for design notes.
         cur.execute("""
-            SELECT DISTINCT b.blob_hash, b.content, b.created_at
+            SELECT b.blob_hash, b.content, b.created_at,
+                   COALESCE(
+                       (SELECT closeout.content::jsonb->>'status'
+                        FROM blobs closeout
+                        WHERE closeout.tenant_id = b.tenant_id
+                          AND closeout.content_type = 'memory'
+                          AND closeout.content::jsonb->>'type' = 'plan_closeout'
+                          AND closeout.content::jsonb->>'plan_blob' = b.blob_hash
+                        ORDER BY closeout.created_at DESC, closeout.blob_hash DESC
+                        LIMIT 1),
+                       b.content::jsonb->>'status',
+                       'active'
+                   ) AS effective_status
             FROM blobs b
             WHERE b.tenant_id = %s AND b.content_type = 'plan'
-              AND (b.content::jsonb->>'status') IN ('active', 'paused')
             ORDER BY b.created_at DESC
         """, (get_tenant_id(),))
-        plan_rows = cur.fetchall()
+        plan_rows_all = cur.fetchall()
+        plan_rows = [r for r in plan_rows_all if r['effective_status'] in ('active', 'paused')]
 
         plans_by_branch = {}
         for row in plan_rows:
@@ -4086,7 +4100,7 @@ def semantic_startup():
                     content = {}
             blob_hash = row['blob_hash']
             plan_title = content.get('title', 'Untitled Plan')
-            plan_status = content.get('status', 'active')
+            plan_status = row['effective_status']
 
             # Get branch from plan-branch tag (auto-set at commit time)
             cur.execute("""
@@ -7002,6 +7016,167 @@ def update_task(task_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/v2/plans/<blob_hash>', methods=['PATCH'])
+def update_plan(blob_hash):
+    """Update a plan's lifecycle status by committing a plan_closeout memory.
+
+    The plan blob stays immutable — status is overridden by the newest
+    plan_closeout memory for (tenant_id, plan_blob). Landscape and startup
+    queries read the closeout via correlated subquery (migration 028).
+
+    Body:
+      status: one of active, completed, paused, abandoned (required)
+      reason: freeform explanation (optional)
+      force: override the reject-if-open-tasks cascade check (optional, default false)
+
+    Idempotent: retrying the same (blob_hash, status) returns the existing
+    closeout with idempotent=true. The first reason is preserved; subsequent
+    reasons are lost (status is the operational field, reason is decoration).
+    """
+    data = request.get_json() or {}
+    status = data.get('status')
+    reason = data.get('reason')
+    force = bool(data.get('force', False))
+
+    valid_plan_statuses = ['active', 'completed', 'paused', 'abandoned']
+    if not status or status not in valid_plan_statuses:
+        return jsonify({'error': f'status required, one of: {valid_plan_statuses}'}), 400
+
+    tenant_id = get_tenant_id()
+    db = get_db()
+    cur = get_cursor()
+
+    try:
+        # Confirm target blob exists, is a plan, belongs to this tenant.
+        cur.execute(
+            '''SELECT blob_hash, content FROM blobs
+               WHERE blob_hash = %s AND tenant_id = %s AND content_type = %s''',
+            (blob_hash, tenant_id, 'plan')
+        )
+        plan_row = cur.fetchone()
+        if not plan_row:
+            cur.close()
+            return jsonify({'error': 'Plan not found'}), 404
+
+        plan_content = plan_row['content']
+        if isinstance(plan_content, str):
+            try:
+                plan_content = json.loads(plan_content)
+            except (json.JSONDecodeError, TypeError):
+                plan_content = {}
+        plan_title = plan_content.get('title', 'Untitled Plan') if isinstance(plan_content, dict) else 'Untitled Plan'
+
+        # Cascade check — reject if plan has open tasks unless force=true.
+        # Closing a plan with work still attached is a decision, not a reflex.
+        cur.execute(
+            '''SELECT COUNT(*) AS n FROM tasks
+               WHERE plan_blob_hash = %s AND tenant_id = %s
+                 AND status NOT IN ('done', 'deleted')''',
+            (blob_hash, tenant_id)
+        )
+        open_count = cur.fetchone()['n']
+        if open_count > 0 and not force:
+            cur.close()
+            return jsonify({
+                'error': 'plan has open tasks',
+                'open_task_count': open_count,
+                'hint': 'pass force=true to override'
+            }), 409
+
+        # Look up the plan's branch via its plan-branch tag.
+        cur.execute(
+            '''SELECT tag FROM tags
+               WHERE blob_hash = %s AND tenant_id = %s AND tag LIKE 'plan-branch:%%'
+               LIMIT 1''',
+            (blob_hash, tenant_id)
+        )
+        tag_row = cur.fetchone()
+        if tag_row:
+            branch = tag_row['tag'].replace('plan-branch:', '')
+        else:
+            branch = plan_content.get('_branch', 'command-center') if isinstance(plan_content, dict) else 'command-center'
+
+        cur.close()
+
+        # Build canonical plan_closeout memory content.
+        closed_at = datetime.utcnow().isoformat() + 'Z'
+        closeout_content = {
+            'type': 'plan_closeout',
+            'plan_blob': blob_hash,
+            'status': status,
+            'closed_at': closed_at,
+        }
+        if reason:
+            closeout_content['reason'] = reason
+
+        commit_payload = {
+            'content': closeout_content,
+            'message': f"PLAN CLOSEOUT: {plan_title} — {status}",
+            'branch': branch,
+            'type': 'memory',
+            'tags': ['plan-closeout'],
+        }
+
+        # Commit via the standard create_commit path. Catches the
+        # uq_plan_closeout_idempotent unique_violation and returns the
+        # existing closeout as idempotent-success.
+        try:
+            commit_result, commit_status = invoke_view(
+                create_commit,
+                method='POST',
+                path='/v2/commit',
+                json_data=commit_payload,
+            )
+        except psycopg2.errors.UniqueViolation:
+            # Shouldn't reach here — create_commit wraps exceptions — but guard anyway.
+            db.rollback()
+            commit_result, commit_status = None, 409
+
+        # Idempotent-success path: look up the existing closeout.
+        if commit_status >= 400 or (isinstance(commit_result, dict) and commit_result.get('error') and 'unique' in str(commit_result.get('error', '')).lower()):
+            lookup_cur = get_cursor()
+            lookup_cur.execute(
+                '''SELECT blob_hash, created_at FROM blobs
+                   WHERE tenant_id = %s
+                     AND content_type = 'memory'
+                     AND content::jsonb->>'type' = 'plan_closeout'
+                     AND content::jsonb->>'plan_blob' = %s
+                     AND content::jsonb->>'status' = %s
+                   ORDER BY created_at DESC, blob_hash DESC
+                   LIMIT 1''',
+                (tenant_id, blob_hash, status)
+            )
+            existing = lookup_cur.fetchone()
+            lookup_cur.close()
+            if existing:
+                return jsonify({
+                    'status': 'updated',
+                    'idempotent': True,
+                    'plan_blob': blob_hash,
+                    'effective_status': status,
+                    'closeout_blob_hash': existing['blob_hash'],
+                })
+            # Fell through — the commit truly failed for a different reason.
+            return jsonify({'error': 'commit failed', 'detail': commit_result}), commit_status or 500
+
+        return jsonify({
+            'status': 'updated',
+            'idempotent': False,
+            'plan_blob': blob_hash,
+            'effective_status': status,
+            'closeout_blob_hash': commit_result.get('blob_hash') if isinstance(commit_result, dict) else None,
+            'closeout_commit_hash': commit_result.get('commit_hash') if isinstance(commit_result, dict) else None,
+        })
+
+    except Exception as e:
+        db.rollback()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/v2/tasks/<task_id>', methods=['DELETE'])
 def delete_task(task_id):
     """Soft delete a task by setting status to 'deleted'."""
@@ -7063,40 +7238,34 @@ def work_landscape():
         db.rollback()
 
     try:
-        # 1. Get active plans (blobs with content_type='plan')
-        plan_status_filter = "AND (b.content::jsonb->>'status') IN ('active', 'paused')"
-        if include_done:
-            plan_status_filter = ""
-
-        plan_sql = f"""
+        # 1. Get plans (content_type='plan'). Effective status is the newest
+        # plan_closeout memory's status (if any), else the plan blob's
+        # embedded status, else 'active'. See migration 028 for design notes.
+        plan_sql = """
             SELECT b.blob_hash, b.content, b.created_at,
-                   c.message AS commit_message,
-                   br.name AS branch_name
-            FROM blobs b
-            JOIN tree_entries te ON te.blob_hash = b.blob_hash AND te.tenant_id = b.tenant_id
-            JOIN commits co ON co.tree_hash = te.tree_hash AND co.tenant_id = b.tenant_id
-            JOIN branches br ON br.head_commit IS NOT NULL AND br.tenant_id = b.tenant_id
-            WHERE b.tenant_id = %s
-              AND b.content_type = 'plan'
-              {plan_status_filter}
-        """
-        params = [tenant_id]
-        if filter_branch:
-            plan_sql += " AND LOWER(br.name) = LOWER(%s)"
-            params.append(filter_branch)
-
-        # Simpler approach: query plans from blobs directly, get branch from commit chain
-        plan_sql = f"""
-            SELECT DISTINCT b.blob_hash, b.content, b.created_at
+                   COALESCE(
+                       (SELECT closeout.content::jsonb->>'status'
+                        FROM blobs closeout
+                        WHERE closeout.tenant_id = b.tenant_id
+                          AND closeout.content_type = 'memory'
+                          AND closeout.content::jsonb->>'type' = 'plan_closeout'
+                          AND closeout.content::jsonb->>'plan_blob' = b.blob_hash
+                        ORDER BY closeout.created_at DESC, closeout.blob_hash DESC
+                        LIMIT 1),
+                       b.content::jsonb->>'status',
+                       'active'
+                   ) AS effective_status
             FROM blobs b
             WHERE b.tenant_id = %s
               AND b.content_type = 'plan'
-              {plan_status_filter}
             ORDER BY b.created_at DESC
         """
-        params = [tenant_id]
-        cur.execute(plan_sql, params)
-        plan_rows = cur.fetchall()
+        cur.execute(plan_sql, [tenant_id])
+        plan_rows_all = cur.fetchall()
+        if include_done:
+            plan_rows = plan_rows_all
+        else:
+            plan_rows = [r for r in plan_rows_all if r['effective_status'] in ('active', 'paused')]
 
         plans_by_branch = {}
         plan_hashes = set()
@@ -7112,7 +7281,7 @@ def work_landscape():
             blob_hash = row['blob_hash']
             plan_hashes.add(blob_hash)
             plan_title = content.get('title', 'Untitled Plan')
-            plan_status = content.get('status', 'active')
+            plan_status = row['effective_status']
 
             # Get branch from plan-branch tag (auto-set at commit time)
             cur.execute("""
@@ -11957,6 +12126,20 @@ MCP_TOOLS = [
         }
     },
     {
+        "name": "boswell_update_plan",
+        "description": "Update a plan's lifecycle status (active/completed/paused/abandoned) by committing a plan_closeout memory. The plan blob stays immutable; landscape and startup read the newest closeout per plan. Rejects if the plan has open tasks unless force=true. Retrying the same (blob_hash, status) is idempotent — first reason wins, subsequent reasons are lost (status is operational, reason is decoration).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "blob_hash": {"type": "string", "description": "Plan blob hash (content_type='plan')"},
+                "status": {"type": "string", "enum": ["active", "completed", "paused", "abandoned"], "description": "New effective status"},
+                "reason": {"type": "string", "description": "Why the status changed (optional, freeform)"},
+                "force": {"type": "boolean", "description": "Close the plan even with open tasks attached (default: false)"}
+            },
+            "required": ["blob_hash", "status"]
+        }
+    },
+    {
         "name": "boswell_delete_task",
         "description": "Soft-delete a task. Use for cleanup after completion or cancellation.",
         "inputSchema": {
@@ -12503,7 +12686,24 @@ def dispatch_mcp_tool(tool_name, args):
             json_data=payload,
             view_args={"task_id": task_id}
         )
-    
+
+    elif tool_name == "boswell_update_plan":
+        err = _require(args, "blob_hash") or _require(args, "status")
+        if err:
+            return err
+        blob_hash = args["blob_hash"]
+        payload = {}
+        for field in ["status", "reason", "force"]:
+            if field in args:
+                payload[field] = args[field]
+        return invoke_view(
+            update_plan,
+            method='PATCH',
+            path=f'/v2/plans/{blob_hash}',
+            json_data=payload,
+            view_args={"blob_hash": blob_hash}
+        )
+
     elif tool_name == "boswell_delete_task":
         err = _require(args, "task_id")
         if err:
