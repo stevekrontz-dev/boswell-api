@@ -1596,8 +1596,11 @@ def create_commit():
                 # Tag already exists, ignore duplicate
                 pass
 
-        # Auto-tag plans with their branch for reliable lookups
-        if memory_type == 'plan':
+        # Auto-tag plans and ideas with their branch for reliable lookups.
+        # Landscape/startup use `plan-branch:<name>` to resolve which branch
+        # a plan or idea belongs to (falls back to content._branch or
+        # 'unknown' otherwise).
+        if memory_type in ('plan', 'idea'):
             try:
                 cur.execute(
                     '''INSERT INTO tags (tenant_id, blob_hash, tag, created_at)
