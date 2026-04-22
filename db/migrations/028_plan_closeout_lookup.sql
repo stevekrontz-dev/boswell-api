@@ -28,11 +28,24 @@
 --
 -- Idempotent via IF NOT EXISTS.
 
+-- Note on the CASE-guarded casts below: blobs.content is TEXT and not
+-- guaranteed to be valid JSON for content_type='memory' — some memories
+-- are plain strings (e.g. raw transcript text starting with '[Session...').
+-- A bare content::jsonb cast fails on those rows. Every JSONB access below
+-- is wrapped in CASE WHEN content LIKE '{%' to guarantee the cast runs
+-- only on content that syntactically begins as a JSON object. This also
+-- matches the partial index predicate so the planner can use the index.
+
 -- 1. Lookup index for landscape/startup subquery.
 CREATE INDEX IF NOT EXISTS idx_plan_closeout_lookup
-    ON blobs (tenant_id, (content::jsonb->>'plan_blob'), created_at DESC)
+    ON blobs (
+        tenant_id,
+        (CASE WHEN content LIKE '{%' THEN content::jsonb->>'plan_blob' END),
+        created_at DESC
+    )
     WHERE content_type = 'memory'
-      AND content::jsonb->>'type' = 'plan_closeout';
+      AND content LIKE '{%'
+      AND (CASE WHEN content LIKE '{%' THEN content::jsonb->>'type' END) = 'plan_closeout';
 
 -- 2. Pre-flight duplicate audit — fail loud if any tenant has dupes.
 DO $$
@@ -49,7 +62,8 @@ BEGIN
                COUNT(*) AS n
         FROM blobs
         WHERE content_type = 'memory'
-          AND content::jsonb->>'type' = 'plan_closeout'
+          AND content LIKE '{%'
+          AND (content::jsonb->>'type') = 'plan_closeout'
         GROUP BY 1, 2, 3, 4
         HAVING COUNT(*) > 1
     ) dupes;
@@ -65,7 +79,8 @@ BEGIN
                    COUNT(*) AS n
             FROM blobs
             WHERE content_type = 'memory'
-              AND content::jsonb->>'type' = 'plan_closeout'
+              AND content LIKE '{%'
+              AND (content::jsonb->>'type') = 'plan_closeout'
             GROUP BY 1, 2, 3, 4
             HAVING COUNT(*) > 1
             LIMIT 5
@@ -79,12 +94,15 @@ $$ LANGUAGE plpgsql;
 
 -- 3. Unique constraint — idempotency at the storage layer.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_closeout_idempotent
-    ON blobs (tenant_id,
-              (content::jsonb->>'plan_blob'),
-              (content::jsonb->>'type'),
-              (content::jsonb->>'status'))
+    ON blobs (
+        tenant_id,
+        (CASE WHEN content LIKE '{%' THEN content::jsonb->>'plan_blob' END),
+        (CASE WHEN content LIKE '{%' THEN content::jsonb->>'type' END),
+        (CASE WHEN content LIKE '{%' THEN content::jsonb->>'status' END)
+    )
     WHERE content_type = 'memory'
-      AND content::jsonb->>'type' = 'plan_closeout';
+      AND content LIKE '{%'
+      AND (CASE WHEN content LIKE '{%' THEN content::jsonb->>'type' END) = 'plan_closeout';
 
 COMMENT ON INDEX idx_plan_closeout_lookup IS
     'Partial B-tree supporting the plan-status correlated subquery in /v2/startup and /v2/tasks/landscape. Per-tenant + plan_blob lookup with created_at DESC ordering.';

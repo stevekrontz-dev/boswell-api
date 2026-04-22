@@ -4076,8 +4076,9 @@ def semantic_startup():
                         FROM blobs closeout
                         WHERE closeout.tenant_id = b.tenant_id
                           AND closeout.content_type = 'memory'
-                          AND closeout.content::jsonb->>'type' = 'plan_closeout'
-                          AND closeout.content::jsonb->>'plan_blob' = b.blob_hash
+                          AND closeout.content LIKE '{%'
+                          AND (closeout.content::jsonb->>'type') = 'plan_closeout'
+                          AND (closeout.content::jsonb->>'plan_blob') = b.blob_hash
                         ORDER BY closeout.created_at DESC, closeout.blob_hash DESC
                         LIMIT 1),
                        b.content::jsonb->>'status',
@@ -7139,9 +7140,10 @@ def update_plan(blob_hash):
                 '''SELECT blob_hash, created_at FROM blobs
                    WHERE tenant_id = %s
                      AND content_type = 'memory'
-                     AND content::jsonb->>'type' = 'plan_closeout'
-                     AND content::jsonb->>'plan_blob' = %s
-                     AND content::jsonb->>'status' = %s
+                     AND content LIKE '{%%'
+                     AND (content::jsonb->>'type') = 'plan_closeout'
+                     AND (content::jsonb->>'plan_blob') = %s
+                     AND (content::jsonb->>'status') = %s
                    ORDER BY created_at DESC, blob_hash DESC
                    LIMIT 1''',
                 (tenant_id, blob_hash, status)
@@ -7248,8 +7250,9 @@ def work_landscape():
                         FROM blobs closeout
                         WHERE closeout.tenant_id = b.tenant_id
                           AND closeout.content_type = 'memory'
-                          AND closeout.content::jsonb->>'type' = 'plan_closeout'
-                          AND closeout.content::jsonb->>'plan_blob' = b.blob_hash
+                          AND closeout.content LIKE '{%'
+                          AND (closeout.content::jsonb->>'type') = 'plan_closeout'
+                          AND (closeout.content::jsonb->>'plan_blob') = b.blob_hash
                         ORDER BY closeout.created_at DESC, closeout.blob_hash DESC
                         LIMIT 1),
                        b.content::jsonb->>'status',
