@@ -1332,6 +1332,7 @@ def check_novelty(embedding, branch, tenant_id):
 CONTENT_SIZE_CAPS = {
     'memory': None,       # NO CAP — Steve's directive 2026-04-08
     'plan': None,         # NO CAP — extended 2026-04-08 (scope complexity growing)
+    'idea': None,         # NO CAP — added 2026-04-22 (pre-plan architecture notes)
     'skill': None,        # NO CAP — extended 2026-04-08 (scope complexity growing)
     'task': None,         # NO CAP — extended 2026-04-08 (scope complexity growing)
     'transcript': None,   # NO CAP — extended 2026-04-08 (CW chat captures are 100KB+)
@@ -1405,6 +1406,16 @@ def create_commit():
         plan_status = content.get('status')
         if not plan_status or plan_status not in valid_plan_statuses:
             return jsonify({'error': f'Plan content requires "status" field, one of: {valid_plan_statuses}'}), 400
+
+    # Validate content_type='idea' requirements. Ideas are pre-plans —
+    # aspirational notes that haven't had tasks attached yet. Looser than
+    # plans: title required, but no status (ideas don't have lifecycle
+    # status; boswell_update_plan via plan_closeout handles flip-to-done).
+    if memory_type == 'idea':
+        if not isinstance(content, dict):
+            return jsonify({'error': 'Idea content must be a JSON object'}), 400
+        if not content.get('title') or not isinstance(content.get('title'), str):
+            return jsonify({'error': 'Idea content requires a "title" string field'}), 400
 
     # Routing check and novelty filter deferred — embedding generation moved to
     # 5-minute micro-batch backfill service (CC/CW consensus March 30 2026).
@@ -4066,11 +4077,16 @@ def semantic_startup():
     my_tasks = []
     open_tasks = []  # Kept for backward compat in minimal/normal verbosity
     try:
-        # Get active plans (content_type='plan'). Effective status is the
-        # newest plan_closeout memory's status (if any), else the plan blob's
-        # embedded status, else 'active'. See migration 028 for design notes.
+        # Get active plans and ideas. Effective status is the newest
+        # plan_closeout memory's status (if any), else the blob's embedded
+        # status, else 'active'. See migration 028 for closeout design.
+        # Ontology (ratified 2026-04-22): plans have tasks; ideas are
+        # pre-plans (no tasks). Classification here is computed:
+        #   content_type='idea'                      → ideas bucket
+        #   content_type='plan' with task_count >=1  → plans bucket
+        #   content_type='plan' with task_count == 0 → ideas bucket (zombie)
         cur.execute("""
-            SELECT b.blob_hash, b.content, b.created_at,
+            SELECT b.blob_hash, b.content, b.content_type, b.created_at,
                    COALESCE(
                        (SELECT safe_jsonb_field(closeout.content, 'status')
                         FROM blobs closeout
@@ -4084,13 +4100,14 @@ def semantic_startup():
                        'active'
                    ) AS effective_status
             FROM blobs b
-            WHERE b.tenant_id = %s AND b.content_type = 'plan'
+            WHERE b.tenant_id = %s AND b.content_type IN ('plan', 'idea')
             ORDER BY b.created_at DESC
         """, (get_tenant_id(),))
         plan_rows_all = cur.fetchall()
         plan_rows = [r for r in plan_rows_all if r['effective_status'] in ('active', 'paused')]
 
         plans_by_branch = {}
+        ideas_by_branch = {}
         for row in plan_rows:
             content = row['content']
             if isinstance(content, str):
@@ -4099,7 +4116,8 @@ def semantic_startup():
                 except (json.JSONDecodeError, TypeError):
                     content = {}
             blob_hash = row['blob_hash']
-            plan_title = content.get('title', 'Untitled Plan')
+            row_type = row['content_type']
+            plan_title = content.get('title', 'Untitled Plan' if row_type == 'plan' else 'Untitled Idea')
             plan_status = row['effective_status']
 
             # Get branch from plan-branch tag (auto-set at commit time)
@@ -4115,7 +4133,7 @@ def semantic_startup():
                 # Fallback for plans created before auto-tagging: check content
                 plan_branch = content.get('_branch', 'unknown') if isinstance(content, dict) else 'unknown'
 
-            # Count tasks under this plan
+            # Count tasks under this blob
             cur.execute("""
                 SELECT COUNT(*) as total,
                        COUNT(*) FILTER (WHERE status = 'done') as done
@@ -4126,16 +4144,24 @@ def semantic_startup():
             task_count = counts['total'] if counts else 0
             done_count = counts['done'] if counts else 0
 
-            if plan_branch not in plans_by_branch:
-                plans_by_branch[plan_branch] = []
-            plans_by_branch[plan_branch].append({
+            entry = {
                 'title': plan_title,
                 'status': plan_status,
                 'blob_hash': blob_hash,
                 'progress': f"{done_count}/{task_count}",
                 'task_count': task_count,
                 'done_count': done_count
-            })
+            }
+
+            # Bucket: typed 'idea' OR 'plan' with zero tasks → ideas.
+            if row_type == 'idea' or task_count == 0:
+                if plan_branch not in ideas_by_branch:
+                    ideas_by_branch[plan_branch] = []
+                ideas_by_branch[plan_branch].append(entry)
+            else:
+                if plan_branch not in plans_by_branch:
+                    plans_by_branch[plan_branch] = []
+                plans_by_branch[plan_branch].append(entry)
 
         # Query orphan task counts grouped by branch (tasks not linked to any plan).
         # Orphans are legitimate by design — the MCP tool description tells callers to
@@ -4156,9 +4182,11 @@ def semantic_startup():
 
         # Build landscape with health scores: combine plan-linked + orphan tasks.
         # Branches with only orphan tasks (no plans) now appear in the landscape too.
-        all_branches = set(plans_by_branch.keys()) | set(orphans_by_branch.keys())
+        # Ideas appear alongside plans but don't affect health (they have no tasks).
+        all_branches = set(plans_by_branch.keys()) | set(ideas_by_branch.keys()) | set(orphans_by_branch.keys())
         for branch_name in all_branches:
             plans = plans_by_branch.get(branch_name, [])
+            ideas = ideas_by_branch.get(branch_name, [])
             plan_total = sum(p['task_count'] for p in plans)
             plan_done = sum(p['done_count'] for p in plans)
             orphan_total = orphans_by_branch.get(branch_name, {}).get('total', 0)
@@ -4168,6 +4196,7 @@ def semantic_startup():
             health = f"{round(done_tasks / total_tasks * 100)}%" if total_tasks > 0 else "no tasks"
             work_landscape[branch_name] = {
                 'plans': plans,
+                'ideas': ideas,
                 'health': health,
                 'plan_linked': {'done': plan_done, 'total': plan_total},
                 'orphans': {'done': orphan_done, 'total': orphan_total}
@@ -7047,16 +7076,19 @@ def update_plan(blob_hash):
     cur = get_cursor()
 
     try:
-        # Confirm target blob exists, is a plan, belongs to this tenant.
+        # Confirm target blob exists, is a plan or idea, belongs to this tenant.
+        # Ideas (content_type='idea', added 2026-04-22) share the same closeout
+        # mechanism as plans — the plan_closeout memory carries a blob hash and
+        # doesn't care about the target's content_type.
         cur.execute(
             '''SELECT blob_hash, content FROM blobs
-               WHERE blob_hash = %s AND tenant_id = %s AND content_type = %s''',
-            (blob_hash, tenant_id, 'plan')
+               WHERE blob_hash = %s AND tenant_id = %s AND content_type IN ('plan', 'idea')''',
+            (blob_hash, tenant_id)
         )
         plan_row = cur.fetchone()
         if not plan_row:
             cur.close()
-            return jsonify({'error': 'Plan not found'}), 404
+            return jsonify({'error': 'Plan or idea not found'}), 404
 
         plan_content = plan_row['content']
         if isinstance(plan_content, str):
@@ -7238,11 +7270,13 @@ def work_landscape():
         db.rollback()
 
     try:
-        # 1. Get plans (content_type='plan'). Effective status is the newest
-        # plan_closeout memory's status (if any), else the plan blob's
-        # embedded status, else 'active'. See migration 028 for design notes.
+        # 1. Get plans and ideas. Effective status is the newest plan_closeout
+        # memory's status (if any), else the blob's embedded status, else
+        # 'active'. See migration 028 for closeout design. Ontology (ratified
+        # 2026-04-22): plans have tasks; ideas are pre-plans (no tasks).
+        # Classification is computed here (see bucket block below).
         plan_sql = """
-            SELECT b.blob_hash, b.content, b.created_at,
+            SELECT b.blob_hash, b.content, b.content_type, b.created_at,
                    COALESCE(
                        (SELECT safe_jsonb_field(closeout.content, 'status')
                         FROM blobs closeout
@@ -7257,7 +7291,7 @@ def work_landscape():
                    ) AS effective_status
             FROM blobs b
             WHERE b.tenant_id = %s
-              AND b.content_type = 'plan'
+              AND b.content_type IN ('plan', 'idea')
             ORDER BY b.created_at DESC
         """
         cur.execute(plan_sql, [tenant_id])
@@ -7268,6 +7302,7 @@ def work_landscape():
             plan_rows = [r for r in plan_rows_all if r['effective_status'] in ('active', 'paused')]
 
         plans_by_branch = {}
+        ideas_by_branch = {}
         plan_hashes = set()
 
         for row in plan_rows:
@@ -7279,8 +7314,9 @@ def work_landscape():
                     content = {}
 
             blob_hash = row['blob_hash']
+            row_type = row['content_type']
             plan_hashes.add(blob_hash)
-            plan_title = content.get('title', 'Untitled Plan')
+            plan_title = content.get('title', 'Untitled Plan' if row_type == 'plan' else 'Untitled Idea')
             plan_status = row['effective_status']
 
             # Get branch from plan-branch tag (auto-set at commit time)
@@ -7298,7 +7334,7 @@ def work_landscape():
             if filter_branch and plan_branch.lower() != filter_branch.lower():
                 continue
 
-            # Count tasks under this plan
+            # Count tasks under this blob
             cur.execute("""
                 SELECT COUNT(*) as total,
                        COUNT(*) FILTER (WHERE status = 'done') as done
@@ -7310,7 +7346,7 @@ def work_landscape():
             task_count = counts['total'] if counts else 0
             done_count = counts['done'] if counts else 0
 
-            plan_entry = {
+            entry = {
                 'title': plan_title,
                 'status': plan_status,
                 'blob_hash': blob_hash,
@@ -7319,9 +7355,15 @@ def work_landscape():
                 'done_count': done_count
             }
 
-            if plan_branch not in plans_by_branch:
-                plans_by_branch[plan_branch] = []
-            plans_by_branch[plan_branch].append(plan_entry)
+            # Bucket: typed 'idea' OR 'plan' with zero tasks → ideas.
+            if row_type == 'idea' or task_count == 0:
+                if plan_branch not in ideas_by_branch:
+                    ideas_by_branch[plan_branch] = []
+                ideas_by_branch[plan_branch].append(entry)
+            else:
+                if plan_branch not in plans_by_branch:
+                    plans_by_branch[plan_branch] = []
+                plans_by_branch[plan_branch].append(entry)
 
         # Query orphan task counts grouped by branch (tasks not linked to any plan).
         # Orphans are legitimate by design — the MCP tool description tells callers to
@@ -7357,9 +7399,11 @@ def work_landscape():
 
         # 2. Build landscape with health scores per branch (plan-linked + orphan tasks).
         # Branches with only orphan tasks (no plans) now appear in the landscape too.
-        all_branches = set(plans_by_branch.keys()) | set(orphans_by_branch.keys())
+        # Ideas appear alongside plans but don't affect health (they have no tasks).
+        all_branches = set(plans_by_branch.keys()) | set(ideas_by_branch.keys()) | set(orphans_by_branch.keys())
         for branch_name in all_branches:
             plans = plans_by_branch.get(branch_name, [])
+            ideas = ideas_by_branch.get(branch_name, [])
             plan_total = sum(p['task_count'] for p in plans)
             plan_done = sum(p['done_count'] for p in plans)
             orphan_total = orphans_by_branch.get(branch_name, {}).get('total', 0)
@@ -7370,6 +7414,7 @@ def work_landscape():
 
             landscape[branch_name] = {
                 'plans': plans,
+                'ideas': ideas,
                 'health': health,
                 'plan_linked': {'done': plan_done, 'total': plan_total},
                 'orphans': {'done': orphan_done, 'total': orphan_total}
@@ -7417,6 +7462,7 @@ def work_landscape():
             'backlog': backlog,
             'summary': {
                 'total_plans': sum(len(p) for p in plans_by_branch.values()),
+                'total_ideas': sum(len(i) for i in ideas_by_branch.values()),
                 'total_branches': len(landscape),
                 'backlog_count': len(backlog)
             }
@@ -12033,10 +12079,10 @@ MCP_TOOLS = [
                 "branch": {"type": "string", "description": "Branch to commit to (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
                 "content": {"oneOf": [{"type": "object"}, {"type": "string"}], "description": "Memory content as JSON object or JSON string"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
-                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'plan' (active work plan), 'skill' (behavioral instruction), 'credential' (auth material), or 'methodology' (future-instance reasoning; weight=0.9 default)", "default": "memory"},
+                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'idea' (pre-plan architecture note — title required, no status, no tasks attached), 'plan' (active work plan with tasks — requires title + status), 'skill' (behavioral instruction), 'credential' (auth material), or 'methodology' (future-instance reasoning; weight=0.9 default). Plans have tasks. Ideas spawn plans but don't hold tasks directly.", "default": "memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
                 "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"},
-                "bootloader_weight": {"type": "number", "description": "How eagerly this commit should be auto-loaded on conversation start (0.0-1.0). Omit for content-type defaults: skill=1.0, methodology=0.9, credential=0.8, plan=0.6, memory=0.0."}
+                "bootloader_weight": {"type": "number", "description": "How eagerly this commit should be auto-loaded on conversation start (0.0-1.0). Omit for content-type defaults: skill=1.0, methodology=0.9, credential=0.8, plan=0.6, idea=0.3, memory=0.0."}
             },
             "required": ["branch", "content", "message"]
         }
@@ -12127,14 +12173,14 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_update_plan",
-        "description": "Update a plan's lifecycle status (active/completed/paused/abandoned) by committing a plan_closeout memory. The plan blob stays immutable; landscape and startup read the newest closeout per plan. Rejects if the plan has open tasks unless force=true. Retrying the same (blob_hash, status) is idempotent — first reason wins, subsequent reasons are lost (status is operational, reason is decoration).",
+        "description": "Update a plan or idea's lifecycle status (active/completed/paused/abandoned) by committing a plan_closeout memory. Works on both content_type='plan' and content_type='idea' blobs — the underlying blob stays immutable; landscape and startup read the newest closeout per plan/idea. Rejects if the plan has open tasks unless force=true (rare for ideas since ideas don't hold tasks). Retrying the same (blob_hash, status) is idempotent — first reason wins, subsequent reasons are lost (status is operational, reason is decoration).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "blob_hash": {"type": "string", "description": "Plan blob hash (content_type='plan')"},
+                "blob_hash": {"type": "string", "description": "Plan or idea blob hash (content_type='plan' or 'idea')"},
                 "status": {"type": "string", "enum": ["active", "completed", "paused", "abandoned"], "description": "New effective status"},
                 "reason": {"type": "string", "description": "Why the status changed (optional, freeform)"},
-                "force": {"type": "boolean", "description": "Close the plan even with open tasks attached (default: false)"}
+                "force": {"type": "boolean", "description": "Close even with open tasks attached (default: false)"}
             },
             "required": ["blob_hash", "status"]
         }
@@ -12586,6 +12632,10 @@ def dispatch_mcp_tool(tool_name, args):
             "methodology": 0.9,
             # plan — active work plans
             "plan": 0.6,
+            # idea — pre-plan architecture notes; surfaces below plans but
+            # above raw memories so they're findable during "what was that
+            # thing I was thinking about" queries.
+            "idea": 0.3,
             # memory — default. explicit bootloader_weight may still promote.
             "memory": 0.0,
         }
