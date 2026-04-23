@@ -16,6 +16,7 @@ COPY audit_service.py .
 COPY encryption_service.py .
 COPY passkey_auth.py .
 COPY nightly_cron.py .
+COPY consolidation_cron.py .
 COPY immune_cron.py .
 COPY health_cron.py .
 COPY embedding_backfill.py .

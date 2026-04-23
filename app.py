@@ -11635,6 +11635,138 @@ def nightly_maintenance():
     })
 
 
+@app.route('/v2/consolidate_all_tenants', methods=['POST'])
+def consolidate_all_tenants():
+    """Consolidation bridge: per-tenant cycle_type='manual' promotion.
+
+    Fills the gap between c49cb56's nightly consolidation disable (2026-04-07)
+    and the future Curator Stack. Uses cycle_type='manual' which routes to the
+    safe activation formula (salience * (1 + log(replay_count + 1))) at
+    app.py:11003 — NOT the dream activation formula that silted sacred content
+    via the novelty-penalty path (see 6dd1673).
+
+    Heartbeat: registered as 'consolidation_bridge' with interval=360 min (6h)
+    per the sacred operational rule (boswell commit e612899e): no
+    consolidation-layer service runs unmonitored.
+    """
+    import gc
+    start_time = time.time()
+
+    try:
+        db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, name FROM tenants")
+        tenants = cur.fetchall()
+        cur.close()
+        db.close()
+    except Exception as e:
+        # Heartbeat the failure so the monitor sees it
+        write_heartbeat(
+            'consolidation_bridge', 'error',
+            f"Failed to fetch tenants: {str(e)[:200]}",
+            work_done=0, expected_interval_minutes=360,
+        )
+        return jsonify({'error': f'Failed to fetch tenants: {str(e)}'}), 500
+
+    tenant_summaries = []
+    failed_tenants = []
+    total_promoted = 0
+
+    for tenant in tenants:
+        tenant_id = str(tenant['id'])
+        tenant_name = tenant.get('name', tenant_id[:8])
+        push_tenant_override(tenant_id)
+
+        slim = {'name': tenant_name, 'id': tenant_id[:8]}
+
+        try:
+            # Use test_request_context so run_consolidation's request.get_json()
+            # call works for cycle_type/max_promotions/etc. Same pattern
+            # nightly_maintenance uses for decay_trails/discovery_pass/
+            # bootstrap_fingerprints.
+            payload = {
+                'cycle_type': 'manual',
+                'max_promotions': 10,
+                'min_score': 0.5,
+                'dry_run': False,
+            }
+            with app.test_request_context(
+                method='POST', path='/v2/consolidate', json=payload,
+            ):
+                g.mcp_auth = {
+                    'tenant_id': tenant_id, 'source': 'consolidation_bridge',
+                }
+                result = run_consolidation()
+                data = result.get_json() if hasattr(result, 'get_json') else result
+
+            promoted = data.get('candidates_promoted', 0) if isinstance(data, dict) else 0
+            evaluated = data.get('candidates_evaluated', 0) if isinstance(data, dict) else 0
+            slim['evaluated'] = evaluated
+            slim['promoted'] = promoted
+            total_promoted += promoted
+            print(
+                f"[CONSOLIDATION_BRIDGE] {tenant_name}: "
+                f"evaluated={evaluated} promoted={promoted}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            err = str(e)[:200]
+            slim['error'] = err
+            failed_tenants.append({
+                'name': tenant_name, 'id': tenant_id[:8], 'error': err,
+            })
+            print(
+                f"[CONSOLIDATION_BRIDGE] {tenant_name}: TENANT FAILURE: {err}",
+                file=sys.stderr,
+            )
+        finally:
+            pop_tenant_override()
+            tenant_summaries.append(slim)
+            # Explicit free between tenants — consolidation loads all embeddings
+            # into scored[], same memory pressure that forced c49cb56's disable.
+            # gc.collect() here keeps each tenant's footprint bounded.
+            gc.collect()
+
+    duration_ms = int((time.time() - start_time) * 1000)
+    tenants_succeeded = len(tenants) - len(failed_tenants)
+
+    # Heartbeat — THE point of this endpoint existing. Status semantics match
+    # nightly_maintenance: 'error' if all tenants failed, 'ok' if any succeeded,
+    # 'no_work' if there were no tenants (shouldn't happen in practice).
+    if len(failed_tenants) > 0 and tenants_succeeded == 0:
+        hb_status = 'error'
+    elif tenants_succeeded > 0:
+        hb_status = 'ok'
+    else:
+        hb_status = 'no_work'
+
+    write_heartbeat(
+        'consolidation_bridge',
+        hb_status,
+        f"tenants={tenants_succeeded}/{len(tenants)} promoted={total_promoted} duration_ms={duration_ms}",
+        work_done=total_promoted,
+        expected_interval_minutes=360,
+    )
+
+    print(
+        f"[CONSOLIDATION_BRIDGE] Complete: {len(tenants)} tenants, "
+        f"{len(failed_tenants)} failed, {total_promoted} promoted, {duration_ms}ms",
+        file=sys.stderr,
+    )
+
+    return jsonify({
+        'status': 'consolidation_bridge_complete',
+        'tenants_processed': len(tenants),
+        'tenants_succeeded': tenants_succeeded,
+        'tenants_failed': len(failed_tenants),
+        'total_promoted': total_promoted,
+        'failed': failed_tenants,
+        'tenants': tenant_summaries,
+        'duration_ms': duration_ms,
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+    })
+
+
 # =============================================================================
 # LEGACY /auth/* PASSKEY FLOW — REMOVED 2026-04-19
 # Deprecated by Steve decision: "it was just so i could open the thing with my face.
