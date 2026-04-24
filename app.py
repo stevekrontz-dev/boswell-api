@@ -89,12 +89,46 @@ def get_openai_client():
 _embedding_cache = {}
 _EMBEDDING_CACHE_MAX = 200
 
+# text-embedding-3-small hard limit is 8192 tokens. Truncate just under to
+# leave headroom for any tokenization edge cases. Char-based truncation is
+# unsafe because code has ~2 chars/token — 30000 chars of Pine Script
+# exceeds the limit (caught live on blob a833301e, the /pine skill, 2026-04-24).
+_EMBEDDING_TOKEN_LIMIT = 8000
+_tiktoken_encoder = None
+
+def _get_tiktoken_encoder():
+    global _tiktoken_encoder
+    if _tiktoken_encoder is None:
+        try:
+            import tiktoken
+            _tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            print(f"[EMBEDDING] tiktoken unavailable, falling back to char truncation: {e}", file=sys.stderr)
+            _tiktoken_encoder = False  # sentinel: disabled
+    return _tiktoken_encoder
+
+
+def _truncate_for_embedding(text: str) -> str:
+    enc = _get_tiktoken_encoder()
+    if not enc:
+        # Fallback: conservative char cap for worst-case ~2 chars/token
+        return text[:16000] if len(text) > 16000 else text
+    tokens = enc.encode(text)
+    if len(tokens) <= _EMBEDDING_TOKEN_LIMIT:
+        return text
+    return enc.decode(tokens[:_EMBEDDING_TOKEN_LIMIT])
+
+
 def generate_embedding(text: str, use_cache: bool = True) -> list:
     """Generate embedding using OpenAI text-embedding-3-small.
 
     LRU cache (in-memory, process-scoped) avoids repeat OpenAI calls for
     identical queries within the same process lifetime. Pass use_cache=False
     for write-path embeddings that should always be fresh.
+
+    Token-aware truncation via tiktoken ensures we never exceed the 8192-token
+    input limit. Older char-based truncation at 30000 chars silently rejected
+    code-heavy blobs because code is ~2 chars/token, well over 8192.
     """
     import hashlib
     cache_key = hashlib.md5(text[:1000].encode()).hexdigest() if use_cache else None
@@ -107,8 +141,7 @@ def generate_embedding(text: str, use_cache: bool = True) -> list:
         print(f"[EMBEDDING] No client - OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}", file=sys.stderr)
         return None
     try:
-        if len(text) > 30000:
-            text = text[:30000]
+        text = _truncate_for_embedding(text)
         response = client.embeddings.create(
             model="text-embedding-3-small",
             input=text,
