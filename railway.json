@@ -5,6 +5,7 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
+    "startCommand": "python consolidation_cron.py",
     "healthcheckPath": "/",
     "restartPolicyType": "ON_FAILURE"
   }
