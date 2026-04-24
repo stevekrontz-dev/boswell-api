@@ -20,6 +20,7 @@ COPY consolidation_cron.py .
 COPY immune_cron.py .
 COPY health_cron.py .
 COPY embedding_backfill.py .
+COPY alert_check_cron.py .
 COPY auth/ ./auth/
 COPY billing/ ./billing/
 COPY onboarding/ ./onboarding/
