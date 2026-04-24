@@ -906,30 +906,41 @@ def _ensure_alert_notifications_schema():
 
 
 def _alert_key(a: dict) -> str:
-    """Stable per-alert identifier. 'cron_silent::<service>' for Alert 6;
-    type-only for the others (they don't have a secondary identifier that
-    changes within a condition)."""
+    """Stable per-alert identifier. For alerts that identify a specific
+    service (Alert 6 cron_silent, Alert 7 cron_zero_work), include the
+    service name so multiple offending services don't collide on one key
+    and suppress each other's notifications. Fall back to type-only for
+    alerts without a service dimension."""
     details = a.get('details') or {}
     atype = a.get('type') or 'unknown'
-    if atype == 'cron_silent':
-        return f"cron_silent::{details.get('service', 'unknown')}"
+    service = details.get('service')
+    if service and atype in ('cron_silent', 'cron_zero_work'):
+        return f"{atype}::{service}"
     return f"{atype}::default"
 
 
 def _send_alert_email(alert: dict):
-    """Send a single alert email via Resend. Never raises."""
+    """Send a single alert email via Resend. Never raises.
+
+    ALERT_EMAIL_FROM can override the sender. Defaults to Resend's sandbox
+    address (onboarding@resend.dev) which always works but only delivers to
+    the Resend account holder — that's ALERT_EMAIL_TO by design for alerts.
+    Production move is to verify a real domain on resend.com/domains and set
+    ALERT_EMAIL_FROM to something like noreply@askboswell.com.
+    """
     import resend
     if not os.environ.get('RESEND_API_KEY'):
         print(f"[ALERT-CHECK] RESEND_API_KEY not set — skipping email for {alert.get('type')}", file=sys.stderr)
         return False
     resend.api_key = os.environ.get('RESEND_API_KEY')
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'Boswell Alerts <onboarding@resend.dev>')
     try:
         severity = alert.get('severity', 'info').upper()
         atype = alert.get('type', 'unknown')
         msg = alert.get('message', '(no message)')
         details_str = json.dumps(alert.get('details') or {}, indent=2, default=str)
         resend.Emails.send({
-            "from": "Boswell Alerts <noreply@askboswell.com>",
+            "from": from_addr,
             "to": [_ALERT_EMAIL_TO],
             "subject": f"[Boswell {severity}] {atype}",
             "html": f"""
