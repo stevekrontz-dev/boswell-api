@@ -385,6 +385,7 @@ def check_mcp_auth(get_cursor_func, get_db_func=None):
         '/v2/billing/webhook',              # Stripe webhook — signature-verified, not JWT
         '/v2/nightly',                      # Nightly cron — called by Railway cron service
         '/v2/immune/patrol',                # Immune patrol cron — called by Railway cron service
+        '/v2/consolidate_all_tenants',      # Consolidation bridge cron — called by Railway cron service every 6h
         '/v2/embeddings/backfill',          # Embedding backfill — called by Railway cron service every 5 min
         '/v2/embeddings/status',            # Embedding coverage monitoring — cron/health checks
     ]
