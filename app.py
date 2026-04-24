@@ -1072,11 +1072,16 @@ def alert_check():
         cur.close()
 
     # Heartbeat for this cron too — closing the recursive case.
+    # work_done=1 always: a successful poll IS the work. Counting `notified`
+    # made Alert 7 self-fire because the 12h throttle legitimately suppresses
+    # emails on 23 of every 24 runs. Alert 6 (cron_silent) is the right
+    # watchdog for polling crons; Alert 7 (cron_zero_work) is for worker crons
+    # whose purpose is to drain a queue.
     write_heartbeat(
         'alert_check',
         'ok',
         f"critical={len(critical)} notified={notified} resolved={resolved_count}",
-        work_done=notified,
+        work_done=1,
         expected_interval_minutes=30
     )
 
