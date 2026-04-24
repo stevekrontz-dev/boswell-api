@@ -670,9 +670,19 @@ def check_openai():
 
 
 def get_current_alerts_internal():
-    """Get current alerts via internal call to admin_alerts."""
+    """Get current alerts via internal call to admin_alerts.
+
+    admin_alerts is wrapped in @require_admin, so calling it through a
+    plain test_request_context returns 401. Inject X-Godmode-Password so the
+    existing godmode fallback in require_admin (app.py:5988-5992) authorizes
+    the internal call. Without this header, alert_check silently sees zero
+    critical alerts every fire — which is exactly how the Alert 6/7
+    dispatch pipeline went dark.
+    """
+    godmode = os.environ.get('GODMODE_PASSWORD', '')
+    headers = {'X-Godmode-Password': godmode} if godmode else {}
     try:
-        with app.test_request_context():
+        with app.test_request_context(headers=headers):
             response = admin_alerts()
             if hasattr(response, 'json'):
                 return response.json
