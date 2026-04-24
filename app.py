@@ -2553,8 +2553,15 @@ def ensure_cron_heartbeats_schema():
                 last_status TEXT NOT NULL,
                 last_message TEXT,
                 work_done_count INT DEFAULT 0,
-                expected_interval_minutes INT NOT NULL DEFAULT 5
+                expected_interval_minutes INT NOT NULL DEFAULT 5,
+                consecutive_zero_work INT NOT NULL DEFAULT 0
             );
+        """)
+        # Migration: add consecutive_zero_work to tables created before Alert 7.
+        # Idempotent — no-op if column already present.
+        cur.execute("""
+            ALTER TABLE cron_heartbeats
+                ADD COLUMN IF NOT EXISTS consecutive_zero_work INT NOT NULL DEFAULT 0;
         """)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_cron_heartbeats_last_run
@@ -2591,15 +2598,20 @@ def write_heartbeat(service: str, status: str, message: str = None,
         cur = get_cursor()
         cur.execute("""
             INSERT INTO cron_heartbeats
-                (service, last_run_at, last_status, last_message, work_done_count, expected_interval_minutes)
-            VALUES (%s, NOW(), %s, %s, %s, %s)
+                (service, last_run_at, last_status, last_message, work_done_count, expected_interval_minutes, consecutive_zero_work)
+            VALUES (%s, NOW(), %s, %s, %s, %s, CASE WHEN %s = 0 THEN 1 ELSE 0 END)
             ON CONFLICT (service) DO UPDATE SET
                 last_run_at = EXCLUDED.last_run_at,
                 last_status = EXCLUDED.last_status,
                 last_message = EXCLUDED.last_message,
                 work_done_count = EXCLUDED.work_done_count,
-                expected_interval_minutes = EXCLUDED.expected_interval_minutes
-        """, (service, status, message, work_done, expected_interval_minutes))
+                expected_interval_minutes = EXCLUDED.expected_interval_minutes,
+                consecutive_zero_work = CASE
+                    WHEN EXCLUDED.work_done_count = 0
+                        THEN cron_heartbeats.consecutive_zero_work + 1
+                    ELSE 0
+                END
+        """, (service, status, message, work_done, expected_interval_minutes, work_done))
         get_db().commit()
         cur.close()
     except Exception as e:
@@ -6737,6 +6749,40 @@ def admin_alerts():
             # Don't break the other alerts if cron_heartbeats doesn't exist yet.
             # Log loudly per sacred rule c36afb57.
             print(f"[ALERT-6] cron_heartbeats query failed (table may not exist yet): {e}", file=sys.stderr)
+
+        # Alert 7: Cron zero-work streak — heartbeat fires on schedule but work_done=0
+        # for >= 2 consecutive runs. Catches silent no-ops where script exits 0 and
+        # heartbeat writes but no actual work happened. Different failure class than
+        # Alert 6 (temporal silence): a cron can be "alive" (heartbeat recent) but
+        # "idle" (consecutive_zero_work accumulating) — the class that caused
+        # consolidation_bridge's Apr 7 → Apr 24 2026 silent 401 no-op.
+        # THIRD SURFACING of NO SILENT FAILURES directive (c36afb57). SEVERITY
+        # critical because the whole reason these crons exist is to not silent-fail.
+        try:
+            cur.execute('''
+                SELECT service, last_run_at, last_status, last_message,
+                       consecutive_zero_work, expected_interval_minutes
+                FROM cron_heartbeats
+                WHERE consecutive_zero_work >= 2
+                ORDER BY consecutive_zero_work DESC
+            ''')
+            for row in cur.fetchall():
+                alerts.append({
+                    'severity': 'critical',
+                    'type': 'cron_zero_work',
+                    'message': f"Cron '{row['service']}' has run {row['consecutive_zero_work']} consecutive times with work_done=0",
+                    'details': {
+                        'service': row['service'],
+                        'last_run_at': str(row['last_run_at']),
+                        'last_status': row['last_status'],
+                        'last_message': row['last_message'],
+                        'consecutive_zero_work': row['consecutive_zero_work'],
+                        'expected_interval_minutes': row['expected_interval_minutes'],
+                    }
+                })
+        except Exception as e:
+            # Don't break the other alerts if column is mid-migration.
+            print(f"[ALERT-7] cron_zero_work query failed (column may not exist yet): {e}", file=sys.stderr)
 
         cur.close()
 
