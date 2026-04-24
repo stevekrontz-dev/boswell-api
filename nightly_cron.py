@@ -32,6 +32,7 @@ def main():
             json={},
             timeout=MAX_RUNTIME
         )
+        response.raise_for_status()
         data = response.json()
 
         status = data.get('status', 'unknown')

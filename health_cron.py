@@ -18,6 +18,7 @@ def main():
     url = f"{BOSWELL_URL}/v2/health/daemon"
     try:
         response = requests.get(url, timeout=30)
+        response.raise_for_status()
         data = response.json()
         status = data.get('status', 'unknown')
         checks_passed = data.get('summary', {}).get('checks_passed', 0)

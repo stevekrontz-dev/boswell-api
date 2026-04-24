@@ -38,6 +38,7 @@ def main():
             json={'batch_size': BATCH_SIZE},
             timeout=MAX_RUNTIME
         )
+        response.raise_for_status()
         data = response.json()
 
         blobs_filled = data.get('blobs_filled', 0)

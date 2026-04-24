@@ -30,6 +30,7 @@ def main():
             json={"auto_quarantine": True},
             timeout=MAX_RUNTIME
         )
+        response.raise_for_status()
         data = response.json()
 
         patrol_id = data.get('patrol_id', 'unknown')
