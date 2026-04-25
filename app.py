@@ -2702,13 +2702,13 @@ def ensure_embedding_policy_schema():
             ADD COLUMN IF NOT EXISTS embedding_policy embedding_policy_t
             NOT NULL DEFAULT 'always';
         """)
-        # One-shot migration: Scout-Semis (ingestion tenant) → 'never'.
-        # Idempotent — only fires when current value differs.
-        cur.execute("""
-            UPDATE tenants SET embedding_policy = 'never'
-            WHERE id = '968e407c-91df-4313-ab97-7e9023b95874'
-              AND embedding_policy != 'never';
-        """)
+        # No tenants ship with 'never' by default. The column exists as a
+        # placeholder for future ingestion-only tenants (pure numeric ETL,
+        # key-value caches, etc.) where the architecture is settled enough
+        # to commit to that classification. Earlier patch flipped Scout-Semis
+        # to 'never' but reverted same session — prototype-phase tenants
+        # shouldn't be categorically excluded; data-when-you-want-it asymmetry
+        # favors backfill. See technology.boswell.architecture commit.
         db.commit()
         cur.close()
         _embedding_policy_schema_ensured = True
