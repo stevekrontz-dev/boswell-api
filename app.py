@@ -26,6 +26,8 @@ import math
 import threading
 import numpy as np
 
+from boswell_scheduler import scheduled, start_scheduler
+
 # Read version from VERSION file
 try:
     VERSION = open(os.path.join(os.path.dirname(__file__), 'VERSION')).read().strip()
@@ -261,29 +263,69 @@ def pop_tenant_override():
 
 
 def tenant_embedding_enabled(tenant_id) -> bool:
-    """True iff the tenant's embedding_policy is 'always'.
+    """True iff the tenant subscribes to embedding ('always').
 
-    Skips OpenAI embedding generation for ingestion-style tenants (e.g.
-    Scout-Semis at 'never') where an external NLP pipeline is the semantic
-    layer. Safe defaults: missing tenant_id, missing tenant row, or any
-    lookup failure returns True so policy lookup never blocks a write.
+    Reads tenants.subscriptions JSONB (key 'embedding'), falling back to
+    'always' when the key is missing — same default as get_subscribed_tenants
+    so a tenant added without a subscription row still gets embeddings.
 
-    See ensure_embedding_policy_schema for the column + migration.
+    Safe defaults: missing tenant_id, missing tenant row, or any lookup
+    failure returns True so policy lookup never blocks a write.
     """
     if not tenant_id:
         return True
     try:
         cur = get_cursor()
-        cur.execute("SELECT embedding_policy FROM tenants WHERE id = %s", (str(tenant_id),))
+        cur.execute(
+            "SELECT COALESCE(subscriptions->>'embedding', 'always') AS policy "
+            "FROM tenants WHERE id = %s",
+            (str(tenant_id),),
+        )
         r = cur.fetchone()
         cur.close()
         if r is None:
             return True
-        # Row may be a tuple or RealDict-style depending on cursor factory
-        policy = r[0] if isinstance(r, (tuple, list)) else r.get('embedding_policy')
+        policy = r[0] if isinstance(r, (tuple, list)) else r.get('policy')
         return policy != 'never'
     except Exception:
         return True
+
+
+# Lightweight tenant record passed into @scheduled jobs. Avoids leaking row
+# tuples and keeps the per-tenant signature stable as the schema evolves.
+_Tenant = __import__('collections').namedtuple('_Tenant', ['id', 'name'])
+
+
+def get_subscribed_tenants(service: str) -> list:
+    """Return the tenants whose subscriptions[service] is 'always'.
+
+    Default 'always' when the key is missing — safe default for existing
+    tenants and any service not yet declared in the matrix. Lifts the
+    per-tenant-loop convention used by consolidate_all_tenants
+    (app.py:11885) into a platform contract used by @scheduled jobs.
+
+    Replaces ad-hoc `SELECT id FROM tenants` patterns scattered across cron
+    handlers. Callers iterate the returned list, push/pop tenant override
+    around the body, and aggregate results.
+    """
+    cur = get_cursor()
+    cur.execute(
+        """
+        SELECT id, name FROM tenants
+        WHERE COALESCE(subscriptions->>%s, 'always') = 'always'
+        ORDER BY id
+        """,
+        (service,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    out = []
+    for r in rows:
+        if isinstance(r, (tuple, list)):
+            out.append(_Tenant(id=str(r[0]), name=r[1]))
+        else:
+            out.append(_Tenant(id=str(r['id']), name=r.get('name')))
+    return out
 
 # Project to branch mapping for auto-routing
 PROJECT_BRANCH_MAP = {
@@ -2721,6 +2763,54 @@ def ensure_embedding_policy_schema():
             pass
         # Don't retry on every request
         _embedding_policy_schema_ensured = True
+
+
+_tenant_subscriptions_schema_ensured = False
+
+def ensure_tenant_subscriptions_schema():
+    """Add tenants.subscriptions JSONB column + backfill from embedding_policy.
+
+    The subscription matrix is the platform contract for "which tenants
+    does this scheduled job iterate?". @scheduled(subscription='embedding')
+    queries `subscriptions->>'embedding' = 'always'`. Future jobs declare
+    their own subscription keys (alerts, consolidation, decay, etc.).
+
+    embedding_policy column stays for one release as fallback for any
+    handler that still reads it directly. Drop next sprint after grep
+    confirms zero readers.
+    """
+    global _tenant_subscriptions_schema_ensured
+    if _tenant_subscriptions_schema_ensured:
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("""
+            ALTER TABLE tenants
+            ADD COLUMN IF NOT EXISTS subscriptions JSONB
+            NOT NULL DEFAULT '{}'::jsonb;
+        """)
+        # One-shot backfill: only seed rows that haven't been touched yet.
+        # Idempotent — once a row has a non-empty subscriptions object,
+        # subsequent runs leave it alone.
+        cur.execute("""
+            UPDATE tenants
+            SET subscriptions = jsonb_build_object(
+                'embedding', COALESCE(embedding_policy::text, 'always')
+            )
+            WHERE subscriptions = '{}'::jsonb;
+        """)
+        db.commit()
+        cur.close()
+        _tenant_subscriptions_schema_ensured = True
+        print("[STARTUP] tenant_subscriptions schema ensured", file=sys.stderr)
+    except Exception as e:
+        print(f"[STARTUP] tenant_subscriptions schema check failed: {e}", file=sys.stderr)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _tenant_subscriptions_schema_ensured = True
 
 
 def write_heartbeat(service: str, status: str, message: str = None,
@@ -5759,45 +5849,129 @@ def debug_branch_detection():
 
 # ==================== EMBEDDINGS ====================
 
+
+@scheduled(cron='*/5 * * * *', subscription='embedding',
+           heartbeat_key='embedding_backfill', expected_interval_minutes=5)
+def backfill_embeddings_for_tenant(tenant, batch_size: int = 20) -> dict:
+    """Per-tenant embedding backfill body.
+
+    Caller is responsible for push_tenant_override(tenant.id) before and
+    pop_tenant_override() after — both the HTTP handler and the
+    @scheduled wrapper handle that, so this body just runs the queries
+    against the already-scoped connection.
+
+    Returns dict with: blobs, candidates, errors, error_details.
+    Commits the connection on success.
+    """
+    if not OPENAI_API_KEY:
+        return {'blobs': 0, 'candidates': 0, 'errors': 0, 'error_details': []}
+
+    tenant_id = tenant.id if hasattr(tenant, 'id') else tenant['id']
+    tenant_id_str = str(tenant_id)
+    short = tenant_id_str[:8]
+
+    db = get_db()
+    tcur = get_cursor()
+    t_blobs = 0
+    t_cands = 0
+    t_errs = 0
+    error_details = []
+
+    # Phase 1: Backfill blob embeddings for this tenant
+    tcur.execute('''
+        SELECT blob_hash, content FROM blobs
+        WHERE tenant_id = %s AND embedding IS NULL
+        ORDER BY created_at DESC
+        LIMIT %s
+    ''', (tenant_id_str, batch_size))
+
+    for blob in tcur.fetchall():
+        content = blob['content']
+        if not content or not content.strip():
+            error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': 'empty_content', 'tenant': short})
+            t_errs += 1
+            continue
+        embedding = generate_embedding(content, use_cache=False)
+        if embedding:
+            try:
+                tcur.execute(
+                    '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
+                    (embedding, blob['blob_hash'], tenant_id_str)
+                )
+                t_blobs += 1
+            except Exception as e:
+                error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': f'update_failed: {e}', 'tenant': short})
+                t_errs += 1
+        else:
+            error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': 'embedding_generation_failed', 'tenant': short})
+            t_errs += 1
+
+    # Phase 2: Backfill candidate_memories for this tenant
+    if HIPPOCAMPAL_ENABLED:
+        ensure_hippocampal_tables()
+        tcur.execute('''
+            SELECT id, summary, content, context_embedding IS NULL as needs_context
+            FROM candidate_memories
+            WHERE tenant_id = %s AND embedding IS NULL
+              AND status IN ('active', 'cooling')
+            ORDER BY created_at DESC
+            LIMIT %s
+        ''', (tenant_id_str, batch_size))
+
+        for cand in tcur.fetchall():
+            embed_text = cand['summary'] or ''
+            if cand['content']:
+                content_str = json.dumps(cand['content'], default=str) if isinstance(cand['content'], dict) else str(cand['content'])
+                embed_text = f"{embed_text}\n{content_str}"
+
+            embedding = generate_embedding(embed_text, use_cache=False)
+            if embedding:
+                try:
+                    tcur.execute(
+                        '''UPDATE candidate_memories SET embedding = %s WHERE id = %s AND tenant_id = %s''',
+                        (embedding, str(cand['id']), tenant_id_str)
+                    )
+                    t_cands += 1
+                except Exception:
+                    t_errs += 1
+            else:
+                t_errs += 1
+
+    tcur.close()
+    db.commit()
+    return {'blobs': t_blobs, 'candidates': t_cands, 'errors': t_errs, 'error_details': error_details}
+
+
 @app.route('/v2/embeddings/backfill', methods=['POST'])
 def backfill_embeddings():
     """Generate embeddings for blobs and candidates that don't have them.
 
-    Called by the embedding-backfill Railway cron service every 5 minutes.
-    Handles both blobs (permanent memory) and candidate_memories (bookmarks).
-    CC/CW consensus March 30 2026: 5-minute micro-batch, not nightly.
+    HTTP fallback for the in-process @scheduled job. Kept for one release
+    while the APScheduler shell (boswell_scheduler.py) takes over the
+    cron-firing role; see ops-postmortems for the 2026-04-25 deploy-layer
+    fix that motivated the collapse.
 
-    Iterates ALL tenants where embedding_policy='always' (per-tenant scoping
-    via push_tenant_override, mirroring consolidate_all_tenants pattern).
-    Tenants with policy='never' (e.g. Scout-Semis ingestion-style tenants
-    using FinBERT as their semantic layer) are skipped by design.
+    Iterates tenants subscribed to 'embedding' (subscriptions->>'embedding'
+    = 'always'). Tenants with subscription 'never' (future ingestion-style
+    tenants whose semantic layer is an external NLP pipeline) are skipped
+    by design.
 
     Pre-2026-04-25 this handler used get_tenant_id() which fell through to
     DEFAULT_TENANT for unauthenticated PUBLIC_PATHS callers — silently
-    starving every non-DEFAULT tenant. See ops-postmortems for the discovery.
+    starving every non-DEFAULT tenant.
     """
     if not OPENAI_API_KEY:
         return jsonify({'error': 'OpenAI API key not configured'}), 500
 
     ensure_embedding_policy_schema()
+    ensure_tenant_subscriptions_schema()
 
     start_time = time.time()
     batch_size = 20
     if request.json and 'batch_size' in request.json:
         batch_size = min(request.json['batch_size'], 50)
 
-    db = get_db()
-    cur = get_cursor()
-
-    # Eligible tenants per policy. Snapshot the list up front so the loop
-    # is deterministic even if a new tenant lands mid-cron.
-    cur.execute("""
-        SELECT id, name FROM tenants
-        WHERE embedding_policy = 'always'
-        ORDER BY id
-    """)
-    eligible = cur.fetchall()
-    cur.close()
+    eligible = get_subscribed_tenants('embedding')
 
     blobs_filled = 0
     candidates_filled = 0
@@ -5805,100 +5979,27 @@ def backfill_embeddings():
     error_details = []
     tenants_processed = []
 
-    for tenant_row in eligible:
-        # Tenant rows may be tuples or RealDict-like depending on cursor factory.
-        if isinstance(tenant_row, (tuple, list)):
-            tenant_id, tenant_name = tenant_row[0], tenant_row[1]
-        else:
-            tenant_id, tenant_name = tenant_row['id'], tenant_row['name']
-
-        push_tenant_override(tenant_id)
+    for tenant in eligible:
+        push_tenant_override(tenant.id)
         try:
-            tcur = get_cursor()
-            t_blobs = 0
-            t_cands = 0
-            t_errs = 0
-
-            # Phase 1: Backfill blob embeddings for this tenant
-            tcur.execute('''
-                SELECT blob_hash, content FROM blobs
-                WHERE tenant_id = %s AND embedding IS NULL
-                ORDER BY created_at DESC
-                LIMIT %s
-            ''', (str(tenant_id), batch_size))
-
-            for blob in tcur.fetchall():
-                content = blob['content']
-                if not content or not content.strip():
-                    error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': 'empty_content', 'tenant': str(tenant_id)[:8]})
-                    t_errs += 1
-                    continue
-                embedding = generate_embedding(content, use_cache=False)
-                if embedding:
-                    try:
-                        tcur.execute(
-                            '''UPDATE blobs SET embedding = %s WHERE blob_hash = %s AND tenant_id = %s''',
-                            (embedding, blob['blob_hash'], str(tenant_id))
-                        )
-                        t_blobs += 1
-                    except Exception as e:
-                        error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': f'update_failed: {e}', 'tenant': str(tenant_id)[:8]})
-                        t_errs += 1
-                else:
-                    error_details.append({'blob_hash': blob['blob_hash'][:16], 'reason': 'embedding_generation_failed', 'tenant': str(tenant_id)[:8]})
-                    t_errs += 1
-
-            # Phase 2: Backfill candidate_memories for this tenant
-            if HIPPOCAMPAL_ENABLED:
-                ensure_hippocampal_tables()
-                tcur.execute('''
-                    SELECT id, summary, content, context_embedding IS NULL as needs_context
-                    FROM candidate_memories
-                    WHERE tenant_id = %s AND embedding IS NULL
-                      AND status IN ('active', 'cooling')
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                ''', (str(tenant_id), batch_size))
-
-                for cand in tcur.fetchall():
-                    embed_text = cand['summary'] or ''
-                    if cand['content']:
-                        content_str = json.dumps(cand['content'], default=str) if isinstance(cand['content'], dict) else str(cand['content'])
-                        embed_text = f"{embed_text}\n{content_str}"
-
-                    embedding = generate_embedding(embed_text, use_cache=False)
-                    if embedding:
-                        try:
-                            tcur.execute(
-                                '''UPDATE candidate_memories SET embedding = %s WHERE id = %s AND tenant_id = %s''',
-                                (embedding, str(cand['id']), str(tenant_id))
-                            )
-                            t_cands += 1
-                        except Exception:
-                            t_errs += 1
-                    else:
-                        t_errs += 1
-
-            tcur.close()
-            blobs_filled += t_blobs
-            candidates_filled += t_cands
-            errors_count += t_errs
-            if t_blobs or t_cands or t_errs:
+            r = backfill_embeddings_for_tenant(tenant, batch_size=batch_size)
+            blobs_filled += r['blobs']
+            candidates_filled += r['candidates']
+            errors_count += r['errors']
+            error_details.extend(r['error_details'])
+            if r['blobs'] or r['candidates'] or r['errors']:
                 tenants_processed.append({
-                    'id': str(tenant_id)[:8],
-                    'name': tenant_name,
-                    'blobs': t_blobs,
-                    'candidates': t_cands,
-                    'errors': t_errs,
+                    'id': tenant.id[:8],
+                    'name': tenant.name,
+                    'blobs': r['blobs'],
+                    'candidates': r['candidates'],
+                    'errors': r['errors'],
                 })
         finally:
             pop_tenant_override()
 
-    db.commit()
-
     duration_ms = int((time.time() - start_time) * 1000)
 
-    # Fix 3 + per-tenant aggregation: write cron heartbeat with totals.
     total_work = blobs_filled + candidates_filled
     if errors_count > 0 and total_work == 0:
         hb_status = 'error'
@@ -13602,6 +13703,40 @@ def serve_spa(path):
         return send_from_directory(DASHBOARD_DIR, path)
     # Otherwise return index.html for SPA routing
     return send_from_directory(DASHBOARD_DIR, 'index.html')
+
+
+def _bootstrap_scheduler():
+    """Wire boswell_scheduler.start_scheduler with app helpers and ensure
+    the schemas it depends on. Called at module import so it runs in each
+    gunicorn worker; the advisory lock inside start_scheduler picks
+    exactly one worker as the lock-holder."""
+    aps_enabled = os.environ.get('APSCHEDULER_ENABLED', 'true').lower() == 'true'
+    if not aps_enabled:
+        print("[STARTUP] APScheduler disabled via APSCHEDULER_ENABLED=false",
+              file=sys.stderr)
+        return
+    try:
+        with app.test_request_context():
+            ensure_embedding_policy_schema()
+            ensure_tenant_subscriptions_schema()
+    except Exception as e:
+        print(f"[STARTUP] schema preflight before scheduler failed: {e}",
+              file=sys.stderr)
+    try:
+        start_scheduler(
+            app,
+            helpers={
+                'get_subscribed_tenants': get_subscribed_tenants,
+                'push_tenant_override': push_tenant_override,
+                'pop_tenant_override': pop_tenant_override,
+                'write_heartbeat': write_heartbeat,
+            },
+        )
+    except Exception as e:
+        print(f"[STARTUP] scheduler bootstrap failed: {e}", file=sys.stderr)
+
+
+_bootstrap_scheduler()
 
 
 if __name__ == '__main__':
