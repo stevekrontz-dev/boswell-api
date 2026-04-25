@@ -6790,6 +6790,7 @@ def admin_alerts():
                        EXTRACT(EPOCH FROM (NOW() - last_run_at)) / 60 AS minutes_silent
                 FROM cron_heartbeats
                 WHERE NOW() - last_run_at > (expected_interval_minutes * 3) * INTERVAL '1 minute'
+                  AND last_status != 'disabled'
                 ORDER BY minutes_silent DESC
             ''')
             for row in cur.fetchall():
@@ -6823,6 +6824,7 @@ def admin_alerts():
                        consecutive_zero_work, expected_interval_minutes
                 FROM cron_heartbeats
                 WHERE consecutive_zero_work >= 2
+                  AND last_status != 'disabled'
                 ORDER BY consecutive_zero_work DESC
             ''')
             for row in cur.fetchall():
