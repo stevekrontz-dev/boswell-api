@@ -38,8 +38,24 @@ def main():
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
+            # The daemon at /v2/health/daemon deliberately returns HTTP 503
+            # when overall_status='unhealthy' (app.py:884). That is NOT a
+            # transport failure — it's the daemon successfully reporting bad
+            # news. raise_for_status() would treat 503 as transient and
+            # retry-then-exit-1, conflating "system unhealthy" with "cron
+            # broken." Don't raise on 503 if the body is parseable health
+            # JSON; treat it as a successful ping per docstring.
+            try:
+                data = response.json()
+            except ValueError:
+                # Body isn't JSON — that's a real protocol failure (proxy
+                # error page, container swap mid-rollout, etc). Retry.
+                response.raise_for_status()
+                # If status was 2xx but body unparseable, raise our own error
+                raise requests.HTTPError(
+                    f"non-JSON response from daemon (status={response.status_code})"
+                )
+
             status = data.get('status', 'unknown')
             summary = data.get('summary', {})
             checks_passed = summary.get('checks_passed', 0)
@@ -48,7 +64,8 @@ def main():
 
             print(
                 f"[HEALTH] {status.upper()} - {checks_passed}/{checks_total} "
-                f"checks passed, alerts_critical={alerts_critical}"
+                f"checks passed, alerts_critical={alerts_critical} "
+                f"http={response.status_code}"
             )
 
             if status == 'unhealthy':
