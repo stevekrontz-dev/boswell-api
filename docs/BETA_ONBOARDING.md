@@ -79,7 +79,8 @@ Ask Claude:
 Call boswell_brief to check the memory system status.
 ```
 
-If connected, you'll see a summary of recent activity and available branches.
+If connected, you'll see the recent_thread — last commits across all branches with
+relative-time markers ("23m ago", "yesterday") — and a timestamp.
 
 ---
 
@@ -99,7 +100,8 @@ This loads your active commitments and available tools in one call. Make this yo
 Call boswell_brief to see recent activity.
 ```
 
-Shows recent commits across all branches, pending items, and system status.
+Returns the recent_thread — last 8 commits across all branches, capped at 3 per
+branch so one hot project doesn't monopolize the view, with relative-time markers.
 
 ### Store a Memory
 
