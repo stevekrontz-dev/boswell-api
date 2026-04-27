@@ -4065,6 +4065,244 @@ def recall_memory():
 
     return jsonify({'error': 'Hash or commit required'}), 400
 
+# ==================== RESUME-CONTEXT HELPERS ====================
+# Composition primitives shared by boswell_startup, boswell_brief, boswell_task_briefing.
+
+RESUME_NOISE_AUTHORS = frozenset({'cc-stop-hook'})  # excluded from recent_thread; underlying commits remain queryable
+
+
+def _format_relative_time(timestamp):
+    """Render datetime or ISO string as '23m ago', 'yesterday', '3w ago'. Returns None for None."""
+    if not timestamp:
+        return None
+    if isinstance(timestamp, str):
+        try:
+            timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except Exception:
+            return timestamp
+    try:
+        if timestamp.tzinfo is not None:
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+        else:
+            now = datetime.utcnow()
+        seconds = (now - timestamp).total_seconds()
+    except Exception:
+        return None
+    if seconds < 0:
+        return 'just now'
+    if seconds < 60:
+        return f'{int(seconds)}s ago'
+    if seconds < 3600:
+        return f'{int(seconds // 60)}m ago'
+    if seconds < 86400:
+        return f'{int(seconds // 3600)}h ago'
+    days = int(seconds // 86400)
+    if days == 1:
+        return 'yesterday'
+    if days < 7:
+        return f'{days}d ago'
+    if days < 30:
+        return f'{days // 7}w ago'
+    if days < 365:
+        return f'{days // 30}mo ago'
+    return f'{days // 365}y ago'
+
+
+def _fetch_recent_commits(cur, tenant_id, limit=8, max_per_branch=3, exclude_authors=None):
+    """Recent commits across branches, capped per-branch.
+
+    Walks parent_hash from each branch HEAD up to max_per_branch deep, dedupes commits
+    that appear in multiple branch chains (keeps the shallowest), excludes exclude_authors
+    (defaults to RESUME_NOISE_AUTHORS), sorts globally by created_at DESC, returns top limit.
+
+    Per-branch cap prevents one hot branch from monopolizing the resume thread.
+    """
+    if exclude_authors is None:
+        exclude_authors = RESUME_NOISE_AUTHORS
+    exclude_list = list(exclude_authors)
+    try:
+        cur.execute("""
+            WITH RECURSIVE branch_walks AS (
+                SELECT b.name AS branch, c.commit_hash, c.parent_hash, c.author,
+                       c.message, c.created_at, 1 AS depth
+                FROM branches b
+                JOIN commits c ON c.commit_hash = b.head_commit AND c.tenant_id = b.tenant_id
+                WHERE b.tenant_id = %s AND b.head_commit IS NOT NULL
+                UNION ALL
+                SELECT bw.branch, c.commit_hash, c.parent_hash, c.author,
+                       c.message, c.created_at, bw.depth + 1
+                FROM branch_walks bw
+                JOIN commits c ON c.commit_hash = bw.parent_hash AND c.tenant_id = %s
+                WHERE bw.depth < %s
+            ),
+            deduped AS (
+                SELECT DISTINCT ON (commit_hash)
+                       branch, commit_hash, author, message, created_at
+                FROM branch_walks
+                WHERE author IS NULL OR author <> ALL(%s::text[])
+                ORDER BY commit_hash, depth ASC
+            )
+            SELECT branch, commit_hash, author, message, created_at
+            FROM deduped
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (tenant_id, tenant_id, max_per_branch, exclude_list, limit))
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                'commit_hash': row['commit_hash'][:16] if row['commit_hash'] else None,
+                'branch': row['branch'],
+                'author': row['author'],
+                'message': (row['message'] or '')[:80],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'age': _format_relative_time(row['created_at']),
+            })
+        return results
+    except Exception as e:
+        print(f"[RECENT_COMMITS] {e}", file=sys.stderr)
+        return []
+
+
+def _fetch_hot_trails(cur, tenant_id, limit=5):
+    """Top N trails by strength with FSRS-6 fields and relative last_traversed."""
+    try:
+        cur.execute("""
+            SELECT source_blob, target_blob, traversal_count,
+                   last_traversed, strength,
+                   COALESCE(storage_strength, 1.0) AS storage_strength,
+                   COALESCE(retrieval_strength, 1.0) AS retrieval_strength,
+                   COALESCE(stability, 1.0) AS stability
+            FROM trails
+            WHERE tenant_id = %s AND COALESCE(state, 'active') != 'archived'
+            ORDER BY strength DESC NULLS LAST
+            LIMIT %s
+        """, (tenant_id, limit))
+        trails = []
+        for row in cur.fetchall():
+            trails.append({
+                'source_blob': row['source_blob'][:16] if row['source_blob'] else None,
+                'target_blob': row['target_blob'][:16] if row['target_blob'] else None,
+                'traversal_count': row['traversal_count'],
+                'strength': round(float(row['strength']), 3) if row['strength'] is not None else None,
+                'storage_strength': round(float(row['storage_strength']), 3),
+                'retrieval_strength': round(float(row['retrieval_strength']), 3),
+                'stability': round(float(row['stability']), 3),
+                'last_traversed_age': _format_relative_time(row['last_traversed']),
+            })
+        return trails
+    except Exception as e:
+        print(f"[HOT_TRAILS] {e}", file=sys.stderr)
+        return []
+
+
+def _fetch_expiring_bookmarks(cur, tenant_id, days=2):
+    """Bookmarks expiring within N days from candidate_memories.
+    Soft-fails to [] if hippocampal tables are absent (older deployments)."""
+    try:
+        cur.execute("""
+            SELECT id, branch, summary, salience, replay_count, status, expires_at,
+                   EXTRACT(EPOCH FROM (expires_at - NOW())) / 3600 AS hours_remaining
+            FROM candidate_memories
+            WHERE tenant_id = %s AND status IN ('active', 'cooling')
+              AND expires_at < NOW() + (%s || ' days')::interval
+              AND expires_at > NOW()
+            ORDER BY expires_at ASC
+        """, (tenant_id, str(days)))
+        expiring = []
+        for row in cur.fetchall():
+            expiring.append({
+                'id': str(row['id']),
+                'branch': row['branch'],
+                'summary': (row['summary'] or '')[:120],
+                'salience': row['salience'],
+                'hours_remaining': round(float(row['hours_remaining']), 1),
+            })
+        return expiring
+    except Exception as e:
+        print(f"[EXPIRING_BOOKMARKS] {e}", file=sys.stderr)
+        return []
+
+
+def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
+    """Semantic memory retrieval routed through the FSRS-6 reranking pipeline.
+
+    Single source of truth for both boswell_startup.relevant_memories (when caller
+    passes a context) and boswell_task_briefing. Both formerly bypassed
+    _rerank_results() — this helper closes that drift.
+
+    Score = (1 - weight_blend) * reranked_score + weight_blend * bootloader_weight.
+    """
+    if not query:
+        return []
+    if not OPENAI_API_KEY:
+        return []
+    try:
+        embedding = generate_embedding(query)
+        if not embedding:
+            return []
+        cur.execute("""
+            SELECT b.blob_hash, b.content,
+                   c.commit_hash, c.message, c.author, c.created_at,
+                   COALESCE(c.bootloader_weight, 0.0) AS bootloader_weight,
+                   c.episode_id, c.perspective,
+                   1.0 / (1.0 + (b.embedding <=> %s::vector)) AS rrf_score
+            FROM blobs b
+            JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
+            JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
+            WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
+              AND COALESCE(b.quarantined, FALSE) = FALSE
+            ORDER BY b.embedding <=> %s::vector ASC
+            LIMIT 30
+        """, (embedding, tenant_id, embedding))
+        rrf_results = []
+        for row in cur.fetchall():
+            rrf_results.append({
+                'blob_hash': row['blob_hash'],
+                'commit_hash': row['commit_hash'],
+                'message': row['message'],
+                'author': row['author'],
+                'perspective': row['perspective'],
+                'episode_id': row['episode_id'],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'bootloader_weight': float(row['bootloader_weight']),
+                'rrf_score': float(row['rrf_score']),
+                'content': row['content'],
+            })
+        if not rrf_results:
+            return []
+        rrf_results = _rerank_results(rrf_results, cur, tenant_id)
+        for r in rrf_results:
+            base = r.get('reranked_score', r.get('rrf_score', 0.0))
+            r['final_score'] = (1.0 - weight_blend) * base + weight_blend * r.get('bootloader_weight', 0.0)
+        rrf_results.sort(key=lambda r: r.get('final_score', 0), reverse=True)
+        out = []
+        for r in rrf_results[:limit]:
+            content_str = r.get('content') or '{}'
+            try:
+                blob = json.loads(content_str)
+            except Exception:
+                blob = {}
+            out.append({
+                'commit_hash': r['commit_hash'][:16] if r['commit_hash'] else None,
+                'blob_hash': r['blob_hash'][:16] if r['blob_hash'] else None,
+                'message': r['message'],
+                'author': r['author'],
+                'perspective': r['perspective'],
+                'episode_id': r['episode_id'],
+                'created_at': r['created_at'],
+                'age': _format_relative_time(r['created_at']),
+                'narrative_context': (blob.get('narrative_context', '') or '')[:300],
+                'bootloader_weight': r['bootloader_weight'],
+                'final_score': round(r['final_score'], 4),
+                '_rerank_signals': r.get('_rerank_signals'),
+            })
+        return out
+    except Exception as e:
+        print(f"[RELEVANT_MEMORIES] {e}", file=sys.stderr)
+        return []
+
+
 @app.route('/v2/quick-brief', methods=['GET'])
 def quick_brief():
     """Get a context brief for current state."""
