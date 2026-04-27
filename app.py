@@ -4921,6 +4921,51 @@ def semantic_startup():
     return jsonify(response)
 
 
+@app.route('/v2/manifest', methods=['GET'])
+def get_manifest():
+    """Return the current tenant's full sacred_manifest content (not the projection).
+
+    The startup endpoint emits a projected version (identity, mission,
+    active_commitments, voice, branches) so warm payloads stay lean.
+    This endpoint is the lazy on-demand fallback when the caller needs
+    the complete manifest body — useful when CC moves between branches
+    inside a tenant whose manifest holds branch-specific governance rules.
+
+    Tenant-scoped via the authenticated session — no tenant_id arg.
+    Cross-tenant access stays admin-only via the existing override pattern.
+    """
+    cur = get_cursor()
+    cur.execute("""
+        SELECT b.content, b.created_at, b.blob_hash
+        FROM blobs b
+        WHERE b.content_type = 'sacred_manifest' AND b.tenant_id = %s
+        ORDER BY b.created_at DESC LIMIT 1
+    """, (get_tenant_id(),))
+    row = cur.fetchone()
+    cur.close()
+
+    if not row:
+        return jsonify({
+            'manifest': None,
+            'message': 'No sacred_manifest blob for this tenant',
+        }), 404
+
+    try:
+        manifest = json.loads(row['content'])
+    except Exception as e:
+        return jsonify({
+            'error': 'manifest blob is not valid JSON',
+            'blob_hash': row['blob_hash'],
+            'detail': str(e),
+        }), 500
+
+    return jsonify({
+        'manifest': manifest,
+        'blob_hash': row['blob_hash'],
+        'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+    })
+
+
 # ==================== BOOTLOADER / EPISODE NARRATIVE ====================
 
 PERSPECTIVE_ORDER = ['Dispatch', 'Steve', 'Wren', 'CC', 'CW-Opus', 'CW', 'claude-web', 'claude']
@@ -12730,6 +12775,14 @@ MCP_TOOLS = [
         }
     },
     {
+        "name": "boswell_manifest",
+        "description": "Return the current tenant's full sacred_manifest content (not the projection emitted at startup). Use when you need the complete manifest beyond the {identity, mission, active_commitments, voice, branches} projection — for example when entering a branch whose tenant has branch-specific governance rules buried in deeper sections. Tenant-scoped to the authenticated session; cross-tenant access is admin-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
         "name": "boswell_branches",
         "description": "List all cognitive branches: command-center (infrastructure), tint-atlanta (CRM), iris (research), tint-empire (franchise), family (personal), boswell (memory system). Use to understand the topology.",
         "inputSchema": {"type": "object", "properties": {}}
@@ -13268,7 +13321,10 @@ def dispatch_mcp_tool(tool_name, args):
     
     if tool_name == "boswell_brief":
         return invoke_view(quick_brief)
-    
+
+    elif tool_name == "boswell_manifest":
+        return invoke_view(get_manifest)
+
     elif tool_name == "boswell_branches":
         return invoke_view(list_branches)
     
