@@ -4242,7 +4242,7 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
         if not embedding:
             return []
         cur.execute("""
-            SELECT b.blob_hash, b.content,
+            SELECT b.blob_hash, b.content, b.content_type,
                    c.commit_hash, c.message, c.author, c.created_at,
                    COALESCE(c.bootloader_weight, 0.0) AS bootloader_weight,
                    c.episode_id, c.perspective,
@@ -4264,6 +4264,7 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
                 'author': row['author'],
                 'perspective': row['perspective'],
                 'episode_id': row['episode_id'],
+                'content_type': row['content_type'],
                 'created_at': str(row['created_at']) if row['created_at'] else None,
                 'bootloader_weight': float(row['bootloader_weight']),
                 'rrf_score': float(row['rrf_score']),
@@ -4290,6 +4291,7 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
                 'author': r['author'],
                 'perspective': r['perspective'],
                 'episode_id': r['episode_id'],
+                'content_type': r.get('content_type', 'memory'),
                 'created_at': r['created_at'],
                 'age': _format_relative_time(r['created_at']),
                 'narrative_context': (blob.get('narrative_context', '') or '')[:300],
@@ -4364,19 +4366,27 @@ def semantic_startup():
     If HIPPOCAMPAL_ENABLED, also returns recent bookmarks from working memory.
 
     Query params:
-    - context: Optional context string to search for relevant memories
+    - context: Optional intent string. PRESENCE of context gates semantic firing
+      (relevant_memories). Greetings/warm-ups pass nothing → cheap path. Substantive
+      turns pass intent → semantic + FSRS-6 reranking.
     - k: Number of relevant memories to return (default: 5)
     - agent_id: Optional agent ID to filter tasks assigned to this agent
-    - verbosity: minimal | normal | full (default: normal)
-      - minimal: sacred_manifest + top 3 tasks (slim) + local_time
-      - normal: sacred_manifest + tasks (5) + relevant_memories (3) - no tool_registry
-      - full: everything including tool_registry and hot_memories
+    - verbosity: minimal | warm | full (default: warm). 'normal' is a deprecated
+      alias for 'warm' kept for one release cycle.
+      - minimal: sacred_manifest + top 3 tasks + local_time. PROGRAMMATIC ONLY,
+        not for greetings.
+      - warm: default human-init turn including greetings (Steve's warm-up ritual).
+        Adds recent_thread, hot_trails, expiring_bookmarks, wren_bootloader (weight>0.5),
+        slim work_landscape. relevant_memories only fires if `context` is provided.
+      - full: deep-return / debug. Adds hot_memories, untrimmed work_landscape,
+        tool_registry, full bootloader, discovery_blobs.
     """
-    context = request.args.get('context', 'important decisions and active commitments')
+    context = request.args.get('context')  # None default; presence gates semantic firing
     k = request.args.get('k', 5, type=int)
     agent_id = request.args.get('agent_id')  # Filter tasks for specific agent
-    verbosity = request.args.get('verbosity', 'normal')  # minimal, normal, full
-    semantic = request.args.get('semantic', 'false').lower() in ('true', '1', 'yes')  # opt-in semantic search
+    verbosity = request.args.get('verbosity', 'warm')  # minimal | warm | full
+    if verbosity == 'normal':
+        verbosity = 'warm'  # deprecated alias, one-release back-compat
 
     cur = get_cursor()
 
@@ -4410,66 +4420,19 @@ def semantic_startup():
         except:
             pass
 
-    # Semantic search for contextually relevant memories (opt-in via semantic=true)
+    # Semantic relevant memories — fires only when caller passes `context` (non-default).
+    # Routes through _fetch_relevant_memories → _rerank_results for full FSRS-6 pipeline
+    # (trail boost, retrievability, recency, supersession penalty, MMR diversity).
+    # Greetings (no context) skip this entirely; substantive turns pass intent.
     relevant_memories = []
-    if semantic and OPENAI_API_KEY:
-        query_embedding = generate_embedding(context)
-        if query_embedding:
-            cur.execute("""
-                SELECT b.blob_hash, substring(b.content, 1, 300) as preview,
-                       c.message, b.content_type, b.embedding <=> %s::vector AS distance
-                FROM blobs b
-                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
-                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-                WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
-                ORDER BY distance LIMIT %s
-            """, (query_embedding, get_tenant_id(), k))
-            for row in cur.fetchall():
-                relevant_memories.append({
-                    'blob_hash': row['blob_hash'],
-                    'preview': row['preview'],
-                    'message': row['message'],
-                    'content_type': row.get('content_type', 'memory'),
-                    'distance': float(row['distance'])
-                })
-                # Auto-trail: track startup relevant memories
-                g.accessed_blobs.add(row['blob_hash'])
+    if context:
+        relevant_memories = _fetch_relevant_memories(cur, get_tenant_id(), context, limit=k)
 
-    # Boost semantic scores by trail strength (hot paths surface higher)
+    # hot_memories: top blobs by aggregated trail strength (full tier only).
+    # Trail-boost on relevant_memories now lives inside _rerank_results — no longer
+    # post-processed here.
     hot_memories = []
     try:
-        # Get trail strength for each blob in relevant_memories
-        if relevant_memories:
-            blob_hashes = [m['blob_hash'] for m in relevant_memories]
-            placeholders = ','.join(['%s'] * len(blob_hashes))
-            cur.execute(f"""
-                SELECT blob_hash, SUM(strength) as total_strength
-                FROM (
-                    SELECT source_blob as blob_hash, strength FROM trails
-                    WHERE tenant_id = %s AND source_blob IN ({placeholders})
-                    UNION ALL
-                    SELECT target_blob as blob_hash, strength FROM trails
-                    WHERE tenant_id = %s AND target_blob IN ({placeholders})
-                ) t
-                GROUP BY blob_hash
-            """, (get_tenant_id(), *blob_hashes, get_tenant_id(), *blob_hashes))
-
-            trail_strengths = {row['blob_hash']: float(row['total_strength']) for row in cur.fetchall()}
-
-            # Boost scores: lower distance = higher relevance
-            # Formula: adjusted = distance * (1 / (1 + log(1 + strength)))
-            for mem in relevant_memories:
-                strength = trail_strengths.get(mem['blob_hash'], 0)
-                if strength > 0:
-                    boost_factor = 1 / (1 + math.log(1 + strength))
-                    mem['original_distance'] = mem['distance']
-                    mem['distance'] = mem['distance'] * boost_factor
-                    mem['trail_strength'] = strength
-                    mem['boosted'] = True
-
-            # Re-sort by adjusted distance
-            relevant_memories.sort(key=lambda m: m['distance'])
-
         # Get hot memories (most traversed, independent of semantic search)
         cur.execute("""
             SELECT blob_hash, SUM(strength) as total_strength, SUM(traversal_count) as total_traversals
@@ -4763,6 +4726,46 @@ def semantic_startup():
         except Exception as e:
             print(f"[STARTUP] Bookmark fetch error: {e}", file=sys.stderr)
 
+    # Time-aware composition fields (used by warm and full tiers).
+    # Helpers extracted in commit 36e3b08 — single source of truth.
+    recent_thread = _fetch_recent_commits(cur, get_tenant_id(), limit=8, max_per_branch=3)
+    hot_trails = _fetch_hot_trails(cur, get_tenant_id(), limit=5)
+    expiring_bookmarks = _fetch_expiring_bookmarks(cur, get_tenant_id(), days=2)
+
+    # wren_bootloader (weight > 0.5): explicit "load every session" curation.
+    # Now lives in warm tier (was full-only). Slim variant emitted at warm; full
+    # variant with narrative_context emitted at full.
+    wren_bootloader_full = []
+    try:
+        cur.execute("""
+            SELECT commit_hash, message, created_at, episode_id,
+                   bootloader_weight, perspective, narrative_context, emotional_valence
+            FROM commits
+            WHERE tenant_id = %s AND bootloader_weight > 0.5
+            ORDER BY bootloader_weight DESC, episode_id ASC NULLS LAST, created_at ASC
+            LIMIT 20
+        """, (get_tenant_id(),))
+        for row in cur.fetchall():
+            wren_bootloader_full.append({
+                'commit_hash': row['commit_hash'][:16],
+                'message': row['message'],
+                'episode_id': row['episode_id'],
+                'bootloader_weight': row['bootloader_weight'],
+                'perspective': row['perspective'],
+                'narrative_context': row['narrative_context'],
+                'emotional_valence': row['emotional_valence'],
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+            })
+    except Exception as e:
+        print(f"[STARTUP] Wren bootloader query failed: {e}", file=sys.stderr)
+    wren_bootloader_slim = [{
+        'commit_hash': b['commit_hash'],
+        'message': b['message'],
+        'bootloader_weight': b['bootloader_weight'],
+        'episode_id': b['episode_id'],
+        'age': _format_relative_time(b['created_at']),
+    } for b in wren_bootloader_full]
+
     cur.close()
 
     # Build timestamp first - this orients the AI temporally
@@ -4777,7 +4780,7 @@ def semantic_startup():
 
     # Build response based on verbosity level
     if verbosity == 'minimal':
-        # Bare essentials: sacred manifest + slim backlog
+        # Programmatic / sub-agent only — NOT for greetings (use 'warm' for those).
         slim_backlog = [{
             'id': t['id'],
             'title': t.get('title', t.get('description', '')[:80]),
@@ -4791,57 +4794,27 @@ def semantic_startup():
             'verbosity': 'minimal'
         }
     elif verbosity == 'full':
-        # Get high-bootloader-weight commits from wren branch (narrative cascade seed)
-        wren_bootloader = []
-        try:
-            wren_cur = get_cursor()
-            wren_cur.execute("""
-                SELECT commit_hash, message, created_at, episode_id,
-                       bootloader_weight, perspective, narrative_context, emotional_valence
-                FROM commits
-                WHERE tenant_id = %s AND bootloader_weight > 0.5
-                ORDER BY bootloader_weight DESC, episode_id ASC NULLS LAST, created_at ASC
-                LIMIT 20
-            """, (get_tenant_id(),))
-            for row in wren_cur.fetchall():
-                wren_bootloader.append({
-                    'commit_hash': row['commit_hash'][:16] + '...',
-                    'message': row['message'],
-                    'episode_id': row['episode_id'],
-                    'bootloader_weight': row['bootloader_weight'],
-                    'perspective': row['perspective'],
-                    'narrative_context': row['narrative_context'],
-                    'emotional_valence': row['emotional_valence'],
-                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
-                })
-            wren_cur.close()
-        except Exception as e:
-            print(f"[STARTUP] Wren bootloader query failed: {e}", file=sys.stderr)
-
-        # Everything for debugging — full landscape (backlog removed: redundant with open_tasks)
+        # Deep return / debug / explicit firehose. All warm fields plus untrimmed
+        # work_landscape, hot_memories, full bootloader narratives, tool_registry.
         response = {
             'timestamp': timestamp_utc,
             'local_time': local_time,
             'sacred_manifest': sacred_manifest,
             'tool_registry': tool_registry,
-            'relevant_memories': relevant_memories,
-            'hot_memories': hot_memories,
-            'work_landscape': work_landscape,
+            'wren_bootloader': wren_bootloader_full,
             'open_tasks': open_tasks,
+            'recent_thread': recent_thread,
+            'hot_trails': hot_trails,
+            'hot_memories': hot_memories,
+            'expiring_bookmarks': expiring_bookmarks,
+            'work_landscape': work_landscape,
             'context_used': context,
             'verbosity': 'full',
-            'wren_bootloader': wren_bootloader,
         }
     else:
-        # normal (default): balanced payload with landscape
-        trimmed_memories = [{
-            'blob_hash': m['blob_hash'],
-            'message': m['message'],
-            'content_type': m.get('content_type', 'memory'),
-            'distance': m.get('distance')
-        } for m in relevant_memories[:3]]
-
-        # Slim tasks: P1-P2 only, title-only (no full descriptions)
+        # warm (default): every human-init turn including greetings.
+        # Steve's warm-up ritual lives here — basic state surface + recent thread,
+        # but no semantic call unless caller passes context.
         slim_tasks = [{
             'id': t['id'],
             'title': t.get('title', t.get('description', '')[:80]),
@@ -4850,7 +4823,6 @@ def semantic_startup():
             'assigned_to': t['assigned_to']
         } for t in open_tasks if t.get('priority', 3) <= 2]
 
-        # Slim landscape: branch:health pairs only (plan titles on demand via boswell_log)
         slim_landscape = {
             branch: {'health': data['health']}
             for branch, data in work_landscape.items()
@@ -4860,31 +4832,39 @@ def semantic_startup():
             'timestamp': timestamp_utc,
             'local_time': local_time,
             'sacred_manifest': sacred_manifest,
-            'relevant_memories': trimmed_memories,
-            'work_landscape': slim_landscape,
+            'wren_bootloader': wren_bootloader_slim,
             'open_tasks': slim_tasks,
+            'recent_thread': recent_thread,
+            'hot_trails': hot_trails,
+            'expiring_bookmarks': expiring_bookmarks,
+            'work_landscape': slim_landscape,
             'context_used': context,
-            'verbosity': 'normal'
+            'verbosity': 'warm',
         }
 
-    # v4: Add recent bookmarks if available (summaries truncated for startup weight)
-    if HIPPOCAMPAL_ENABLED and recent_bookmarks:
+    # relevant_memories: only emitted when caller passed context (gating decision).
+    if relevant_memories:
+        response['relevant_memories'] = relevant_memories
+
+    # recent_bookmarks (recently-CREATED, 48h window): full tier only.
+    # warm uses expiring_bookmarks (about-to-DISAPPEAR) which is more action-oriented.
+    if HIPPOCAMPAL_ENABLED and recent_bookmarks and verbosity == 'full':
         for bm in recent_bookmarks:
             if bm.get('summary') and len(bm['summary']) > 200:
                 bm['summary'] = bm['summary'][:200] + '...'
         response['recent_bookmarks'] = recent_bookmarks
 
-    # v5: Discovery blobs — orphaned memories surfaced for reconnection
-    if discovery_blobs and verbosity != 'minimal':
+    # Discovery blobs — orphaned memories surfaced for reconnection (full only).
+    if discovery_blobs and verbosity == 'full':
         response['discovery_blobs'] = discovery_blobs
 
-    # v6: Skills loaded — behavioral instructions surfaced via semantic search
-    source_memories = relevant_memories if verbosity == 'full' else trimmed_memories if verbosity != 'minimal' else []
-    loaded_skills = [m for m in source_memories if m.get('content_type') == 'skill']
+    # Skills loaded — flag any behavioral skills that surfaced via semantic search,
+    # so Claude knows to recall full content and follow as instructions.
+    loaded_skills = [m for m in relevant_memories if m.get('content_type') == 'skill']
     if loaded_skills:
         response['skills_loaded'] = [{
-            'blob_hash': s['blob_hash'],
-            'message': s['message'],
+            'blob_hash': s.get('blob_hash'),
+            'message': s.get('message'),
             'hint': 'Behavioral skill - recall full content and follow as instructions'
         } for s in loaded_skills]
 
@@ -12683,14 +12663,15 @@ def invoke_view(view_fn, method='GET', path='/', query_string=None, json_data=No
 MCP_TOOLS = [
     {
         "name": "boswell_startup",
-        "description": "Load startup context. Returns sacred commitments, open tasks, and relevant memories. CALL THIS FIRST at conversation start, before responding to anything—even 'hi'. Sets the stage for continuity. Use verbosity='minimal' for greetings, 'normal' (default) for work, 'full' for debugging. Semantic search is OFF by default—use boswell_search for targeted retrieval.",
+        "description": "Load startup context. CALL THIS FIRST at conversation start, before responding to anything — including greetings (greetings are Steve's warm-up ritual, not throwaway turns). Verbosity tiers: 'warm' (default, every human-initiated turn), 'full' (deep return / debug), 'minimal' (programmatic/sub-agent only — NOT for greetings). Semantic retrieval (relevant_memories) fires ONLY when caller passes a non-default `context` — greetings stay cheap, substantive turns get FSRS-6 reranked memories.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "context": {"type": "string", "description": "Optional context for semantic retrieval (only used when semantic=true)"},
-                "k": {"type": "integer", "description": "Number of relevant memories to return when semantic=true (default: 5)", "default": 5},
-                "verbosity": {"type": "string", "enum": ["minimal", "normal", "full"], "description": "Response size: minimal (greeting), normal (work), full (debug)", "default": "normal"},
-                "semantic": {"type": "string", "enum": ["true", "false"], "description": "Enable semantic search for relevant memories (default: false). Use boswell_search instead for targeted retrieval.", "default": "false"}
+                "context": {"type": "string", "description": "Optional intent string. PRESENCE of context gates semantic firing. Pass when you want relevant_memories surfaced for a specific topic; omit on greetings/warm-ups."},
+                "k": {"type": "integer", "description": "Number of relevant memories to return when context is provided (default: 5)", "default": 5},
+                "verbosity": {"type": "string", "enum": ["minimal", "warm", "normal", "full"], "description": "Response size: 'warm' (default human session), 'full' (deep return/debug), 'minimal' (programmatic only — NOT for greetings). 'normal' is a deprecated alias for 'warm'.", "default": "warm"},
+                "agent_id": {"type": "string", "description": "Optional agent ID to filter tasks assigned to this agent (returns my_tasks field)."},
+                "semantic": {"type": "string", "enum": ["true", "false"], "description": "DEPRECATED — accepted but ignored. Semantic firing is now gated on presence of `context`. Will be removed in a future release.", "default": "false"}
             }
         }
     },
@@ -13316,6 +13297,10 @@ def dispatch_mcp_tool(tool_name, args):
             qs["context"] = args["context"]
         if "k" in args:
             qs["k"] = args["k"]
+        if "verbosity" in args:
+            qs["verbosity"] = args["verbosity"]
+        if "agent_id" in args:
+            qs["agent_id"] = args["agent_id"]
         if "semantic" in args:
             qs["semantic"] = args["semantic"]
         return invoke_view(semantic_startup, query_string=qs)
