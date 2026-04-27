@@ -4317,6 +4317,52 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
         return []
 
 
+# Manifest projection size threshold — anything larger collapses to identity-card-only.
+MANIFEST_PROJECTION_MAX_BYTES = 5000
+
+
+def _project_manifest(content_dict):
+    """Project a sacred_manifest blob to its load-every-session essentials.
+
+    Returns {identity, mission, active_commitments, voice, branches, branches_list}
+    pruned to the keys actually present. If the projection still exceeds the
+    MANIFEST_PROJECTION_MAX_BYTES failsafe, clips further to the irreducible
+    {identity, mission, active_commitments} only.
+
+    Defensive against the historical LIKE-bug data shape: some legacy blobs
+    (e.g. the Bishop execution_plan) nested the actual manifest under
+    `appendix_a_sacred_manifest`. If we encounter that shape we unwrap it
+    before projecting. After the migration to content_type='sacred_manifest'
+    on properly-structured blobs, this branch is dead — left as a belt-and-
+    suspenders for migrated/edge data.
+
+    Returns the original dict unchanged if it doesn't look like a manifest
+    (no recognizable fields). Returns None for None input.
+    """
+    if content_dict is None:
+        return None
+    if not isinstance(content_dict, dict):
+        return content_dict
+
+    # Unwrap legacy nested-manifest shape if present
+    inner = content_dict.get('appendix_a_sacred_manifest')
+    if isinstance(inner, dict):
+        content_dict = inner
+
+    fields = ('identity', 'mission', 'active_commitments', 'voice', 'branches', 'branches_list')
+    projected = {k: content_dict[k] for k in fields if k in content_dict}
+
+    if not projected:
+        # Unknown shape — return as-is so a future-proof consumer can still see something
+        return content_dict
+
+    if len(json.dumps(projected, default=str)) > MANIFEST_PROJECTION_MAX_BYTES:
+        irreducible = ('identity', 'mission', 'active_commitments')
+        projected = {k: projected[k] for k in irreducible if k in projected}
+
+    return projected
+
+
 @app.route('/v2/quick-brief', methods=['GET'])
 def quick_brief():
     """Mid-session refresh: thread of recent work without the full startup payload.
@@ -4377,17 +4423,22 @@ def semantic_startup():
     sacred_manifest = None
     tool_registry = None
 
-    # Fetch sacred_manifest
+    # Fetch sacred_manifest by content_type (was a brittle LIKE on the JSON body —
+    # any blob containing "type": "sacred_manifest" anywhere matched, so the Bishop
+    # execution_plan with appendix_a_sacred_manifest nested inside hijacked Steve's
+    # slot since April 19, 2026). Now requires the typed slot. Result is projected
+    # to {identity, mission, active_commitments, voice, branches} via _project_manifest
+    # so the field stays lean at every verbosity tier; full content via boswell_manifest.
     cur.execute("""
         SELECT b.content FROM blobs b
-        WHERE b.content LIKE %s AND b.tenant_id = %s
+        WHERE b.content_type = 'sacred_manifest' AND b.tenant_id = %s
         ORDER BY b.created_at DESC LIMIT 1
-    """, ('%"type": "sacred_manifest"%', get_tenant_id()))
+    """, (get_tenant_id(),))
     row = cur.fetchone()
     if row:
         try:
-            sacred_manifest = json.loads(row['content'])
-        except:
+            sacred_manifest = _project_manifest(json.loads(row['content']))
+        except Exception:
             pass
 
     # Fetch tool_registry
