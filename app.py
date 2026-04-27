@@ -4109,7 +4109,7 @@ def _format_relative_time(timestamp):
     return f'{days // 365}y ago'
 
 
-def _fetch_recent_commits(cur, tenant_id, limit=8, max_per_branch=3, exclude_authors=None):
+def _fetch_recent_commits(cur, tenant_id, limit=8, max_per_branch=3, exclude_authors=None, exclude_commit_hashes=None):
     """Recent commits across branches, capped per-branch.
 
     Walks parent_hash from each branch HEAD up to max_per_branch deep, dedupes commits
@@ -4117,10 +4117,15 @@ def _fetch_recent_commits(cur, tenant_id, limit=8, max_per_branch=3, exclude_aut
     (defaults to RESUME_NOISE_AUTHORS), sorts globally by created_at DESC, returns top limit.
 
     Per-branch cap prevents one hot branch from monopolizing the resume thread.
+
+    exclude_commit_hashes: optional iterable of full or 16-char commit hash prefixes
+    to omit from results. Used by callers that surface the same commits via a more
+    specific channel (e.g. task_briefing) and want recent_thread to skip the overlap.
     """
     if exclude_authors is None:
         exclude_authors = RESUME_NOISE_AUTHORS
     exclude_list = list(exclude_authors)
+    exclude_hash_prefixes = {h[:16] for h in (exclude_commit_hashes or []) if h}
     try:
         cur.execute("""
             WITH RECURSIVE branch_walks AS (
@@ -4147,17 +4152,22 @@ def _fetch_recent_commits(cur, tenant_id, limit=8, max_per_branch=3, exclude_aut
             FROM deduped
             ORDER BY created_at DESC
             LIMIT %s
-        """, (tenant_id, tenant_id, max_per_branch, exclude_list, limit))
+        """, (tenant_id, tenant_id, max_per_branch, exclude_list, limit + len(exclude_hash_prefixes)))
         results = []
         for row in cur.fetchall():
+            short_hash = row['commit_hash'][:16] if row['commit_hash'] else None
+            if short_hash in exclude_hash_prefixes:
+                continue
             results.append({
-                'commit_hash': row['commit_hash'][:16] if row['commit_hash'] else None,
+                'commit_hash': short_hash,
                 'branch': row['branch'],
                 'author': row['author'],
                 'message': (row['message'] or '')[:80],
                 'created_at': str(row['created_at']) if row['created_at'] else None,
                 'age': _format_relative_time(row['created_at']),
             })
+            if len(results) >= limit:
+                break
         return results
     except Exception as e:
         print(f"[RECENT_COMMITS] {e}", file=sys.stderr)
@@ -4245,7 +4255,7 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
             SELECT b.blob_hash, b.content, b.content_type,
                    c.commit_hash, c.message, c.author, c.created_at,
                    COALESCE(c.bootloader_weight, 0.0) AS bootloader_weight,
-                   c.episode_id, c.perspective,
+                   c.episode_id, c.perspective, c.emotional_valence,
                    1.0 / (1.0 + (b.embedding <=> %s::vector)) AS rrf_score
             FROM blobs b
             JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
@@ -4265,6 +4275,7 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
                 'perspective': row['perspective'],
                 'episode_id': row['episode_id'],
                 'content_type': row['content_type'],
+                'emotional_valence': row['emotional_valence'],
                 'created_at': str(row['created_at']) if row['created_at'] else None,
                 'bootloader_weight': float(row['bootloader_weight']),
                 'rrf_score': float(row['rrf_score']),
@@ -4292,6 +4303,7 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
                 'perspective': r['perspective'],
                 'episode_id': r['episode_id'],
                 'content_type': r.get('content_type', 'memory'),
+                'emotional_valence': r.get('emotional_valence'),
                 'created_at': r['created_at'],
                 'age': _format_relative_time(r['created_at']),
                 'narrative_context': (blob.get('narrative_context', '') or '')[:300],
@@ -5083,60 +5095,64 @@ def get_episode_recap(episode_id):
 def task_briefing():
     """Generate a 'Previously on Boswell...' briefing for an instance starting a task.
 
+    Composes _fetch_relevant_memories — the same Parnas leaf used by
+    boswell_startup.relevant_memories — so both surfaces inherit the full
+    FSRS-6 reranking pipeline (trail boost, retrievability, recency,
+    supersession, MMR diversity) from _rerank_results. Before this refactor,
+    task_briefing did its own pgvector + manual blend and bypassed _rerank_results
+    entirely; the two surfaces had drifted.
+
     POST body:
-        task_description  (required)
-        limit             (optional, default 5)
-        branch            (optional)
+        task_description       (required) — semantic anchor for retrieval
+        limit                  (optional, default 5)
+        exclude_commit_hashes  (optional list) — commits to omit (e.g. ones the
+                               caller is already showing in another surface like
+                               recent_thread; per-anchor wins, recent_thread
+                               excludes the overlap)
     """
     data = request.get_json() or {}
     task_description = data.get('task_description', '').strip()
     limit = int(data.get('limit', 5))
+    exclude_commit_hashes = data.get('exclude_commit_hashes') or []
+    exclude_prefixes = {h[:16] for h in exclude_commit_hashes if h}
 
     if not task_description:
         return jsonify({'error': 'task_description required'}), 400
 
     cur = get_cursor()
+    mode = 'bootloader_weight_fallback'
     results = []
 
     if OPENAI_API_KEY:
-        task_embedding = generate_embedding(task_description)
-        if task_embedding:
-            cur.execute("""
-                SELECT b.blob_hash, b.content,
-                       c.commit_hash, c.message, c.perspective, c.episode_id,
-                       c.bootloader_weight, c.emotional_valence, c.created_at,
-                       (b.embedding <=> %s::vector) AS distance
-                FROM blobs b
-                JOIN tree_entries t ON b.blob_hash = t.blob_hash AND b.tenant_id = t.tenant_id
-                JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
-                WHERE b.embedding IS NOT NULL AND b.tenant_id = %s
-                ORDER BY distance ASC LIMIT 20
-            """, (task_embedding, get_tenant_id()))
-            rows = cur.fetchall()
-            scored = []
-            for row in rows:
-                similarity = max(0.0, 1.0 - float(row['distance'] or 1.0))
-                weight = float(row['bootloader_weight'] or 0.0)
-                score = 0.7 * similarity + 0.3 * weight
-                scored.append((score, row))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            for score, row in scored[:limit]:
-                content_str = row['content'] or '{}'
-                try:
-                    blob = json.loads(content_str)
-                except Exception:
-                    blob = {}
-                results.append({
-                    'commit_hash': row['commit_hash'], 'message': row['message'],
-                    'perspective': row['perspective'], 'episode_id': row['episode_id'],
-                    'bootloader_weight': row['bootloader_weight'],
-                    'emotional_valence': row['emotional_valence'],
-                    'created_at': str(row['created_at']) if row['created_at'] else None,
-                    'narrative_context': (blob.get('narrative_context', '') or '')[:500],
-                    'score': round(score, 3),
-                })
+        # Over-fetch then dedupe — exclusions might thin the limit window.
+        helper_results = _fetch_relevant_memories(
+            cur, get_tenant_id(), task_description,
+            limit=limit + len(exclude_prefixes),
+            weight_blend=0.3,
+        )
+        if helper_results:
+            mode = 'semantic'
+        for r in helper_results:
+            if r.get('commit_hash') in exclude_prefixes:
+                continue
+            results.append({
+                'commit_hash': r['commit_hash'],
+                'message': r['message'],
+                'perspective': r['perspective'],
+                'episode_id': r['episode_id'],
+                'bootloader_weight': r['bootloader_weight'],
+                'emotional_valence': r.get('emotional_valence'),
+                'created_at': r['created_at'],
+                'narrative_context': r.get('narrative_context', ''),
+                'score': r['final_score'],
+                '_rerank_signals': r.get('_rerank_signals'),
+            })
+            if len(results) >= limit:
+                break
 
     if not results:
+        # Fallback when OpenAI is unavailable OR semantic returned nothing useful:
+        # surface the curated "load every session" commits by bootloader_weight.
         cur.execute("""
             SELECT b.blob_hash, b.content,
                    c.commit_hash, c.message, c.perspective, c.episode_id,
@@ -5146,22 +5162,29 @@ def task_briefing():
             JOIN commits c ON t.tree_hash = c.tree_hash AND t.tenant_id = c.tenant_id
             WHERE c.tenant_id = %s AND c.bootloader_weight IS NOT NULL AND c.bootloader_weight > 0.3
             ORDER BY c.bootloader_weight DESC, c.created_at DESC LIMIT %s
-        """, (get_tenant_id(), limit))
+        """, (get_tenant_id(), limit + len(exclude_prefixes)))
         for row in cur.fetchall():
+            short_hash = row['commit_hash'][:16] if row['commit_hash'] else None
+            if short_hash in exclude_prefixes:
+                continue
             content_str = row['content'] or '{}'
             try:
                 blob = json.loads(content_str)
             except Exception:
                 blob = {}
             results.append({
-                'commit_hash': row['commit_hash'], 'message': row['message'],
-                'perspective': row['perspective'], 'episode_id': row['episode_id'],
+                'commit_hash': short_hash,
+                'message': row['message'],
+                'perspective': row['perspective'],
+                'episode_id': row['episode_id'],
                 'bootloader_weight': row['bootloader_weight'],
                 'emotional_valence': row['emotional_valence'],
                 'created_at': str(row['created_at']) if row['created_at'] else None,
-                'narrative_context': (blob.get('narrative_context', '') or '')[:500],
+                'narrative_context': (blob.get('narrative_context', '') or '')[:300],
                 'score': float(row['bootloader_weight'] or 0.0),
             })
+            if len(results) >= limit:
+                break
 
     cur.close()
     lines = [f'## Previously on Boswell — relevant to: *{task_description[:80]}*\n']
@@ -5175,9 +5198,10 @@ def task_briefing():
         lines.append('---')
 
     return jsonify({
-        'task_description': task_description, 'results': results,
+        'task_description': task_description,
+        'results': results,
         'markdown': '\n'.join(lines),
-        'mode': 'semantic' if OPENAI_API_KEY else 'bootloader_weight_fallback',
+        'mode': mode,
         'count': len(results),
     })
 
@@ -13146,12 +13170,13 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_task_briefing",
-        "description": "Generate a 'Previously on Boswell...' briefing for an instance about to start work. Retrieves past commits ranked by semantic similarity to the task + bootloader_weight. Call at task start to inherit relevant prior context.",
+        "description": "Generate a 'Previously on Boswell...' briefing for an instance about to start work. Routes through the same FSRS-6 reranking pipeline as boswell_search and boswell_startup.relevant_memories — semantic anchor by task_description, blended with bootloader_weight (0.3 default). Call at task start to inherit relevant prior context. Pass exclude_commit_hashes to coordinate with another surface (e.g. recent_thread) so the same commit doesn't appear twice.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task_description": {"type": "string", "description": "What you are about to work on"},
-                "limit": {"type": "integer", "description": "Max items to surface (default 5)", "default": 5}
+                "limit": {"type": "integer", "description": "Max items to surface (default 5)", "default": 5},
+                "exclude_commit_hashes": {"type": "array", "items": {"type": "string"}, "description": "Optional commit hashes (full or 16-char prefix) to omit from results — for cross-surface dedupe"}
             },
             "required": ["task_description"]
         }
@@ -13655,6 +13680,8 @@ def dispatch_mcp_tool(tool_name, args):
         payload = {"task_description": args.get("task_description", "")}
         if "limit" in args:
             payload["limit"] = args["limit"]
+        if "exclude_commit_hashes" in args:
+            payload["exclude_commit_hashes"] = args["exclude_commit_hashes"]
         return invoke_view(task_briefing, method="POST", json_data=payload)
 
     else:
