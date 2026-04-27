@@ -4307,52 +4307,23 @@ def _fetch_relevant_memories(cur, tenant_id, query, limit=5, weight_blend=0.3):
 
 @app.route('/v2/quick-brief', methods=['GET'])
 def quick_brief():
-    """Get a context brief for current state."""
-    branch = request.args.get('branch', 'command-center')
+    """Mid-session refresh: thread of recent work without the full startup payload.
 
+    Single-mode global snapshot — no branch scoping (consensus from the
+    redesign argue: global is the right default for resume context, and
+    the previous `branch` parameter never actually filtered anything due
+    to a missing WHERE clause). For branch-scoped commit history, use
+    boswell_log instead.
+
+    Composes _fetch_recent_commits — same data shape as the recent_thread
+    field in boswell_startup, so the two surfaces stay in sync.
+    """
     cur = get_cursor()
-    cur.execute('SELECT * FROM branches WHERE name = %s AND tenant_id = %s', (branch, get_tenant_id()))
-    branch_info = cur.fetchone()
-
-    if not branch_info:
-        cur.close()
-        return jsonify({'error': f'Branch {branch} not found'}), 404
-
-    cur.execute(
-        '''SELECT commit_hash, message, created_at, author
-           FROM commits WHERE tenant_id = %s ORDER BY created_at DESC LIMIT 5''',
-        (get_tenant_id(),)
-    )
-    recent_commits = []
-    for row in cur.fetchall():
-        r = dict(row)
-        if r.get('created_at'):
-            r['created_at'] = str(r['created_at'])
-        recent_commits.append(r)
-
-    cur.execute(
-        '''SELECT session_id, branch, summary, synced_at
-           FROM sessions WHERE tenant_id = %s ORDER BY synced_at DESC LIMIT 5''',
-        (get_tenant_id(),)
-    )
-    pending_sessions = []
-    for row in cur.fetchall():
-        r = dict(row)
-        if r.get('synced_at'):
-            r['synced_at'] = str(r['synced_at'])
-        pending_sessions.append(r)
-
-    cur.execute('SELECT name FROM branches WHERE tenant_id = %s', (get_tenant_id(),))
-    branches = [dict(row) for row in cur.fetchall()]
-
+    recent_thread = _fetch_recent_commits(cur, get_tenant_id(), limit=8, max_per_branch=3)
     cur.close()
     return jsonify({
-        'current_branch': branch,
-        'head_commit': branch_info['head_commit'],
-        'recent_commits': recent_commits,
-        'pending_sessions': pending_sessions,
-        'branches': branches,
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
+        'recent_thread': recent_thread,
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
     })
 
 
@@ -12677,12 +12648,10 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_brief",
-        "description": "Quick context snapshot—recent commits, open tasks, branch activity. Call when resuming work or when asked 'what's been happening?' Lighter than boswell_startup.",
+        "description": "Mid-session refresh: returns recent_thread (last 8 commits across all branches, max 3 per branch, cc-stop-hook noise filtered) without the full boswell_startup payload. Use when you need 'what's changed in the last hour?' without re-loading manifest/landscape. Global snapshot — no branch param. For branch-scoped commit history, use boswell_log.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "branch": {"type": "string", "description": "Branch to focus on (default: command-center)", "default": "command-center"}
-            }
+            "properties": {}
         }
     },
     {
@@ -13222,8 +13191,7 @@ def dispatch_mcp_tool(tool_name, args):
     # ===== READ OPERATIONS =====
     
     if tool_name == "boswell_brief":
-        branch = args.get("branch", "command-center")
-        return invoke_view(quick_brief, query_string={"branch": branch})
+        return invoke_view(quick_brief)
     
     elif tool_name == "boswell_branches":
         return invoke_view(list_branches)
