@@ -1506,7 +1506,22 @@ def _screen_content(content, content_type: str = 'memory') -> tuple:
 
 @app.route('/v2/commit', methods=['POST'])
 def create_commit():
-    """Commit a memory to the repository."""
+    """Commit a memory to the repository.
+
+    content_type semantics (the disambiguation that matters for behavior):
+      - 'sacred_manifest': tenant-defining commitments. Loaded full-text
+        into startup as a projection ({identity, mission,
+        active_commitments, voice, branches}). The behavioral channel.
+      - 'skill': FILESYSTEM-skill snapshot / machine-to-machine sync.
+        Surfaces in startup's skills_loaded as a 1-line preview, NOT
+        full-text. The recall loop doesn't auto-close — preview-surfaced
+        skills are dormant for behavioral purposes. For behavioral
+        content, prefer 'sacred_manifest' OR commit at high
+        bootloader_weight and have CLAUDE.md mandate boswell_bootloader
+        at session start (the full-text-on-entry rail Wren uses).
+      - 'plan' / 'idea' / 'memory' / 'credential' / 'methodology': as
+        documented in the MCP tool schema.
+    """
     data = request.get_json() or {}
     content = data.get('content')
     message = data.get('message', 'Memory commit')
@@ -12870,14 +12885,14 @@ MCP_TOOLS = [
     },
     {
         "name": "boswell_commit",
-        "description": "Preserve a decision, insight, or context to memory. ALWAYS capture WHY, not just WHAT—future instances need reasoning. Call after completing steps, solving problems, making decisions, or learning something new. Use content_type='plan' to create persistent work plans, content_type='skill' for behavioral instructions.",
+        "description": "Preserve a decision, insight, or context to memory. ALWAYS capture WHY, not just WHAT — future instances need reasoning. Call after completing steps, solving problems, making decisions, or learning something new. Use content_type='plan' for work plans, content_type='sacred_manifest' for tenant-defining behavior loaded full-text at startup, content_type='skill' for filesystem-skill snapshots (sync layer, NOT auto-loaded as behavior).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "branch": {"type": "string", "description": "Branch to commit to (tint-atlanta, iris, tint-empire, family, command-center, boswell)"},
                 "content": {"oneOf": [{"type": "object"}, {"type": "string"}], "description": "Memory content as JSON object or JSON string"},
                 "message": {"type": "string", "description": "Commit message describing the memory"},
-                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'idea' (pre-plan architecture note — title required, no status, no tasks attached), 'plan' (active work plan with tasks — requires title + status), 'skill' (behavioral instruction), 'credential' (auth material), or 'methodology' (future-instance reasoning; weight=0.9 default). Plans have tasks. Ideas spawn plans but don't hold tasks directly.", "default": "memory"},
+                "content_type": {"type": "string", "description": "Content type: 'memory' (default), 'idea' (pre-plan note — title required, no tasks), 'plan' (active work plan with tasks — requires title + status), 'sacred_manifest' (tenant-defining commitments — projected to {identity, mission, active_commitments, voice, branches} and loaded full-text into startup; full content via boswell_manifest tool), 'skill' (filesystem-skill snapshot / machine-to-machine sync — NOT auto-loaded as behavior; preview surfacing doesn't close the recall loop, so for behavioral content use 'sacred_manifest' or commit at high bootloader_weight + CLAUDE.md-mandated boswell_bootloader call at session start), 'credential' (auth material), 'methodology' (future-instance reasoning; weight=0.9 default). Plans have tasks. Ideas spawn plans but don't hold tasks directly.", "default": "memory"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for categorization"},
                 "force_branch": {"type": "boolean", "description": "Suppress routing warnings - use when intentionally committing to a branch despite mismatch"},
                 "bootloader_weight": {"type": "number", "description": "How eagerly this commit should be auto-loaded on conversation start (0.0-1.0). Omit for content-type defaults: skill=1.0, methodology=0.9, credential=0.8, plan=0.6, idea=0.3, memory=0.0."}
